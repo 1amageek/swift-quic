@@ -128,8 +128,7 @@ struct RecoveryBenchmarkTests {
                 timeSent: .now,
                 ackEliciting: true,
                 inFlight: true,
-                sentBytes: 1200,
-                frames: []
+                sentBytes: 1200
             )
             detector.onPacketSent(packet)
         }
@@ -159,8 +158,7 @@ struct RecoveryBenchmarkTests {
                     timeSent: .now,
                     ackEliciting: true,
                     inFlight: true,
-                    sentBytes: 1200,
-                    frames: []
+                    sentBytes: 1200
                 )
                 detector.onPacketSent(packet)
             }
@@ -204,8 +202,7 @@ struct RecoveryBenchmarkTests {
                     timeSent: .now,
                     ackEliciting: true,
                     inFlight: true,
-                    sentBytes: 1200,
-                    frames: []
+                    sentBytes: 1200
                 )
                 detector.onPacketSent(packet)
             }
@@ -247,8 +244,7 @@ struct RecoveryBenchmarkTests {
                 timeSent: .now,
                 ackEliciting: true,
                 inFlight: true,
-                sentBytes: 1200,
-                frames: []
+                sentBytes: 1200
             )
             detector.onPacketSent(packet)
         }
@@ -280,8 +276,7 @@ struct RecoveryBenchmarkTests {
                     timeSent: .now,
                     ackEliciting: true,
                     inFlight: true,
-                    sentBytes: 1200,
-                    frames: []
+                    sentBytes: 1200
                 )
                 detector.onPacketSent(packet)
             }
@@ -335,8 +330,7 @@ struct RecoveryBenchmarkTests {
                         timeSent: .now,
                         ackEliciting: true,
                         inFlight: true,
-                        sentBytes: 1200,
-                        frames: []
+                        sentBytes: 1200
                     )
                     lossDetector.onPacketSent(packet)
                 }
@@ -385,8 +379,7 @@ struct RecoveryBenchmarkTests {
                 timeSent: .now,
                 ackEliciting: true,
                 inFlight: true,
-                sentBytes: 1200,
-                frames: []
+                sentBytes: 1200
             )
             lossDetector.onPacketSent(packet)
 

@@ -6,18 +6,21 @@ import Foundation
 import QUICCore
 
 /// Tracks a sent packet for loss detection (RFC 9002 Appendix A.1.1)
+/// Field order optimized for cache efficiency and minimal padding
 public struct SentPacket: Sendable, Identifiable {
+    // 8-byte aligned fields (hot path - frequently accessed together)
     /// Unique identifier (packet number)
     public let id: UInt64
 
-    /// Alias for packet number
-    public var packetNumber: UInt64 { id }
-
-    /// Encryption level this packet belongs to
-    public let encryptionLevel: EncryptionLevel
+    /// Size of the packet in bytes (for congestion control)
+    public let sentBytes: Int
 
     /// Time the packet was sent
     public let timeSent: ContinuousClock.Instant
+
+    // Small fields grouped together (minimizes padding)
+    /// Encryption level this packet belongs to
+    public let encryptionLevel: EncryptionLevel
 
     /// Whether this packet contains ack-eliciting frames
     public let ackEliciting: Bool
@@ -25,11 +28,8 @@ public struct SentPacket: Sendable, Identifiable {
     /// Whether this packet is in-flight (counts against congestion window)
     public let inFlight: Bool
 
-    /// Size of the packet in bytes (for congestion control)
-    public let sentBytes: Int
-
-    /// Frames contained in this packet (for potential retransmission)
-    public let frames: [Frame]
+    /// Alias for packet number
+    public var packetNumber: UInt64 { id }
 
     /// Creates a new SentPacket
     /// - Parameters:
@@ -39,23 +39,20 @@ public struct SentPacket: Sendable, Identifiable {
     ///   - ackEliciting: Whether the packet requires an ACK
     ///   - inFlight: Whether the packet counts toward bytes in flight
     ///   - sentBytes: Size of the packet in bytes
-    ///   - frames: Frames contained in the packet
     public init(
         packetNumber: UInt64,
         encryptionLevel: EncryptionLevel,
         timeSent: ContinuousClock.Instant,
         ackEliciting: Bool,
         inFlight: Bool,
-        sentBytes: Int,
-        frames: [Frame]
+        sentBytes: Int
     ) {
         self.id = packetNumber
-        self.encryptionLevel = encryptionLevel
+        self.sentBytes = sentBytes
         self.timeSent = timeSent
+        self.encryptionLevel = encryptionLevel
         self.ackEliciting = ackEliciting
         self.inFlight = inFlight
-        self.sentBytes = sentBytes
-        self.frames = frames
     }
 }
 

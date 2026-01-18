@@ -67,7 +67,9 @@ public final class LossDetector: Sendable {
         rttEstimator: RTTEstimator
     ) -> LossDetectionResult {
         var ackedPackets: [SentPacket] = []
+        ackedPackets.reserveCapacity(32)
         var lostPackets: [SentPacket] = []
+        lostPackets.reserveCapacity(8)
         var rttSample: Duration? = nil
         var isFirstAckElicitingAck = false
 
@@ -114,6 +116,7 @@ public final class LossDetector: Sendable {
     }
 
     /// Processes ACK ranges directly without building intermediate array
+    /// Optimized to skip packet numbers below smallestUnacked
     @inline(__always)
     private func processAckedRanges(
         ackFrame: AckFrame,
@@ -123,6 +126,7 @@ public final class LossDetector: Sendable {
         ackReceivedTime: ContinuousClock.Instant
     ) {
         let largestAcked = ackFrame.largestAcknowledged
+        let smallestUnacked = state.smallestUnacked ?? 0
         var current = largestAcked
 
         for (index, range) in ackFrame.ackRanges.enumerated() {
@@ -134,20 +138,25 @@ public final class LossDetector: Sendable {
                 rangeStart = current - range.rangeLength
             }
 
-            // Process each packet in range
-            for pn in rangeStart...current {
-                if let packet = state.sentPackets.removeValue(forKey: pn) {
-                    ackedPackets.append(packet)
-                    if packet.inFlight {
-                        state.bytesInFlight -= packet.sentBytes
-                    }
-                    if packet.ackEliciting {
-                        state.ackElicitingInFlight -= 1
-                    }
+            // Skip packet numbers below smallestUnacked (they can't be in sentPackets)
+            let checkStart = max(rangeStart, smallestUnacked)
 
-                    // RTT sample from largest newly acked ack-eliciting packet
-                    if pn == largestAcked && packet.ackEliciting {
-                        rttSample = ackReceivedTime - packet.timeSent
+            // Process only packets that might exist in sentPackets
+            if checkStart <= current {
+                for pn in checkStart...current {
+                    if let packet = state.sentPackets.removeValue(forKey: pn) {
+                        ackedPackets.append(packet)
+                        if packet.inFlight {
+                            state.bytesInFlight -= packet.sentBytes
+                        }
+                        if packet.ackEliciting {
+                            state.ackElicitingInFlight -= 1
+                        }
+
+                        // RTT sample from largest newly acked ack-eliciting packet
+                        if pn == largestAcked && packet.ackEliciting {
+                            rttSample = ackReceivedTime - packet.timeSent
+                        }
                     }
                 }
             }
@@ -156,7 +165,7 @@ public final class LossDetector: Sendable {
     }
 
     /// Internal loss detection algorithm (RFC 9002 Section 4.3)
-    /// Optimized to avoid double iteration
+    /// Optimized with single-pass iteration
     private func detectLostPacketsInternal(
         _ state: inout LossState,
         now: ContinuousClock.Instant,
@@ -171,14 +180,21 @@ public final class LossDetector: Sendable {
         let lossDelayThreshold = max(lossDelay, LossDetectionConstants.granularity)
 
         var lostPackets: [SentPacket] = []
+        lostPackets.reserveCapacity(8)
         var earliestLossTime: ContinuousClock.Instant? = nil
         var newSmallestUnacked: UInt64? = nil
+        var packetsToRemove: [UInt64] = []
+        packetsToRemove.reserveCapacity(8)
 
-        // Single pass: detect losses and update loss time
-        let keysToCheck = state.sentPackets.keys.filter { $0 < largestAcked }
-
-        for pn in keysToCheck {
-            guard let packet = state.sentPackets[pn] else { continue }
+        // Single pass: iterate all packets exactly once
+        for (pn, packet) in state.sentPackets {
+            if pn >= largestAcked {
+                // Packets >= largestAcked: only track for smallest unacked
+                if newSmallestUnacked == nil || pn < newSmallestUnacked! {
+                    newSmallestUnacked = pn
+                }
+                continue
+            }
 
             // Packet threshold loss: 3+ newer packets acknowledged
             let packetLost = largestAcked >= pn + LossDetectionConstants.packetThreshold
@@ -187,8 +203,8 @@ public final class LossDetector: Sendable {
             let timeLost = (now - packet.timeSent) >= lossDelayThreshold
 
             if packetLost || timeLost {
-                // Remove and mark as lost
-                state.sentPackets.removeValue(forKey: pn)
+                // Mark for removal (batch delete later)
+                packetsToRemove.append(pn)
                 lostPackets.append(packet)
                 if packet.inFlight {
                     state.bytesInFlight -= packet.sentBytes
@@ -212,11 +228,9 @@ public final class LossDetector: Sendable {
             }
         }
 
-        // Also check packets >= largestAcked for smallest unacked
-        for pn in state.sentPackets.keys where pn >= largestAcked {
-            if newSmallestUnacked == nil || pn < newSmallestUnacked! {
-                newSmallestUnacked = pn
-            }
+        // Batch remove lost packets
+        for pn in packetsToRemove {
+            state.sentPackets.removeValue(forKey: pn)
         }
 
         state.lossTime = earliestLossTime

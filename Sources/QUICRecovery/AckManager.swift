@@ -24,7 +24,7 @@ public final class AckManager: Sendable {
 
     private struct AckState {
         /// Received packet ranges (sorted by start, non-overlapping)
-        var receivedRanges: [PacketRange] = []
+        var receivedRanges: [PacketRange]
 
         /// Largest packet number received
         var largestReceived: UInt64?
@@ -46,6 +46,12 @@ public final class AckManager: Sendable {
 
         /// Total packet count for memory management
         var totalPacketCount: Int = 0
+
+        init(maxAckDelay: Duration) {
+            self.maxAckDelay = maxAckDelay
+            self.receivedRanges = []
+            self.receivedRanges.reserveCapacity(32)
+        }
     }
 
     /// Maximum number of ranges to track
@@ -96,75 +102,16 @@ public final class AckManager: Sendable {
         }
     }
 
-    /// Inserts a packet number into the ranges, merging as needed
-    /// Uses binary search for O(log n) insertion point finding
-    private func insertPacket(
-        _ packetNumber: UInt64,
-        receiveTime: ContinuousClock.Instant,
-        into state: inout AckState
-    ) {
-        // Check if packet is already tracked
-        if let index = findRangeContaining(packetNumber, in: state.receivedRanges) {
-            // Already in a range, just update receive time if newer
-            if receiveTime > state.receivedRanges[index].receiveTime {
-                state.receivedRanges[index].receiveTime = receiveTime
-            }
-            return
-        }
-
-        state.totalPacketCount += 1
-
-        // Find insertion point using binary search
-        let insertIndex = state.receivedRanges.partitioningIndex { $0.start > packetNumber }
-
-        // Check if we can extend the previous range
-        let canExtendPrevious = insertIndex > 0 &&
-            state.receivedRanges[insertIndex - 1].end + 1 == packetNumber
-
-        // Check if we can extend the next range
-        let canExtendNext = insertIndex < state.receivedRanges.count &&
-            packetNumber + 1 == state.receivedRanges[insertIndex].start
-
-        if canExtendPrevious && canExtendNext {
-            // Merge three ranges into one
-            let prevIndex = insertIndex - 1
-            state.receivedRanges[prevIndex].end = state.receivedRanges[insertIndex].end
-            state.receivedRanges[prevIndex].receiveTime = max(
-                state.receivedRanges[prevIndex].receiveTime,
-                receiveTime,
-                state.receivedRanges[insertIndex].receiveTime
-            )
-            state.receivedRanges.remove(at: insertIndex)
-        } else if canExtendPrevious {
-            // Extend previous range
-            state.receivedRanges[insertIndex - 1].end = packetNumber
-            state.receivedRanges[insertIndex - 1].receiveTime = max(
-                state.receivedRanges[insertIndex - 1].receiveTime,
-                receiveTime
-            )
-        } else if canExtendNext {
-            // Extend next range
-            state.receivedRanges[insertIndex].start = packetNumber
-            state.receivedRanges[insertIndex].receiveTime = max(
-                state.receivedRanges[insertIndex].receiveTime,
-                receiveTime
-            )
-        } else {
-            // Insert new range
-            let newRange = PacketRange(start: packetNumber, end: packetNumber, receiveTime: receiveTime)
-            state.receivedRanges.insert(newRange, at: insertIndex)
-
-            // Prune if too many ranges
-            if state.receivedRanges.count > Self.maxRanges {
-                // Remove oldest (smallest) ranges
-                let toRemove = state.receivedRanges.count - Self.maxRanges / 2
-                state.receivedRanges.removeFirst(toRemove)
-            }
-        }
+    /// Result of unified binary search
+    private enum BinarySearchResult {
+        case contained(at: Int)  // Packet is within an existing range
+        case insertAt(Int)       // Packet should be inserted at this index
     }
 
-    /// Binary search to find range containing packet number
-    private func findRangeContaining(_ packetNumber: UInt64, in ranges: [PacketRange]) -> Int? {
+    /// Unified binary search: finds if packet is contained or where to insert
+    /// Single search instead of two separate searches
+    @inline(__always)
+    private func findPacketPosition(_ packetNumber: UInt64, in ranges: [PacketRange]) -> BinarySearchResult {
         var low = 0
         var high = ranges.count
 
@@ -177,10 +124,75 @@ public final class AckManager: Sendable {
             } else if packetNumber > range.end {
                 low = mid + 1
             } else {
-                return mid
+                return .contained(at: mid)
             }
         }
-        return nil
+        return .insertAt(low)
+    }
+
+    /// Inserts a packet number into the ranges, merging as needed
+    /// Uses unified binary search for O(log n) performance
+    private func insertPacket(
+        _ packetNumber: UInt64,
+        receiveTime: ContinuousClock.Instant,
+        into state: inout AckState
+    ) {
+        switch findPacketPosition(packetNumber, in: state.receivedRanges) {
+        case .contained(let index):
+            // Already in a range, just update receive time if newer
+            if receiveTime > state.receivedRanges[index].receiveTime {
+                state.receivedRanges[index].receiveTime = receiveTime
+            }
+            return
+
+        case .insertAt(let insertIndex):
+            state.totalPacketCount += 1
+
+            // Check if we can extend the previous range
+            let canExtendPrevious = insertIndex > 0 &&
+                state.receivedRanges[insertIndex - 1].end + 1 == packetNumber
+
+            // Check if we can extend the next range
+            let canExtendNext = insertIndex < state.receivedRanges.count &&
+                packetNumber + 1 == state.receivedRanges[insertIndex].start
+
+            if canExtendPrevious && canExtendNext {
+                // Merge three ranges into one
+                let prevIndex = insertIndex - 1
+                state.receivedRanges[prevIndex].end = state.receivedRanges[insertIndex].end
+                state.receivedRanges[prevIndex].receiveTime = max(
+                    state.receivedRanges[prevIndex].receiveTime,
+                    receiveTime,
+                    state.receivedRanges[insertIndex].receiveTime
+                )
+                state.receivedRanges.remove(at: insertIndex)
+            } else if canExtendPrevious {
+                // Extend previous range
+                state.receivedRanges[insertIndex - 1].end = packetNumber
+                state.receivedRanges[insertIndex - 1].receiveTime = max(
+                    state.receivedRanges[insertIndex - 1].receiveTime,
+                    receiveTime
+                )
+            } else if canExtendNext {
+                // Extend next range
+                state.receivedRanges[insertIndex].start = packetNumber
+                state.receivedRanges[insertIndex].receiveTime = max(
+                    state.receivedRanges[insertIndex].receiveTime,
+                    receiveTime
+                )
+            } else {
+                // Insert new range
+                let newRange = PacketRange(start: packetNumber, end: packetNumber, receiveTime: receiveTime)
+                state.receivedRanges.insert(newRange, at: insertIndex)
+
+                // Prune if too many ranges (25% removal for smoother degradation)
+                if state.receivedRanges.count > Self.maxRanges {
+                    // Remove oldest (smallest) ranges, keep 75%
+                    let toRemove = state.receivedRanges.count - (Self.maxRanges * 3 / 4)
+                    state.receivedRanges.removeFirst(toRemove)
+                }
+            }
+        }
     }
 
     /// Generates an ACK frame if needed
