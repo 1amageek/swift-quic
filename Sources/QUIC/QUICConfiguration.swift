@@ -50,6 +50,11 @@ public struct QUICConfiguration: Sendable {
     /// Preferred connection ID length (default: 8)
     public var connectionIDLength: Int
 
+    // MARK: - Version
+
+    /// QUIC version to use
+    public var version: QUICVersion
+
     // MARK: - ALPN
 
     /// Application Layer Protocol Negotiation protocols
@@ -81,6 +86,7 @@ public struct QUICConfiguration: Sendable {
         self.maxAckDelay = .milliseconds(25)
         self.ackDelayExponent = 3
         self.connectionIDLength = 8
+        self.version = .v1
         self.alpn = ["h3"]
         self.certificatePath = nil
         self.privateKeyPath = nil

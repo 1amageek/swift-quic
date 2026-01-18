@@ -110,14 +110,18 @@ public final class QUICConnectionHandler: Sendable {
     // MARK: - Initial Key Derivation
 
     /// Derives and installs initial keys
+    /// - Parameter connectionID: The connection ID to use for key derivation.
+    ///   If nil, uses the current destination connection ID. Servers should pass
+    ///   the original DCID from the client's first Initial packet.
     /// - Returns: Tuple of client and server key material
-    public func deriveInitialKeys() throws -> (client: KeyMaterial, server: KeyMaterial) {
-        let (dcid, version) = connectionState.withLock { state in
+    public func deriveInitialKeys(connectionID: ConnectionID? = nil) throws -> (client: KeyMaterial, server: KeyMaterial) {
+        let (defaultCID, version) = connectionState.withLock { state in
             (state.currentDestinationCID, state.version)
         }
+        let cid = connectionID ?? defaultCID
 
         let (clientKeys, serverKeys) = try keySchedule.withLock { schedule in
-            try schedule.deriveInitialKeys(connectionID: dcid, version: version)
+            try schedule.deriveInitialKeys(connectionID: cid, version: version)
         }
 
         // Create and install crypto contexts

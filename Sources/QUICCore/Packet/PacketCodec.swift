@@ -154,15 +154,19 @@ public struct PacketEncoder: Sendable {
         // Build complete header with length
         let headerWithLength = buildLongHeaderWithLength(header, length: UInt64(lengthValue))
 
-        // Encrypt payload
+        // Build packet number bytes
+        let pnBytes = encodePacketNumber(packetNumber, length: header.packetNumberLength)
+
+        // RFC 9001 Section 5.3: AAD includes header up to and including the unprotected packet number
+        var aad = headerWithLength
+        aad.append(pnBytes)
+
+        // Encrypt payload with AAD that includes PN bytes
         let ciphertext = try sealer.seal(
             plaintext: payload,
             packetNumber: packetNumber,
-            header: headerWithLength
+            header: aad
         )
-
-        // Build packet number bytes
-        let pnBytes = encodePacketNumber(packetNumber, length: header.packetNumberLength)
 
         // Combine header + PN + ciphertext (before header protection)
         var packet = headerWithLength
@@ -222,15 +226,19 @@ public struct PacketEncoder: Sendable {
         unprotectedHeader.append(header.firstByte)
         unprotectedHeader.append(header.destinationConnectionID.bytes)
 
-        // Encrypt payload
+        // Build packet number bytes
+        let pnBytes = encodePacketNumber(packetNumber, length: header.packetNumberLength)
+
+        // RFC 9001 Section 5.3: AAD includes header up to and including the unprotected packet number
+        var aad = unprotectedHeader
+        aad.append(pnBytes)
+
+        // Encrypt payload with AAD that includes PN bytes
         let ciphertext = try sealer.seal(
             plaintext: payload,
             packetNumber: packetNumber,
-            header: unprotectedHeader
+            header: aad
         )
-
-        // Build packet number bytes
-        let pnBytes = encodePacketNumber(packetNumber, length: header.packetNumberLength)
 
         // Combine header + PN + ciphertext
         var packet = unprotectedHeader

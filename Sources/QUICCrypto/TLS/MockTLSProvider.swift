@@ -53,15 +53,53 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
             try await Task.sleep(for: delay)
         }
 
+        // Get local transport params and forceComplete status before acquiring the lock
+        let (localParams, wasForceCompleted) = state.withLock {
+            ($0.localTransportParameters, $0.handshakeComplete)
+        }
+
         return state.withLock { state in
             state.isClient = isClient
             state.handshakeStarted = true
 
             var outputs: [TLSOutput] = []
 
+            // If forceComplete() was called before startHandshake(), return all outputs
+            // needed to complete the handshake immediately
+            if wasForceCompleted {
+                // Derive keys
+                let handshakeClientSecret = generateDeterministicSecret(label: "client_hs")
+                let handshakeServerSecret = generateDeterministicSecret(label: "server_hs")
+                outputs.append(.keysAvailable(KeysAvailableInfo(
+                    level: .handshake,
+                    clientSecret: handshakeClientSecret,
+                    serverSecret: handshakeServerSecret
+                )))
+
+                let appClientSecret = generateDeterministicSecret(label: "client_app")
+                let appServerSecret = generateDeterministicSecret(label: "server_app")
+                outputs.append(.keysAvailable(KeysAvailableInfo(
+                    level: .application,
+                    clientSecret: appClientSecret,
+                    serverSecret: appServerSecret
+                )))
+
+                // Set mock peer transport parameters
+                state.peerTransportParameters = generateMockPeerTransportParameters()
+                state.negotiatedALPN = configuration.alpnProtocols.first
+
+                outputs.append(.handshakeComplete(HandshakeCompleteInfo(
+                    alpn: state.negotiatedALPN,
+                    zeroRTTAccepted: false,
+                    resumptionTicket: nil
+                )))
+
+                return outputs
+            }
+
             if isClient {
-                // Client: Generate ClientHello
-                let clientHello = generateMockClientHello()
+                // Client: Generate ClientHello (pass params to avoid nested lock)
+                let clientHello = generateMockClientHello(localParams: localParams)
                 outputs.append(.handshakeData(clientHello, level: .initial))
             }
 
@@ -266,7 +304,7 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
             state.handshakeKeysAvailable = true
 
             // Send EncryptedExtensions, Certificate, CertificateVerify, Finished
-            let handshakeMessages = generateMockServerHandshakeMessages()
+            let handshakeMessages = generateMockServerHandshakeMessages(localParams: state.localTransportParameters)
             outputs.append(.handshakeData(handshakeMessages, level: .handshake))
 
             if immediateCompletion {
@@ -315,10 +353,10 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
         return outputs
     }
 
-    private func generateMockClientHello() -> Data {
+    private func generateMockClientHello(localParams: Data?) -> Data {
         // Mock ClientHello with marker
         var data = Data("MOCK_CLIENT_HELLO".utf8)
-        if let params = state.withLock({ $0.localTransportParameters }) {
+        if let params = localParams {
             data.append(params)
         }
         return data
@@ -328,9 +366,9 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
         Data("MOCK_SERVER_HELLO".utf8)
     }
 
-    private func generateMockServerHandshakeMessages() -> Data {
+    private func generateMockServerHandshakeMessages(localParams: Data?) -> Data {
         var data = Data("MOCK_ENCRYPTED_EXTENSIONS".utf8)
-        if let params = state.withLock({ $0.localTransportParameters }) {
+        if let params = localParams {
             data.append(params)
         }
         data.append(Data("MOCK_CERTIFICATE".utf8))
@@ -350,6 +388,35 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
             return Data(data.suffix(from: 17))  // Skip mock header
         }
         return Data()
+    }
+
+    private func generateMockPeerTransportParameters() -> Data {
+        // Generate mock peer transport parameters with reasonable defaults
+        // This is a simplified encoding - just the parameter values needed for testing
+        // In a real implementation, this would be TLV encoded as per RFC 9000
+        var data = Data("MOCK_PEER_PARAMS".utf8)
+
+        // Encode some key values for the stream manager to parse
+        // These values allow opening streams and sending data
+        func appendUInt64(_ value: UInt64) {
+            var v = value.bigEndian
+            data.append(contentsOf: withUnsafeBytes(of: &v) { Data($0) })
+        }
+
+        // initial_max_data = 10MB
+        appendUInt64(10_000_000)
+        // initial_max_stream_data_bidi_local = 1MB
+        appendUInt64(1_000_000)
+        // initial_max_stream_data_bidi_remote = 1MB
+        appendUInt64(1_000_000)
+        // initial_max_stream_data_uni = 1MB
+        appendUInt64(1_000_000)
+        // initial_max_streams_bidi = 100
+        appendUInt64(100)
+        // initial_max_streams_uni = 100
+        appendUInt64(100)
+
+        return data
     }
 
     private func generateDeterministicSecret(label: String) -> SymmetricKey {

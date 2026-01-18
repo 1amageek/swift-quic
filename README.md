@@ -250,7 +250,7 @@ Run all tests:
 swift test
 ```
 
-290 tests covering:
+325 tests covering:
 - Frame encoding/decoding for all 19 frame types
 - Packet encoding/decoding with header protection
 - Coalesced packet building and parsing
@@ -261,6 +261,7 @@ swift test
 - Stream management (DataStream, StreamManager, FlowController)
 - Flow control (connection and stream level)
 - Out-of-order data reassembly (DataBuffer)
+- Priority scheduling (StreamPriority, StreamScheduler)
 - RFC 9000 Section 4.5 compliance (Stream Final Size)
 - Performance benchmarks
 
@@ -291,6 +292,10 @@ swift test --filter QUICStreamTests
 - **RFC 9000 Section 19**: All 19 frame types with proper encoding/decoding
 - **RFC 9001 Section 5.4**: Header protection with 4-byte packet number handling
 - **RFC 9001 Section 5.8**: Retry packet integrity tag parsing
+- **RFC 9218**: Extensible priority scheme (urgency 0-7, incremental flag)
+  - Priority-based stream scheduling
+  - Fair queuing within same priority level (round-robin)
+  - Mutable stream priorities
 
 ### Security
 
@@ -327,7 +332,7 @@ swift test --filter QUICStreamTests
   - [x] FlowController (connection and stream level)
   - [x] DataBuffer for out-of-order reassembly
   - [x] STOP_SENDING/RESET_STREAM handling
-  - [ ] Priority scheduling
+  - [x] Priority scheduling (RFC 9218)
 - [ ] Phase 5: Full Integration
   - [ ] E2E handshake with real TLS
   - [ ] Interoperability testing (quiche, quinn)
@@ -337,6 +342,7 @@ swift test --filter QUICStreamTests
 - [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html) - QUIC: A UDP-Based Multiplexed and Secure Transport
 - [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html) - Using TLS to Secure QUIC
 - [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html) - QUIC Loss Detection and Congestion Control
+- [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218.html) - Extensible Prioritization Scheme for HTTP
 
 ## License
 

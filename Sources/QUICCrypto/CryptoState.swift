@@ -37,52 +37,16 @@ public protocol HeaderProtection: Sendable {
 // MARK: - Crypto Open/Seal (inspired by quiche)
 
 /// Packet opener (decryption)
-public protocol PacketOpener: Sendable {
-    /// Decrypts a packet payload
-    /// - Parameters:
-    ///   - ciphertext: The encrypted payload
-    ///   - packetNumber: The packet number (used as part of nonce)
-    ///   - header: The packet header bytes (used as AAD)
-    /// - Returns: The decrypted payload
-    func open(ciphertext: Data, packetNumber: UInt64, header: Data) throws -> Data
-
-    /// Removes header protection
-    /// - Parameters:
-    ///   - sample: The sample from the packet (16 bytes)
-    ///   - firstByte: The first byte of the header
-    ///   - packetNumberBytes: The encrypted packet number bytes
-    /// - Returns: (unprotected first byte, unprotected packet number bytes)
-    /// - Throws: CryptoError if header protection removal fails
-    func removeHeaderProtection(
-        sample: Data,
-        firstByte: UInt8,
-        packetNumberBytes: Data
-    ) throws -> (UInt8, Data)
-}
+///
+/// Extends PacketOpenerProtocol from QUICCore for compatibility with PacketDecoder.
+/// All method requirements are inherited from PacketOpenerProtocol.
+public protocol PacketOpener: PacketOpenerProtocol {}
 
 /// Packet sealer (encryption)
-public protocol PacketSealer: Sendable {
-    /// Encrypts a packet payload
-    /// - Parameters:
-    ///   - plaintext: The payload to encrypt
-    ///   - packetNumber: The packet number (used as part of nonce)
-    ///   - header: The packet header bytes (used as AAD)
-    /// - Returns: The encrypted payload with authentication tag
-    func seal(plaintext: Data, packetNumber: UInt64, header: Data) throws -> Data
-
-    /// Applies header protection
-    /// - Parameters:
-    ///   - sample: The sample from the encrypted payload (16 bytes)
-    ///   - firstByte: The first byte of the header
-    ///   - packetNumberBytes: The packet number bytes
-    /// - Returns: (protected first byte, protected packet number bytes)
-    /// - Throws: CryptoError if header protection application fails
-    func applyHeaderProtection(
-        sample: Data,
-        firstByte: UInt8,
-        packetNumberBytes: Data
-    ) throws -> (UInt8, Data)
-}
+///
+/// Extends PacketSealerProtocol from QUICCore for compatibility with PacketEncoder.
+/// All method requirements are inherited from PacketSealerProtocol.
+public protocol PacketSealer: PacketSealerProtocol {}
 
 // MARK: - Crypto Context
 

@@ -63,6 +63,9 @@ private struct DataStreamInternalState: Sendable {
 
     /// Error code if peer sent RESET_STREAM
     var peerResetErrorCode: UInt64?
+
+    /// Stream priority for scheduling
+    var priority: StreamPriority
 }
 
 /// A single QUIC stream with send/receive buffers
@@ -86,12 +89,14 @@ public final class DataStream: Sendable {
     ///   - initialSendMaxData: Initial send flow control limit
     ///   - initialRecvMaxData: Initial receive flow control limit
     ///   - maxBufferSize: Maximum receive buffer size
+    ///   - priority: Initial stream priority (default: .default)
     public init(
         id: UInt64,
         isClient: Bool,
         initialSendMaxData: UInt64,
         initialRecvMaxData: UInt64,
-        maxBufferSize: UInt64 = 16 * 1024 * 1024
+        maxBufferSize: UInt64 = 16 * 1024 * 1024,
+        priority: StreamPriority = .default
     ) {
         self.id = id
 
@@ -117,7 +122,8 @@ public final class DataStream: Sendable {
             resetStreamSent: false,
             resetStreamErrorCode: nil,
             resetStreamReceived: false,
-            peerResetErrorCode: nil
+            peerResetErrorCode: nil,
+            priority: priority
         ))
     }
 
@@ -126,6 +132,14 @@ public final class DataStream: Sendable {
     /// Stream state machine
     public var state: StreamState {
         _internal.withLock { $0.state }
+    }
+
+    /// Stream priority for scheduling (mutable)
+    ///
+    /// Streams with lower urgency values are scheduled first.
+    public var priority: StreamPriority {
+        get { _internal.withLock { $0.priority } }
+        set { _internal.withLock { $0.priority = newValue } }
     }
 
     /// Whether this stream is bidirectional

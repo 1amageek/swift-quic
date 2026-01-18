@@ -34,6 +34,8 @@ This module implements QUIC stream multiplexing and flow control. It handles:
 | `FlowController.swift` | Connection and stream-level flow control |
 | `DataBuffer.swift` | Out-of-order data reassembly with FIN tracking |
 | `StreamState.swift` | Send/receive state enums per RFC 9000 |
+| `StreamPriority.swift` | RFC 9218 priority parameters (urgency, incremental) |
+| `StreamScheduler.swift` | Priority-based scheduling with fair queuing |
 
 ## Key Types
 
@@ -69,14 +71,18 @@ Manages all streams for a connection. Thread-safe via `Mutex<T>`.
 
 ```swift
 public final class StreamManager: Sendable {
-    // Open a new local stream
-    public func openStream(bidirectional: Bool) throws -> UInt64
+    // Open a new local stream with optional priority
+    public func openStream(bidirectional: Bool, priority: StreamPriority = .default) throws -> UInt64
 
     // Receive STREAM frame (creates stream if needed)
     public func receive(frame: StreamFrame) throws
 
-    // Generate frames for all streams
+    // Generate frames for all streams (priority-ordered)
     public func generateStreamFrames(maxBytes: Int) -> [StreamFrame]
+
+    // Priority management
+    public func setPriority(_ priority: StreamPriority, for streamID: UInt64) throws
+    public func priority(for streamID: UInt64) throws -> StreamPriority
 
     // Handle flow control frames
     public func handleMaxStreamData(_ frame: MaxStreamDataFrame)
@@ -87,6 +93,21 @@ public final class StreamManager: Sendable {
     // Cleanup
     public func closeStream(id streamID: UInt64)
     public func closeAllStreams(errorCode: UInt64?) -> [ResetStreamFrame]
+}
+```
+
+### StreamPriority
+
+RFC 9218-aligned priority parameters.
+
+```swift
+public struct StreamPriority: Sendable, Hashable, Comparable {
+    public let urgency: UInt8      // 0-7 (0 = highest)
+    public let incremental: Bool
+
+    public static let highest = StreamPriority(urgency: 0, incremental: false)
+    public static let `default` = StreamPriority(urgency: 3, incremental: false)
+    public static let lowest = StreamPriority(urgency: 7, incremental: false)
 }
 ```
 
@@ -244,13 +265,21 @@ let manager = StreamManager(
     peerInitialMaxStreamsBidi: 100
 )
 
-// Open stream and write
-let streamID = try manager.openStream(bidirectional: true)
-try manager.write(streamID: streamID, data: payload)
-try manager.finish(streamID: streamID)
+// Open stream with priority
+let criticalID = try manager.openStream(bidirectional: true, priority: .highest)
+let normalID = try manager.openStream(bidirectional: true)  // Default priority
+let backgroundID = try manager.openStream(bidirectional: true, priority: .lowest)
 
-// Generate frames for transmission
+// Write data
+try manager.write(streamID: criticalID, data: criticalPayload)
+try manager.write(streamID: normalID, data: normalPayload)
+try manager.write(streamID: backgroundID, data: backgroundPayload)
+
+// Generate frames - high priority streams served first
 let frames = manager.generateStreamFrames(maxBytes: 1200)
+
+// Adjust priority dynamically
+try manager.setPriority(.high, for: backgroundID)
 
 // Process received frames
 try manager.receive(frame: incomingStreamFrame)
@@ -261,19 +290,58 @@ if let data = manager.read(streamID: remoteStreamID) {
 }
 ```
 
+## Priority Scheduling (RFC 9218)
+
+### Overview
+
+RFC 9000 recommends implementations provide a way for applications to indicate stream priorities.
+This module implements RFC 9218 (HTTP/3 Extensible Priority Scheme) parameters.
+
+### Priority Parameters
+
+| Parameter | Range | Default | Description |
+|-----------|-------|---------|-------------|
+| `urgency` | 0-7 | 3 | Lower = higher priority |
+| `incremental` | bool | false | Supports progressive delivery |
+
+### Scheduling Algorithm
+
+```
+1. Group streams by urgency level (0-7)
+2. Process groups in priority order (0 first)
+3. Within same priority: round-robin for fairness
+4. Cursors persist between calls
+```
+
+### Example
+
+```
+Streams: A(u=0), B(u=0), C(u=3), D(u=7)
+
+Call 1: [A, B, C, D] - cursor for u=0 advances
+Call 2: [B, A, C, D] - round-robin within u=0
+```
+
+### Starvation Prevention
+
+High priority streams are served first, but if they exhaust their data/window,
+lower priority streams get bandwidth. The `incremental` flag (future) enables
+more aggressive interleaving.
+
 ## Testing
 
 ```bash
 swift test --filter QUICStreamTests
 ```
 
-124 tests covering:
+159 tests covering:
 - DataStream state machine
 - StreamManager multiplexing
 - FlowController limits
 - DataBuffer reassembly
 - Edge cases and error handling
 - **RFC 9000 Section 4.5 compliance** (Final Size)
+- **RFC 9218 Priority Scheduling** (StreamPriority, StreamScheduler)
 
 ### RFC準拠テスト
 

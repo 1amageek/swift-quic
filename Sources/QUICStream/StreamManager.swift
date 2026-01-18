@@ -33,6 +33,9 @@ public final class StreamManager: Sendable {
         /// Flow controller
         var flowController: FlowController
 
+        /// Stream scheduler for priority-based scheduling
+        var scheduler: StreamScheduler
+
         /// Next local bidirectional stream index
         var nextLocalBidiStreamIndex: UInt64
 
@@ -103,6 +106,7 @@ public final class StreamManager: Sendable {
         self.state = Mutex(StreamManagerState(
             streams: [:],
             flowController: flowController,
+            scheduler: StreamScheduler(),
             nextLocalBidiStreamIndex: 0,
             nextLocalUniStreamIndex: 0,
             isClient: isClient,
@@ -116,10 +120,12 @@ public final class StreamManager: Sendable {
     // MARK: - Stream Lifecycle
 
     /// Open a new locally-initiated stream
-    /// - Parameter bidirectional: Whether to create a bidirectional stream
+    /// - Parameters:
+    ///   - bidirectional: Whether to create a bidirectional stream
+    ///   - priority: Initial stream priority (default: .default)
     /// - Returns: The new stream ID
     /// - Throws: StreamManagerError if stream limit reached
-    public func openStream(bidirectional: Bool) throws -> UInt64 {
+    public func openStream(bidirectional: Bool, priority: StreamPriority = .default) throws -> UInt64 {
         try state.withLock { state in
             // Check stream limit
             guard state.flowController.canOpenStream(bidirectional: bidirectional) else {
@@ -153,7 +159,8 @@ public final class StreamManager: Sendable {
                 isClient: state.isClient,
                 initialSendMaxData: sendLimit,
                 initialRecvMaxData: recvLimit,
-                maxBufferSize: state.maxBufferSize
+                maxBufferSize: state.maxBufferSize,
+                priority: priority
             )
 
             state.streams[streamID] = stream
@@ -450,6 +457,10 @@ public final class StreamManager: Sendable {
     // MARK: - Frame Generation
 
     /// Generate outgoing STREAM frames
+    ///
+    /// Streams are scheduled by priority (urgency 0-7, where 0 is highest).
+    /// Within the same priority level, fair queuing (round-robin) is used.
+    ///
     /// - Parameter maxBytes: Maximum total bytes for frames
     /// - Returns: Array of STREAM frames to send
     public func generateStreamFrames(maxBytes: Int) -> [StreamFrame] {
@@ -457,8 +468,10 @@ public final class StreamManager: Sendable {
             var frames: [StreamFrame] = []
             var remainingBytes = maxBytes
 
-            // Simple round-robin across streams with data to send
-            for (_, stream) in state.streams {
+            // Schedule streams by priority with fair queuing
+            let orderedStreams = state.scheduler.scheduleStreams(state.streams)
+
+            for (_, stream) in orderedStreams {
                 guard stream.hasDataToSend && remainingBytes > 0 else { continue }
 
                 // Check connection-level flow control
@@ -471,9 +484,17 @@ public final class StreamManager: Sendable {
                 // Apply both connection and stream window limits
                 let maxBytesToSend = min(remainingBytes, Int(effectiveWindow))
                 let streamFrames = stream.generateFrames(maxBytes: maxBytesToSend)
+
                 for frame in streamFrames {
                     state.flowController.recordBytesSent(UInt64(frame.data.count))
                     remainingBytes -= 11 + frame.data.count  // Approximate overhead
+                }
+
+                // Advance cursor for fairness within this priority level
+                if !streamFrames.isEmpty {
+                    let urgency = stream.priority.urgency
+                    let groupSize = orderedStreams.filter { $0.stream.priority.urgency == urgency }.count
+                    state.scheduler.advanceCursor(for: urgency, groupSize: groupSize)
                 }
 
                 frames.append(contentsOf: streamFrames)
@@ -535,6 +556,35 @@ public final class StreamManager: Sendable {
             }
 
             return frames
+        }
+    }
+
+    // MARK: - Stream Priority
+
+    /// Set stream priority
+    /// - Parameters:
+    ///   - priority: New priority
+    ///   - streamID: Stream to update
+    /// - Throws: StreamManagerError if stream not found
+    public func setPriority(_ priority: StreamPriority, for streamID: UInt64) throws {
+        try state.withLock { state in
+            guard let stream = state.streams[streamID] else {
+                throw StreamManagerError.streamNotFound(streamID)
+            }
+            stream.priority = priority
+        }
+    }
+
+    /// Get stream priority
+    /// - Parameter streamID: Stream to query
+    /// - Returns: Current priority
+    /// - Throws: StreamManagerError if stream not found
+    public func priority(for streamID: UInt64) throws -> StreamPriority {
+        try state.withLock { state in
+            guard let stream = state.streams[streamID] else {
+                throw StreamManagerError.streamNotFound(streamID)
+            }
+            return stream.priority
         }
     }
 
