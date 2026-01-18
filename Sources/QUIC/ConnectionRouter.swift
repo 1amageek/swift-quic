@@ -56,6 +56,10 @@ public final class ConnectionRouter: Sendable {
     /// Connection ID to connection mapping
     private let connections: Mutex<[ConnectionID: ManagedConnection]>
 
+    /// Reverse mapping: Connection to its registered CIDs
+    /// This is the single source of truth for which CIDs belong to which connection.
+    private let connectionCIDs: Mutex<[ObjectIdentifier: Set<ConnectionID>]>
+
     /// Whether this is a server (can accept new connections)
     private let isServer: Bool
 
@@ -70,6 +74,7 @@ public final class ConnectionRouter: Sendable {
     ///   - dcidLength: Expected DCID length for short headers
     public init(isServer: Bool, dcidLength: Int = 8) {
         self.connections = Mutex([:])
+        self.connectionCIDs = Mutex([:])
         self.isServer = isServer
         self.packetProcessor = PacketProcessor(dcidLength: dcidLength)
     }
@@ -124,35 +129,50 @@ public final class ConnectionRouter: Sendable {
     // MARK: - Connection Management
 
     /// Registers a connection with its connection IDs
+    ///
+    /// This is the primary method for registering a connection.
+    /// The router tracks all CIDs internally via reverse mapping.
+    ///
     /// - Parameters:
     ///   - connection: The connection to register
     ///   - connectionIDs: The connection IDs to associate with this connection
     public func register(_ connection: ManagedConnection, for connectionIDs: [ConnectionID]) {
+        let connID = ObjectIdentifier(connection)
         connections.withLock { conns in
             for cid in connectionIDs {
                 conns[cid] = connection
             }
         }
+        connectionCIDs.withLock { $0[connID, default: []].formUnion(connectionIDs) }
     }
 
     /// Registers a connection with its source connection ID
     /// - Parameter connection: The connection to register
     public func register(_ connection: ManagedConnection) {
         let scid = connection.sourceConnectionID
-        connections.withLock { $0[scid] = connection }
+        register(connection, for: [scid])
     }
 
-    /// Unregisters a connection
+    /// Unregisters a connection and all its associated CIDs
+    ///
+    /// Uses the internal reverse mapping to find all CIDs,
+    /// ensuring complete cleanup regardless of how many CIDs were registered.
+    ///
     /// - Parameter connection: The connection to unregister
     public func unregister(_ connection: ManagedConnection) {
-        let scid = connection.sourceConnectionID
-        _ = connections.withLock { conns in
-            conns.removeValue(forKey: scid)
+        let connID = ObjectIdentifier(connection)
+        // Get all CIDs from our tracking (single source of truth)
+        let cids = connectionCIDs.withLock { $0.removeValue(forKey: connID) } ?? []
+        connections.withLock { conns in
+            for cid in cids {
+                conns.removeValue(forKey: cid)
+            }
         }
     }
 
-    /// Unregisters specific connection IDs
+    /// Unregisters specific connection IDs (without connection reference)
     /// - Parameter connectionIDs: The IDs to unregister
+    @available(*, deprecated, message: "Use retireConnectionID(_:for:) instead for proper tracking")
     public func unregister(connectionIDs: [ConnectionID]) {
         connections.withLock { conns in
             for cid in connectionIDs {
@@ -166,13 +186,34 @@ public final class ConnectionRouter: Sendable {
     ///   - connectionID: The new connection ID
     ///   - connection: The connection to associate
     public func addConnectionID(_ connectionID: ConnectionID, for connection: ManagedConnection) {
+        let connID = ObjectIdentifier(connection)
         connections.withLock { $0[connectionID] = connection }
+        _ = connectionCIDs.withLock { $0[connID, default: []].insert(connectionID) }
     }
 
     /// Retires a connection ID
     /// - Parameter connectionID: The ID to retire
+    @available(*, deprecated, message: "Use retireConnectionID(_:for:) instead for proper tracking")
     public func retireConnectionID(_ connectionID: ConnectionID) {
         _ = connections.withLock { $0.removeValue(forKey: connectionID) }
+    }
+
+    /// Retires a connection ID with proper tracking
+    /// - Parameters:
+    ///   - connectionID: The ID to retire
+    ///   - connection: The connection that owns this ID
+    public func retireConnectionID(_ connectionID: ConnectionID, for connection: ManagedConnection) {
+        let connID = ObjectIdentifier(connection)
+        _ = connections.withLock { $0.removeValue(forKey: connectionID) }
+        _ = connectionCIDs.withLock { $0[connID]?.remove(connectionID) }
+    }
+
+    /// Gets all registered CIDs for a connection
+    /// - Parameter connection: The connection
+    /// - Returns: Set of connection IDs registered for this connection
+    public func registeredConnectionIDs(for connection: ManagedConnection) -> Set<ConnectionID> {
+        let connID = ObjectIdentifier(connection)
+        return connectionCIDs.withLock { $0[connID] ?? [] }
     }
 
     /// Gets a connection by its ID

@@ -196,7 +196,19 @@ public final class QUICConnectionHandler: Sendable {
                 result.handshakeComplete = true
 
             case .stream(let streamFrame):
+                // Check if this is a new peer-initiated stream
+                let isNewStream = !streamManager.hasStream(id: streamFrame.streamID)
+
                 try streamManager.receive(frame: streamFrame)
+
+                // Track new peer-initiated streams
+                if isNewStream {
+                    let isRemote = isRemoteStream(streamFrame.streamID)
+                    if isRemote {
+                        result.newStreams.append(streamFrame.streamID)
+                    }
+                }
+
                 // Read available data from the stream
                 if let data = streamManager.read(streamID: streamFrame.streamID) {
                     result.streamData.append((streamFrame.streamID, data))
@@ -571,6 +583,16 @@ public final class QUICConnectionHandler: Sendable {
         pnSpaceManager.rttEstimator.smoothedRTT
     }
 
+    /// Checks if a stream ID is from the remote peer
+    /// - Parameter streamID: The stream ID to check
+    /// - Returns: True if the stream was initiated by the remote peer
+    private func isRemoteStream(_ streamID: UInt64) -> Bool {
+        let isClient = connectionState.withLock { $0.role == .client }
+        let isClientInitiated = StreamID.isClientInitiated(streamID)
+        // Remote stream: if we're client and stream is server-initiated, or vice versa
+        return isClient != isClientInitiated
+    }
+
     /// Connection role
     public var role: ConnectionRole {
         connectionState.withLock { $0.role }
@@ -610,6 +632,9 @@ public struct FrameProcessingResult: Sendable {
 
     /// Stream data received (stream ID, data)
     public var streamData: [(UInt64, Data)] = []
+
+    /// New peer-initiated streams that were created
+    public var newStreams: [UInt64] = []
 
     /// Whether the handshake completed
     public var handshakeComplete: Bool = false

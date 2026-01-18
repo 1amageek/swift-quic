@@ -76,6 +76,52 @@ public final class PacketProcessor: Sendable {
         dcidLength.withLock { $0 = length }
     }
 
+    // MARK: - Unified Key Management
+
+    /// Installs keys from TLS keying material
+    ///
+    /// This is the unified entry point for key installation.
+    /// PacketProcessor is the single source of truth for crypto contexts.
+    ///
+    /// - Parameters:
+    ///   - info: Keys available info from TLS provider
+    ///   - isClient: Whether this is the client side
+    /// - Throws: Error if key derivation or context creation fails
+    public func installKeys(_ info: KeysAvailableInfo, isClient: Bool) throws {
+        // Derive key material from traffic secrets
+        let clientKeys = try KeyMaterial.derive(from: info.clientSecret)
+        let serverKeys = try KeyMaterial.derive(from: info.serverSecret)
+
+        // Client reads server keys, writes client keys (and vice versa)
+        let readKeys = isClient ? serverKeys : clientKeys
+        let writeKeys = isClient ? clientKeys : serverKeys
+
+        // Create opener (for decryption) and sealer (for encryption)
+        let opener = try AES128GCMOpener(keyMaterial: readKeys)
+        let sealer = try AES128GCMSealer(keyMaterial: writeKeys)
+
+        // Install the crypto context
+        let context = CryptoContext(opener: opener, sealer: sealer)
+        installContext(context, for: info.level)
+    }
+
+    /// Discards keys for an encryption level
+    ///
+    /// This is the unified entry point for key discarding.
+    /// Call this after all packets at this level have been sent.
+    ///
+    /// - Parameter level: The encryption level to discard
+    public func discardKeys(for level: EncryptionLevel) {
+        discardContext(for: level)
+    }
+
+    /// Checks if keys are installed for a level
+    /// - Parameter level: The encryption level
+    /// - Returns: True if keys are available for this level
+    public func hasKeys(for level: EncryptionLevel) -> Bool {
+        contexts.withLock { $0[level] != nil }
+    }
+
     // MARK: - Packet Decryption
 
     /// Decrypts a single QUIC packet
@@ -152,12 +198,14 @@ public final class PacketProcessor: Sendable {
     ///   - frames: Frames to include
     ///   - header: The long header template
     ///   - packetNumber: The packet number
+    ///   - padToMinimum: If true and this is an Initial packet, pad to 1200 bytes
     /// - Returns: The encrypted packet data
     /// - Throws: PacketCodecError if encryption fails
     public func encryptLongHeaderPacket(
         frames: [Frame],
         header: LongHeader,
-        packetNumber: UInt64
+        packetNumber: UInt64,
+        padToMinimum: Bool = true
     ) throws -> Data {
         let level = header.packetType.encryptionLevel
 
@@ -170,7 +218,8 @@ public final class PacketProcessor: Sendable {
             frames: frames,
             header: header,
             packetNumber: packetNumber,
-            sealer: sealer
+            sealer: sealer,
+            padToMinimum: padToMinimum
         )
     }
 

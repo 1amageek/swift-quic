@@ -10,10 +10,11 @@ swift-quic provides a modern, type-safe QUIC implementation designed for the swi
 
 - **RFC 9000/9001/9002 Compliant**: Core QUIC transport protocol implementation
 - **Type-Safe**: Leverages Swift's type system for compile-time safety
-- **Modern Concurrency**: Built with async/await and Sendable types
+- **Modern Concurrency**: Built with async/await, Sendable types, and structured concurrency
 - **Modular Design**: Clean separation between core types, crypto, and connection handling
-- **High Performance**: Optimized varint decoding, inlined hot paths
+- **High Performance**: Optimized for 1Gbps+ throughput with low-latency packet processing
 - **Memory Safe**: Validated encoding/decoding with bounds checking
+- **Graceful Shutdown**: Proper continuation management prevents hangs
 
 ## Requirements
 
@@ -34,7 +35,17 @@ dependencies: [
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  QUICConnection (Connection Handler)                        │
+│  QUICEndpoint (Server/Client Entry Point)                   │
+├─────────────────────────────────────────────────────────────┤
+│  ManagedConnection (High-Level Connection API)              │
+│  - AsyncStream<QUICStreamProtocol> for incoming streams     │
+│  - Graceful shutdown with continuation cleanup              │
+├─────────────────────────────────────────────────────────────┤
+│  ConnectionRouter (DCID-based Packet Routing)               │
+├─────────────────────────────────────────────────────────────┤
+│  QUICConnectionHandler (Connection State Machine)           │
+├─────────────────────────────────────────────────────────────┤
+│  PacketProcessor (Encryption/Decryption Integration)        │
 ├─────────────────────────────────────────────────────────────┤
 │  QUICStream (Stream Multiplexing, Flow Control)             │
 ├─────────────────────────────────────────────────────────────┤
@@ -51,6 +62,16 @@ dependencies: [
 ```
 
 ## Module Structure
+
+### QUIC
+
+High-level API for QUIC connections:
+
+- **QUICEndpoint**: Server and client endpoint management
+- **ManagedConnection**: High-level connection with async stream APIs
+- **ManagedStream**: Stream wrapper implementing QUICStreamProtocol
+- **ConnectionRouter**: DCID-based packet routing with reverse mapping
+- **PacketProcessor**: Unified packet encryption/decryption
 
 ### QUICCore
 
@@ -102,6 +123,40 @@ Stream management and flow control (RFC 9000 Section 2-4):
 - **StreamState**: Send/receive state machines per RFC 9000
 
 ## Usage
+
+### High-Level API (ManagedConnection)
+
+```swift
+import QUIC
+
+// Server: Accept incoming connections
+let endpoint = QUICEndpoint(role: .server)
+try await endpoint.start(address: SocketAddress(ipAddress: "0.0.0.0", port: 4433))
+
+for try await connection in endpoint.incomingConnections {
+    Task {
+        // Handle incoming streams
+        for try await stream in connection.incomingStreams {
+            let data = try await stream.read()
+            try await stream.write(responseData)
+            try await stream.closeWrite()
+        }
+    }
+}
+
+// Client: Connect to server
+let client = QUICEndpoint(role: .client)
+let connection = try await client.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4433))
+
+// Open a stream
+let stream = try await connection.openStream()
+try await stream.write(requestData)
+try await stream.closeWrite()
+let response = try await stream.read()
+
+// Graceful shutdown
+await connection.shutdown()
+```
 
 ### Frame Encoding/Decoding
 
@@ -179,53 +234,78 @@ let encoded = try encoder.encodeLongHeaderPacket(
 
 Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 
+### Throughput Capacity
+
+| Scenario | Max Throughput | Latency |
+|----------|---------------|---------|
+| **Short header (1-RTT)** | ~1.7 Gbps | 5.6 μs/packet |
+| **Long header (Initial)** | ~860 Mbps | 11 μs/packet |
+
+### Packet Processing
+
+| Operation | Performance | Latency |
+|-----------|-------------|---------|
+| Short header parsing | 3.8M ops/sec | 0.26 μs |
+| Long header parsing | 275k ops/sec | 3.6 μs |
+| DCID extraction (short) | 973k ops/sec | 1.0 μs |
+| DCID extraction (long) | 328k ops/sec | 3.0 μs |
+| ConnectionRouter lookup | 233k ops/sec | 4.3 μs |
+| Packet type extraction | 4.7M ops/sec | 0.21 μs |
+
 ### Core Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Varint encoding | 3.3M ops/sec |
-| Varint decoding | 2.3M ops/sec |
-| ConnectionID creation | 1.4M ops/sec |
-| ConnectionID equality | 49M ops/sec |
+| Varint encoding | 8.4M ops/sec |
+| Varint decoding | 743k ops/sec |
+| ConnectionID creation | 578k ops/sec |
+| ConnectionID equality | 66M ops/sec |
+| ConnectionID hash | 14.3M ops/sec |
+| CID Dictionary lookup | 9.8M ops/sec |
 
 ### Frame Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| PING frame encoding | 9.4M ops/sec |
-| PING frame decoding | 21.8M ops/sec |
-| ACK frame encoding | 1.3M ops/sec |
-| ACK frame decoding | 1.6M ops/sec |
-| STREAM frame encoding | 2.4M ops/sec |
-| STREAM frame decoding | 5.0M ops/sec |
-| CRYPTO frame encoding | 2.6M ops/sec |
-| Multiple frames encoding | 200k ops/sec |
-| Frame roundtrip | 846k ops/sec |
+| PING frame encoding | 7.3M ops/sec |
+| PING frame decoding | 15.3M ops/sec |
+| ACK frame encoding | 558k ops/sec |
+| ACK frame decoding | 1.5M ops/sec |
+| STREAM frame encoding | 1.2M ops/sec |
+| STREAM frame decoding | 4.8M ops/sec |
+| CRYPTO frame encoding | 779k ops/sec |
+| Multiple frames encoding | 213k ops/sec |
+| Frame roundtrip | 721k ops/sec |
+
+### Crypto Operations
+
+| Operation | Performance | Latency |
+|-----------|-------------|---------|
+| Initial key derivation | 12.9k ops/sec | 77 μs |
+| KeyMaterial derivation | 47k ops/sec | 21 μs |
+| AES-GCM Sealer creation | 4.3M ops/sec | 0.23 μs |
+
+### Loss Detection & Recovery
+
+| Operation | Performance |
+|-----------|-------------|
+| Sequential packet recording | 3.6M ops/sec |
+| Packet recording with gaps | 476k ops/sec |
+| ACK frame generation | 32.5k ops/sec |
+| Packet send recording | 5.3M ops/sec |
+| ACK processing (100 packets) | 6.5k ops/sec |
+| Loss detection | 6.1k ops/sec |
+| Multi-range ACK (25 ranges) | 2.9k ops/sec |
 
 ### Packet Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Long header parsing | 834k ops/sec |
-| Short header parsing | 5.7M ops/sec |
 | Packet number encoding | 5.2M ops/sec |
-| Packet number decoding | 8.2M ops/sec |
-| Coalesced packet building | 751k ops/sec |
-| Coalesced packet parsing | 324k ops/sec |
-| Packet type sorting | 524k ops/sec |
-
-### Loss Detection & Recovery (QUICRecovery)
-
-| Operation | Performance |
-|-----------|-------------|
-| Sequential packet recording | 6.5M ops/sec |
-| Packet recording with gaps | 1.2M ops/sec |
-| ACK frame generation | 67k ops/sec |
-| Packet send recording | 4.7M ops/sec |
-| ACK processing (100 packets) | 12k ops/sec |
-| Loss detection | 14k ops/sec |
-| Multi-range ACK (25 ranges) | 4k ops/sec |
-| Full ACK cycle (50 packets) | 10k packets/sec |
+| Packet number decoding | 7.3M ops/sec |
+| Coalesced packet building | 607k ops/sec |
+| Coalesced packet parsing | 139k ops/sec |
+| Packet type sorting | 308k ops/sec |
 
 ### Memory Efficiency
 
@@ -250,7 +330,7 @@ Run all tests:
 swift test
 ```
 
-325 tests covering:
+353 tests covering:
 - Frame encoding/decoding for all 19 frame types
 - Packet encoding/decoding with header protection
 - Coalesced packet building and parsing
@@ -263,6 +343,8 @@ swift test
 - Out-of-order data reassembly (DataBuffer)
 - Priority scheduling (StreamPriority, StreamScheduler)
 - RFC 9000 Section 4.5 compliance (Stream Final Size)
+- ManagedConnection shutdown safety (continuation management)
+- AsyncStream lifecycle and graceful termination
 - Performance benchmarks
 
 Run specific test suites:
@@ -272,6 +354,8 @@ swift test --filter FrameCodecTests
 swift test --filter PacketCodecTests
 swift test --filter CoalescedPacketsTests
 swift test --filter QUICStreamTests
+swift test --filter EndpointTests
+swift test --filter Benchmark
 ```
 
 ## RFC Compliance
@@ -304,6 +388,7 @@ swift test --filter QUICStreamTests
 - STREAM/DATAGRAM frame boundary validation
 - Flow control violation detection (connection close on violation)
 - RESET_STREAM final size validation against advertised limits
+- Graceful shutdown prevents continuation leaks and resource exhaustion
 
 ## Roadmap
 
@@ -333,9 +418,16 @@ swift test --filter QUICStreamTests
   - [x] DataBuffer for out-of-order reassembly
   - [x] STOP_SENDING/RESET_STREAM handling
   - [x] Priority scheduling (RFC 9218)
-- [ ] Phase 5: Full Integration
+- [x] Phase 5: High-Level API
+  - [x] QUICEndpoint (server/client entry point)
+  - [x] ManagedConnection with async stream APIs
+  - [x] ConnectionRouter with DCID routing
+  - [x] PacketProcessor for encryption integration
+  - [x] Graceful shutdown with continuation cleanup
+- [ ] Phase 6: Full Integration
   - [ ] E2E handshake with real TLS
   - [ ] Interoperability testing (quiche, quinn)
+  - [ ] Congestion control (New Reno, Cubic)
 
 ## References
 

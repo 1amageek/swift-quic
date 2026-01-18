@@ -215,6 +215,13 @@ public final class StreamManager: Sendable {
         }
     }
 
+    /// Check if a stream exists
+    /// - Parameter streamID: The stream ID to check
+    /// - Returns: True if the stream exists
+    public func hasStream(id streamID: UInt64) -> Bool {
+        state.withLock { $0.streams[streamID] != nil }
+    }
+
     /// Close a stream
     /// - Parameter streamID: Stream to close
     public func closeStream(id streamID: UInt64) {
@@ -589,13 +596,6 @@ public final class StreamManager: Sendable {
     }
 
     // MARK: - Stream Status
-
-    /// Check if a stream exists
-    /// - Parameter streamID: Stream to check
-    /// - Returns: true if stream exists
-    public func hasStream(id streamID: UInt64) -> Bool {
-        state.withLock { $0.streams[streamID] != nil }
-    }
 
     /// Check if stream has data to read
     /// - Parameter streamID: Stream to check
