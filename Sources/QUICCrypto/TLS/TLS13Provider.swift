@@ -108,11 +108,24 @@ public struct TLSConfiguration: Sendable {
     /// Private key (DER encoded) - alternative to file path
     public var privateKey: Data?
 
+    /// Signing key for CertificateVerify (server)
+    public var signingKey: SigningKey?
+
     /// Whether to verify peer certificates (default: true)
     public var verifyPeer: Bool
 
     /// Trusted CA certificates for peer verification (DER encoded)
     public var trustedCACertificates: [Data]?
+
+    /// Parsed trusted root certificates for chain validation
+    public var trustedRootCertificates: [X509Certificate]?
+
+    /// Expected peer public key for verification (x963 format for ECDSA)
+    /// Used for simplified verification when full X.509 parsing is not needed
+    public var expectedPeerPublicKey: Data?
+
+    /// Whether to allow self-signed certificates
+    public var allowSelfSigned: Bool
 
     /// Server name for SNI (client only)
     public var serverName: String?
@@ -123,6 +136,10 @@ public struct TLSConfiguration: Sendable {
     /// Maximum early data size for 0-RTT (0 to disable)
     public var maxEarlyDataSize: UInt32
 
+    /// Supported key exchange groups (in preference order)
+    /// Used by server to select key share group or send HelloRetryRequest
+    public var supportedGroups: [NamedGroup]
+
     /// Creates a default configuration
     public init() {
         self.alpnProtocols = ["h3"]
@@ -130,11 +147,15 @@ public struct TLSConfiguration: Sendable {
         self.privateKeyPath = nil
         self.certificateChain = nil
         self.privateKey = nil
+        self.signingKey = nil
         self.verifyPeer = true
         self.trustedCACertificates = nil
+        self.trustedRootCertificates = nil
+        self.allowSelfSigned = false
         self.serverName = nil
         self.sessionTicket = nil
         self.maxEarlyDataSize = 0
+        self.supportedGroups = [.x25519, .secp256r1]
     }
 
     /// Creates a client configuration
@@ -148,7 +169,20 @@ public struct TLSConfiguration: Sendable {
         return config
     }
 
-    /// Creates a server configuration
+    /// Creates a server configuration with inline signing key
+    public static func server(
+        signingKey: SigningKey,
+        certificateChain: [Data],
+        alpnProtocols: [String] = ["h3"]
+    ) -> TLSConfiguration {
+        var config = TLSConfiguration()
+        config.signingKey = signingKey
+        config.certificateChain = certificateChain
+        config.alpnProtocols = alpnProtocols
+        return config
+    }
+
+    /// Creates a server configuration with file paths
     public static func server(
         certificatePath: String,
         privateKeyPath: String,
@@ -167,5 +201,11 @@ public struct TLSConfiguration: Sendable {
         config.serverName = serverName
         config.alpnProtocols = ["libp2p"]
         return config
+    }
+
+    /// Whether this configuration has certificate material for server authentication
+    public var hasCertificate: Bool {
+        (certificateChain != nil && signingKey != nil) ||
+        (certificatePath != nil && privateKeyPath != nil)
     }
 }

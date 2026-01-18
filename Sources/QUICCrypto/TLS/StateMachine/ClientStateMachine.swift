@@ -1,0 +1,852 @@
+/// TLS 1.3 Client State Machine
+///
+/// Implements the client-side TLS 1.3 handshake for QUIC.
+
+import Foundation
+import Crypto
+import Synchronization
+import QUICCore
+
+// MARK: - Client State Machine
+
+/// Client-side TLS 1.3 state machine
+public final class ClientStateMachine: Sendable {
+
+    private let state = Mutex<ClientState>(ClientState())
+
+    private struct ClientState: Sendable {
+        var handshakeState: ClientHandshakeState = .start
+        var context: HandshakeContext = HandshakeContext()
+        var configuration: TLSConfiguration = TLSConfiguration()
+    }
+
+    // MARK: - Initialization
+
+    public init() {}
+
+    // MARK: - Start Handshake
+
+    /// Generate ClientHello and start the handshake
+    /// - Parameters:
+    ///   - configuration: TLS configuration
+    ///   - transportParameters: QUIC transport parameters to send
+    ///   - sessionTicket: Optional session ticket for resumption
+    ///   - attemptEarlyData: Whether to attempt 0-RTT early data
+    /// - Returns: The ClientHello message and any TLS outputs
+    public func startHandshake(
+        configuration: TLSConfiguration,
+        transportParameters: Data,
+        sessionTicket: SessionTicketData? = nil,
+        attemptEarlyData: Bool = false
+    ) throws -> (clientHello: Data, outputs: [TLSOutput]) {
+        return try state.withLock { state in
+            guard state.handshakeState == .start else {
+                throw TLSHandshakeError.unexpectedMessage("Handshake already started")
+            }
+
+            state.configuration = configuration
+            state.context.localTransportParameters = transportParameters
+            state.context.sessionTicket = sessionTicket
+
+            // Generate ephemeral key for key exchange (prefer X25519)
+            let keyExchange = try KeyExchange.generate(for: .x25519)
+            state.context.keyExchange = keyExchange
+
+            // Generate random
+            var random = Data(count: TLSConstants.randomLength)
+            random.withUnsafeMutableBytes { ptr in
+                _ = SecRandomCopyBytes(kSecRandomDefault, TLSConstants.randomLength, ptr.baseAddress!)
+            }
+            state.context.clientRandom = random
+
+            // Generate session ID for middlebox compatibility
+            var sessionID = Data(count: 32)
+            sessionID.withUnsafeMutableBytes { ptr in
+                _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
+            }
+            state.context.sessionID = sessionID
+
+            // Build extensions
+            var extensions: [TLSExtension] = []
+
+            // supported_versions (required for TLS 1.3)
+            extensions.append(.supportedVersionsClient([TLSConstants.version13]))
+
+            // supported_groups
+            extensions.append(.supportedGroupsList([.x25519, .secp256r1]))
+
+            // signature_algorithms
+            extensions.append(.signatureAlgorithmsList([
+                .ecdsa_secp256r1_sha256,
+                .rsa_pss_rsae_sha256
+            ]))
+
+            // key_share
+            extensions.append(.keyShareClient([keyExchange.keyShareEntry()]))
+
+            // ALPN
+            if !configuration.alpnProtocols.isEmpty {
+                extensions.append(.alpnProtocols(configuration.alpnProtocols))
+            }
+
+            // Server name (SNI)
+            if let serverName = configuration.serverName {
+                extensions.append(.serverName(ServerNameExtension(hostName: serverName)))
+            }
+
+            // QUIC transport parameters
+            extensions.append(.quicTransportParameters(transportParameters))
+
+            // Build the cipher suites list
+            var cipherSuites: [CipherSuite] = [.tls_aes_128_gcm_sha256]
+
+            // PSK-related extensions (if we have a session ticket)
+            var pskExtensionsInfo: (offered: OfferedPsks, ticket: SessionTicketData)?
+
+            if let ticket = sessionTicket, ticket.isValid() {
+                // If resuming, prefer the original cipher suite
+                cipherSuites = [ticket.cipherSuite, .tls_aes_128_gcm_sha256]
+
+                // psk_key_exchange_modes (required when offering PSKs)
+                // QUIC requires psk_dhe_ke mode
+                extensions.append(.pskKeyExchangeModesList([.psk_dhe_ke]))
+
+                // early_data (if attempting 0-RTT)
+                if attemptEarlyData && ticket.maxEarlyDataSize > 0 {
+                    extensions.append(.earlyDataClient())
+                    state.context.earlyDataState.attemptingEarlyData = true
+                    state.context.earlyDataState.maxEarlyDataSize = ticket.maxEarlyDataSize
+                }
+
+                // pre_shared_key must be the last extension
+                // Create the PSK identity from the ticket
+                let pskIdentity = PskIdentity(ticket: ticket)
+                let offeredPsks = OfferedPsks(
+                    identities: [pskIdentity],
+                    binders: [Data(repeating: 0, count: ticket.cipherSuite.hashLength)] // Placeholder
+                )
+                pskExtensionsInfo = (offered: offeredPsks, ticket: ticket)
+
+                // Initialize key schedule with PSK
+                let psk = SymmetricKey(data: ticket.resumptionPSK)
+                state.context.keySchedule = TLSKeySchedule(cipherSuite: ticket.cipherSuite)
+                state.context.keySchedule.deriveEarlySecret(psk: psk)
+            }
+
+            // If offering PSK, we need to compute binders using a two-pass approach
+            var clientHelloMessage: Data
+            if let pskInfo = pskExtensionsInfo {
+                let ticket = pskInfo.ticket
+                var offeredPsks = pskInfo.offered
+
+                // First pass: Build ClientHello with placeholder binders
+                var extensionsWithPsk = extensions
+                extensionsWithPsk.append(.preSharedKeyClient(offeredPsks))
+
+                let placeholderClientHello = ClientHello(
+                    random: random,
+                    legacySessionID: sessionID,
+                    cipherSuites: cipherSuites,
+                    extensions: extensionsWithPsk
+                )
+
+                // Encode ClientHello to get the transcript up to binders
+                let clientHelloWithPlaceholder = placeholderClientHello.encodeAsHandshake()
+
+                // Compute the truncated transcript (excluding binders)
+                let bindersSectionSize = offeredPsks.bindersSize
+                let truncatedClientHello = clientHelloWithPlaceholder.prefix(clientHelloWithPlaceholder.count - bindersSectionSize)
+
+                // Initialize transcript hash with truncated ClientHello
+                var transcriptHashForBinder = TranscriptHash(cipherSuite: ticket.cipherSuite)
+                transcriptHashForBinder.update(with: Data(truncatedClientHello))
+
+                // Compute binder
+                let binderKey = try state.context.keySchedule.deriveBinderKey(isResumption: true)
+                state.context.binderKey = binderKey
+                let transcriptHash = transcriptHashForBinder.currentHash()
+                let finishedKeyForBinder = state.context.keySchedule.finishedKey(from: binderKey)
+                let binder = state.context.keySchedule.finishedVerifyData(
+                    forKey: finishedKeyForBinder,
+                    transcriptHash: transcriptHash
+                )
+
+                // Second pass: Rebuild ClientHello with correct binders
+                offeredPsks.binders = [binder]
+
+                var finalExtensions = extensions
+                finalExtensions.append(.preSharedKeyClient(offeredPsks))
+
+                let finalClientHello = ClientHello(
+                    random: random,
+                    legacySessionID: sessionID,
+                    cipherSuites: cipherSuites,
+                    extensions: finalExtensions
+                )
+
+                clientHelloMessage = finalClientHello.encodeAsHandshake()
+
+                // Derive early traffic secret if attempting 0-RTT
+                if state.context.earlyDataState.attemptingEarlyData {
+                    var earlyTranscript = TranscriptHash(cipherSuite: ticket.cipherSuite)
+                    earlyTranscript.update(with: clientHelloMessage)
+                    let earlySecret = try state.context.keySchedule.deriveClientEarlyTrafficSecret(
+                        transcriptHash: earlyTranscript.currentHash()
+                    )
+                    state.context.clientEarlyTrafficSecret = earlySecret
+                }
+            } else {
+                // Standard ClientHello without PSK
+                let clientHello = ClientHello(
+                    random: random,
+                    legacySessionID: sessionID,
+                    cipherSuites: cipherSuites,
+                    extensions: extensions
+                )
+                clientHelloMessage = clientHello.encodeAsHandshake()
+            }
+
+            // Update transcript
+            state.context.transcriptHash.update(with: clientHelloMessage)
+
+            // Transition state
+            state.handshakeState = .waitServerHello
+
+            // Prepare outputs
+            var outputs: [TLSOutput] = []
+
+            // If attempting early data, provide the early keys (0-RTT)
+            if let earlySecret = state.context.clientEarlyTrafficSecret {
+                outputs.append(.keysAvailable(KeysAvailableInfo(
+                    level: .zeroRTT,
+                    clientSecret: earlySecret,
+                    serverSecret: earlySecret // Not used for 0-RTT (client-to-server only)
+                )))
+            }
+
+            return (clientHelloMessage, outputs)
+        }
+    }
+
+    // MARK: - Process ServerHello
+
+    /// Process a ServerHello message
+    /// - Parameter data: The ServerHello message content (without handshake header)
+    /// - Returns: TLS outputs (keys available, etc.)
+    public func processServerHello(_ data: Data) throws -> [TLSOutput] {
+        return try state.withLock { state in
+            // Accept ServerHello in waitServerHello or waitServerHelloRetry states
+            guard state.handshakeState == .waitServerHello ||
+                  state.handshakeState == .waitServerHelloRetry else {
+                throw TLSHandshakeError.unexpectedMessage("Unexpected ServerHello in state \(state.handshakeState)")
+            }
+
+            let serverHello = try ServerHello.decode(from: data)
+
+            // Check for HelloRetryRequest
+            if serverHello.isHelloRetryRequest {
+                return try processHelloRetryRequest(serverHello, data: data, state: &state)
+            }
+
+            // Verify supported_versions extension
+            guard let supportedVersions = serverHello.supportedVersions,
+                  supportedVersions.isTLS13 else {
+                throw TLSHandshakeError.unsupportedVersion
+            }
+
+            // Validate legacy_session_id_echo (must match what we sent)
+            guard serverHello.legacySessionIDEcho == state.context.sessionID else {
+                throw TLSHandshakeError.invalidExtension("ServerHello legacy_session_id_echo does not match ClientHello")
+            }
+
+            // Validate cipher suite (must be one we offered)
+            let offeredCipherSuites: [CipherSuite] = [.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384]
+            guard offeredCipherSuites.contains(serverHello.cipherSuite) else {
+                throw TLSHandshakeError.noCipherSuiteMatch
+            }
+
+            // Check for PSK acceptance
+            var pskAccepted = false
+            if let pskExtension = serverHello.extensions.first(where: { $0.extensionType == .preSharedKey }) {
+                if case .preSharedKey(.serverHello(let selectedPsk)) = pskExtension {
+                    // Verify the selected identity is valid
+                    guard selectedPsk.selectedIdentity == 0 else {
+                        throw TLSHandshakeError.invalidExtension("Invalid PSK selection")
+                    }
+                    pskAccepted = true
+                    state.context.pskUsed = true
+                    state.context.selectedPskIdentity = selectedPsk.selectedIdentity
+                }
+            }
+
+            // Get key_share extension (required even for PSK-DHE mode)
+            guard let serverKeyShare = serverHello.keyShare else {
+                throw TLSHandshakeError.missingExtension("key_share")
+            }
+
+            // Verify we have a key for this group
+            guard let ourKeyExchange = state.context.keyExchange,
+                  ourKeyExchange.group == serverKeyShare.serverShare.group else {
+                throw TLSHandshakeError.noKeyShareMatch
+            }
+
+            // Perform key agreement
+            let sharedSecret = try ourKeyExchange.sharedSecret(with: serverKeyShare.serverShare.keyExchange)
+            state.context.sharedSecret = sharedSecret
+
+            // Store cipher suite
+            state.context.cipherSuite = serverHello.cipherSuite
+            state.context.serverRandom = serverHello.random
+
+            // Update transcript with ServerHello
+            let serverHelloMessage = HandshakeCodec.encode(type: .serverHello, content: data)
+            state.context.transcriptHash.update(with: serverHelloMessage)
+
+            // Initialize or update key schedule for the selected cipher suite
+            if !pskAccepted {
+                // Non-PSK mode: reinitialize key schedule with no PSK
+                state.context.keySchedule = TLSKeySchedule(cipherSuite: serverHello.cipherSuite)
+                state.context.keySchedule.deriveEarlySecret(psk: nil)
+            }
+            // If PSK was accepted, early secret was already derived with PSK in startHandshake
+
+            // Derive handshake secrets
+            let transcriptHash = state.context.transcriptHash.currentHash()
+            let (clientSecret, serverSecret) = try state.context.keySchedule.deriveHandshakeSecrets(
+                sharedSecret: sharedSecret,
+                transcriptHash: transcriptHash
+            )
+
+            state.context.clientHandshakeSecret = clientSecret
+            state.context.serverHandshakeSecret = serverSecret
+
+            // Transition state
+            state.handshakeState = .waitEncryptedExtensions
+
+            // Return keys available output
+            return [
+                .keysAvailable(KeysAvailableInfo(
+                    level: .handshake,
+                    clientSecret: clientSecret,
+                    serverSecret: serverSecret
+                ))
+            ]
+        }
+    }
+
+    // MARK: - Process HelloRetryRequest
+
+    /// Process a HelloRetryRequest message
+    /// - Parameters:
+    ///   - hrr: The decoded HelloRetryRequest (ServerHello with special random)
+    ///   - data: The raw message data
+    ///   - state: The client state (mutable)
+    /// - Returns: TLS outputs including the new ClientHello2
+    private func processHelloRetryRequest(
+        _ hrr: ServerHello,
+        data: Data,
+        state: inout ClientState
+    ) throws -> [TLSOutput] {
+        // Ensure we haven't already received an HRR (only one allowed)
+        guard !state.context.receivedHelloRetryRequest else {
+            throw TLSHandshakeError.unexpectedMessage("Received second HelloRetryRequest")
+        }
+        state.context.receivedHelloRetryRequest = true
+
+        // Get the requested group from HRR
+        guard let requestedGroup = hrr.helloRetryRequestSelectedGroup else {
+            throw TLSHandshakeError.missingExtension("key_share in HelloRetryRequest")
+        }
+
+        // Verify we support the requested group
+        let supportedGroups: [NamedGroup] = [.x25519, .secp256r1]
+        guard supportedGroups.contains(requestedGroup) else {
+            throw TLSHandshakeError.noKeyShareMatch
+        }
+
+        // Store cipher suite from HRR
+        state.context.cipherSuite = hrr.cipherSuite
+
+        // RFC 8446 Section 4.4.1: Special transcript handling for HRR
+        // Save the hash of ClientHello1
+        let clientHello1Hash = state.context.transcriptHash.currentHash()
+        state.context.originalClientHello1Hash = clientHello1Hash
+
+        // Replace transcript with message_hash synthetic message
+        state.context.transcriptHash = TranscriptHash.fromMessageHash(
+            clientHello1Hash: clientHello1Hash,
+            cipherSuite: hrr.cipherSuite
+        )
+
+        // Add HRR to transcript
+        let hrrMessage = HandshakeCodec.encode(type: .serverHello, content: data)
+        state.context.transcriptHash.update(with: hrrMessage)
+
+        // Generate new key pair for the requested group
+        let newKeyExchange = try KeyExchange.generate(for: requestedGroup)
+        state.context.keyExchange = newKeyExchange
+
+        // Build ClientHello2 with the new key share
+        let clientHello2 = try generateClientHello2(state: &state, keyExchange: newKeyExchange)
+
+        // Transition state
+        state.handshakeState = .waitServerHelloRetry
+
+        // Return the new ClientHello
+        return [.handshakeData(clientHello2, level: .initial)]
+    }
+
+    /// Generate ClientHello2 after HelloRetryRequest
+    private func generateClientHello2(
+        state: inout ClientState,
+        keyExchange: KeyExchange
+    ) throws -> Data {
+        // Build extensions (similar to startHandshake but with new key_share)
+        var extensions: [TLSExtension] = []
+
+        // supported_versions (required for TLS 1.3)
+        extensions.append(.supportedVersionsClient([TLSConstants.version13]))
+
+        // supported_groups
+        extensions.append(.supportedGroupsList([.x25519, .secp256r1]))
+
+        // signature_algorithms
+        extensions.append(.signatureAlgorithmsList([
+            .ecdsa_secp256r1_sha256,
+            .rsa_pss_rsae_sha256
+        ]))
+
+        // key_share with the new key
+        extensions.append(.keyShareClient([keyExchange.keyShareEntry()]))
+
+        // ALPN
+        if !state.configuration.alpnProtocols.isEmpty {
+            extensions.append(.alpnProtocols(state.configuration.alpnProtocols))
+        }
+
+        // Server name (SNI)
+        if let serverName = state.configuration.serverName {
+            extensions.append(.serverName(ServerNameExtension(hostName: serverName)))
+        }
+
+        // QUIC transport parameters
+        if let params = state.context.localTransportParameters {
+            extensions.append(.quicTransportParameters(params))
+        }
+
+        // Build ClientHello2
+        guard let clientRandom = state.context.clientRandom,
+              let sessionID = state.context.sessionID else {
+            throw TLSHandshakeError.internalError("Missing client random or session ID")
+        }
+
+        let clientHello = ClientHello(
+            random: clientRandom,
+            legacySessionID: sessionID,
+            cipherSuites: [.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384],
+            extensions: extensions
+        )
+
+        // Encode and update transcript
+        let clientHelloMessage = clientHello.encodeAsHandshake()
+        state.context.transcriptHash.update(with: clientHelloMessage)
+
+        return clientHelloMessage
+    }
+
+    // MARK: - Process EncryptedExtensions
+
+    /// Process an EncryptedExtensions message
+    /// - Parameter data: The EncryptedExtensions message content
+    /// - Returns: TLS outputs
+    public func processEncryptedExtensions(_ data: Data) throws -> [TLSOutput] {
+        return try state.withLock { state in
+            guard state.handshakeState == .waitEncryptedExtensions else {
+                throw TLSHandshakeError.unexpectedMessage("Unexpected EncryptedExtensions")
+            }
+
+            let encryptedExtensions = try EncryptedExtensions.decode(from: data)
+
+            // Extract ALPN (required for QUIC per RFC 9001)
+            guard let alpn = encryptedExtensions.selectedALPN else {
+                throw TLSHandshakeError.noALPNMatch
+            }
+            // Verify server's ALPN is one we offered
+            guard state.configuration.alpnProtocols.contains(alpn) else {
+                throw TLSHandshakeError.noALPNMatch
+            }
+            state.context.negotiatedALPN = alpn
+
+            // Extract QUIC transport parameters (required for QUIC)
+            guard let params = encryptedExtensions.quicTransportParameters else {
+                throw TLSHandshakeError.missingExtension("quic_transport_parameters")
+            }
+            state.context.peerTransportParameters = params
+
+            // Check for early_data acceptance
+            let earlyDataAccepted = encryptedExtensions.extensions.contains {
+                $0.extensionType == .earlyData
+            }
+
+            if state.context.earlyDataState.attemptingEarlyData {
+                state.context.earlyDataState.earlyDataAccepted = earlyDataAccepted
+                // If early data was not accepted, client must discard any sent 0-RTT data
+                // and retransmit in 1-RTT (handled at QUIC layer)
+            }
+
+            // Update transcript
+            let message = HandshakeCodec.encode(type: .encryptedExtensions, content: data)
+            state.context.transcriptHash.update(with: message)
+
+            // Transition state - skip Certificate/CertificateVerify if PSK was used
+            if state.context.pskUsed {
+                state.handshakeState = .waitFinished
+            } else {
+                state.handshakeState = .waitCertificate
+            }
+
+            return []
+        }
+    }
+
+    // MARK: - Process Certificate
+
+    /// Process a Certificate message
+    /// - Parameter data: The Certificate message content
+    /// - Returns: TLS outputs
+    public func processCertificate(_ data: Data) throws -> [TLSOutput] {
+        return try state.withLock { state in
+            guard state.handshakeState == .waitCertificate else {
+                throw TLSHandshakeError.unexpectedMessage("Unexpected Certificate")
+            }
+
+            let certificate = try Certificate.decode(from: data)
+
+            // Store raw certificates
+            state.context.peerCertificates = certificate.certificates
+
+            // Parse and validate X.509 certificate if verification is enabled
+            if state.configuration.verifyPeer {
+                guard let leafCertData = certificate.leafCertificate else {
+                    throw TLSHandshakeError.certificateVerificationFailed("No certificate provided")
+                }
+
+                // Parse the leaf certificate
+                let leafCert: X509Certificate
+                do {
+                    leafCert = try X509Certificate.parse(from: leafCertData)
+                } catch {
+                    throw TLSHandshakeError.certificateVerificationFailed("Failed to parse certificate: \(error)")
+                }
+
+                // Store the parsed certificate
+                state.context.peerCertificate = leafCert
+
+                // Parse intermediate certificates
+                let intermediateCerts = try certificate.certificates.dropFirst().compactMap { certData -> X509Certificate? in
+                    try X509Certificate.parse(from: certData)
+                }
+
+                // Set up validation options
+                var validationOptions = X509ValidationOptions()
+                validationOptions.hostname = state.configuration.serverName
+                validationOptions.allowSelfSigned = state.configuration.allowSelfSigned
+
+                // Create validator with trusted roots
+                let validator = X509Validator(
+                    trustedRoots: state.configuration.trustedRootCertificates ?? [],
+                    options: validationOptions
+                )
+
+                // Validate the certificate chain
+                do {
+                    try validator.validate(certificate: leafCert, intermediates: Array(intermediateCerts))
+                } catch let error as X509Error {
+                    throw TLSHandshakeError.certificateVerificationFailed(error.description)
+                }
+
+                // Extract and store the public key for CertificateVerify verification
+                do {
+                    state.context.peerVerificationKey = try leafCert.extractPublicKey()
+                } catch {
+                    throw TLSHandshakeError.certificateVerificationFailed("Failed to extract public key: \(error)")
+                }
+            }
+
+            // Update transcript
+            let message = HandshakeCodec.encode(type: .certificate, content: data)
+            state.context.transcriptHash.update(with: message)
+
+            // Transition state
+            state.handshakeState = .waitCertificateVerify
+
+            return []
+        }
+    }
+
+    // MARK: - Process CertificateVerify
+
+    /// Process a CertificateVerify message
+    /// - Parameter data: The CertificateVerify message content
+    /// - Returns: TLS outputs
+    public func processCertificateVerify(_ data: Data) throws -> [TLSOutput] {
+        return try state.withLock { state in
+            guard state.handshakeState == .waitCertificateVerify else {
+                throw TLSHandshakeError.unexpectedMessage("Unexpected CertificateVerify")
+            }
+
+            let certificateVerify = try CertificateVerify.decode(from: data)
+
+            // Get the transcript hash up to (but not including) CertificateVerify
+            let transcriptHash = state.context.transcriptHash.currentHash()
+
+            // Construct the content that was signed
+            let signedContent = TLSSignature.certificateVerifyContent(
+                transcriptHash: transcriptHash,
+                isServer: true
+            )
+
+            // Determine which verification key to use
+            let verificationKey: VerificationKey?
+
+            if let expectedPublicKey = state.configuration.expectedPeerPublicKey {
+                // Use explicitly configured public key
+                verificationKey = try VerificationKey(
+                    publicKeyBytes: expectedPublicKey,
+                    scheme: certificateVerify.algorithm
+                )
+            } else if let extractedKey = state.context.peerVerificationKey {
+                // Use public key extracted from certificate
+                verificationKey = extractedKey
+            } else {
+                verificationKey = nil
+            }
+
+            // Verify signature if we have a verification key
+            if let key = verificationKey {
+                // Verify the signature scheme matches the key type
+                guard key.scheme == certificateVerify.algorithm else {
+                    throw TLSHandshakeError.signatureVerificationFailed
+                }
+
+                // Verify the signature
+                let isValid = try key.verify(
+                    signature: certificateVerify.signature,
+                    for: signedContent
+                )
+
+                guard isValid else {
+                    throw TLSHandshakeError.signatureVerificationFailed
+                }
+            } else if state.configuration.verifyPeer {
+                // verifyPeer is true but we have no key to verify with
+                throw TLSHandshakeError.certificateVerificationFailed("No public key available for verification")
+            }
+            // If verifyPeer is false, skip signature verification
+
+            // Update transcript
+            let message = HandshakeCodec.encode(type: .certificateVerify, content: data)
+            state.context.transcriptHash.update(with: message)
+
+            // Transition state
+            state.handshakeState = .waitFinished
+
+            return []
+        }
+    }
+
+    // MARK: - Process Finished
+
+    /// Process a server Finished message
+    /// - Parameter data: The Finished message content
+    /// - Returns: TLS outputs including application keys and client Finished
+    public func processServerFinished(_ data: Data) throws -> (outputs: [TLSOutput], clientFinished: Data) {
+        return try state.withLock { state in
+            // Accept Finished in waitFinished, waitCertificate, or waitCertificateVerify states
+            // (Server may skip Certificate/CertificateVerify in certain modes)
+            switch state.handshakeState {
+            case .waitFinished, .waitCertificate, .waitCertificateVerify:
+                break
+            default:
+                throw TLSHandshakeError.unexpectedMessage("Unexpected Finished in state \(state.handshakeState)")
+            }
+
+            let serverFinished = try Finished.decode(from: data)
+
+            // Verify server Finished
+            guard let serverHandshakeSecret = state.context.serverHandshakeSecret else {
+                throw TLSHandshakeError.internalError("Missing server handshake secret")
+            }
+
+            let serverFinishedKey = state.context.keySchedule.finishedKey(from: serverHandshakeSecret)
+            let transcriptHash = state.context.transcriptHash.currentHash()
+            let expectedVerifyData = state.context.keySchedule.finishedVerifyData(
+                forKey: serverFinishedKey,
+                transcriptHash: transcriptHash
+            )
+
+            guard serverFinished.verify(expected: expectedVerifyData) else {
+                throw TLSHandshakeError.finishedVerificationFailed
+            }
+
+            // Update transcript with server Finished
+            let serverFinishedMessage = HandshakeCodec.encode(type: .finished, content: data)
+            state.context.transcriptHash.update(with: serverFinishedMessage)
+
+            // Derive application secrets
+            let appTranscriptHash = state.context.transcriptHash.currentHash()
+            let (clientAppSecret, serverAppSecret) = try state.context.keySchedule.deriveApplicationSecrets(
+                transcriptHash: appTranscriptHash
+            )
+
+            state.context.clientApplicationSecret = clientAppSecret
+            state.context.serverApplicationSecret = serverAppSecret
+
+            // Derive exporter master secret
+            let exporterMasterSecret = try state.context.keySchedule.deriveExporterMasterSecret(
+                transcriptHash: appTranscriptHash
+            )
+            state.context.exporterMasterSecret = exporterMasterSecret
+
+            // Generate client Finished
+            guard let clientHandshakeSecret = state.context.clientHandshakeSecret else {
+                throw TLSHandshakeError.internalError("Missing client handshake secret")
+            }
+
+            let clientFinishedKey = state.context.keySchedule.finishedKey(from: clientHandshakeSecret)
+            let clientFinishedTranscript = state.context.transcriptHash.currentHash()
+            let clientVerifyData = state.context.keySchedule.finishedVerifyData(
+                forKey: clientFinishedKey,
+                transcriptHash: clientFinishedTranscript
+            )
+
+            let clientFinished = Finished(verifyData: clientVerifyData)
+            let clientFinishedMessage = clientFinished.encodeAsHandshake()
+
+            // Update transcript with client Finished
+            state.context.transcriptHash.update(with: clientFinishedMessage)
+
+            // Derive resumption master secret (for session tickets)
+            let resumptionTranscriptHash = state.context.transcriptHash.currentHash()
+            let resumptionMasterSecret = try state.context.keySchedule.deriveResumptionMasterSecret(
+                transcriptHash: resumptionTranscriptHash
+            )
+            state.context.resumptionMasterSecret = resumptionMasterSecret
+
+            // Transition state
+            state.handshakeState = .connected
+
+            var outputs: [TLSOutput] = []
+
+            // Application keys
+            outputs.append(.keysAvailable(KeysAvailableInfo(
+                level: .application,
+                clientSecret: clientAppSecret,
+                serverSecret: serverAppSecret
+            )))
+
+            // Handshake complete
+            outputs.append(.handshakeComplete(HandshakeCompleteInfo(
+                alpn: state.context.negotiatedALPN,
+                zeroRTTAccepted: state.context.earlyDataState.earlyDataAccepted,
+                resumptionTicket: nil
+            )))
+
+            return (outputs, clientFinishedMessage)
+        }
+    }
+
+    // MARK: - Process NewSessionTicket
+
+    /// Process a NewSessionTicket message (received post-handshake)
+    /// - Parameter data: The NewSessionTicket message content
+    /// - Returns: The derived session ticket data for future use
+    public func processNewSessionTicket(_ data: Data) throws -> SessionTicketData {
+        return try state.withLock { state in
+            guard state.handshakeState == .connected else {
+                throw TLSHandshakeError.unexpectedMessage("NewSessionTicket received before handshake complete")
+            }
+
+            let ticket = try NewSessionTicket.decode(from: data)
+
+            // Get resumption master secret
+            guard let resumptionMasterSecret = state.context.resumptionMasterSecret,
+                  let cipherSuite = state.context.cipherSuite else {
+                throw TLSHandshakeError.internalError("Missing resumption master secret or cipher suite")
+            }
+
+            // Derive PSK from resumption master secret and ticket nonce
+            let resumptionPSK = state.context.keySchedule.deriveResumptionPSK(
+                resumptionMasterSecret: resumptionMasterSecret,
+                ticketNonce: ticket.ticketNonce
+            )
+
+            // Extract max early data size from extensions
+            var maxEarlyDataSize: UInt32 = 0
+            for ext in ticket.extensions {
+                if case .earlyData(let earlyData) = ext {
+                    if case .newSessionTicket(let size) = earlyData {
+                        maxEarlyDataSize = size
+                    }
+                }
+            }
+
+            // Create session ticket data
+            let ticketData = SessionTicketData(
+                ticket: ticket.ticket,
+                resumptionPSK: resumptionPSK.withUnsafeBytes { Data($0) },
+                maxEarlyDataSize: maxEarlyDataSize,
+                ticketAgeAdd: ticket.ticketAgeAdd,
+                receiveTime: Date(),
+                lifetime: ticket.ticketLifetime,
+                cipherSuite: cipherSuite,
+                serverName: state.configuration.serverName,
+                alpn: state.context.negotiatedALPN
+            )
+
+            return ticketData
+        }
+    }
+
+    // MARK: - Accessors
+
+    /// Current handshake state
+    public var handshakeState: ClientHandshakeState {
+        state.withLock { $0.handshakeState }
+    }
+
+    /// Whether the handshake is complete
+    public var isConnected: Bool {
+        state.withLock { $0.handshakeState == .connected }
+    }
+
+    /// Negotiated ALPN protocol
+    public var negotiatedALPN: String? {
+        state.withLock { $0.context.negotiatedALPN }
+    }
+
+    /// Peer transport parameters
+    public var peerTransportParameters: Data? {
+        state.withLock { $0.context.peerTransportParameters }
+    }
+
+    /// Exporter master secret (available after handshake completion)
+    public var exporterMasterSecret: SymmetricKey? {
+        state.withLock { $0.context.exporterMasterSecret }
+    }
+
+    /// Whether PSK was used in this handshake
+    public var pskUsed: Bool {
+        state.withLock { $0.context.pskUsed }
+    }
+
+    /// Whether early data (0-RTT) was accepted by the server
+    public var earlyDataAccepted: Bool {
+        state.withLock { $0.context.earlyDataState.earlyDataAccepted }
+    }
+
+    /// Resumption master secret (for deriving new session tickets)
+    public var resumptionMasterSecret: SymmetricKey? {
+        state.withLock { $0.context.resumptionMasterSecret }
+    }
+}

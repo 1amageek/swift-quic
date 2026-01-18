@@ -379,6 +379,15 @@ public final class ManagedConnection: Sendable {
 
             case .error(let error):
                 throw error
+
+            case .alert(let alert):
+                // TLS Alert received - for QUIC, this results in CONNECTION_CLOSE
+                // with crypto error code (0x100 + alert code) per RFC 9001 Section 4.8
+                // For now, we throw an error which will be handled by the caller
+                throw TLSError.handshakeFailed(
+                    alert: alert.alertDescription.rawValue,
+                    description: alert.description
+                )
             }
         }
 
@@ -771,6 +780,14 @@ extension ManagedConnection {
 // MARK: - Connection IDs
 
 extension ManagedConnection {
+    /// The TLS provider used for this connection.
+    ///
+    /// Provides access to the underlying TLS 1.3 provider for custom
+    /// authentication schemes (e.g., libp2p certificate-based PeerID extraction).
+    public var underlyingTLSProvider: any TLS13Provider {
+        tlsProvider
+    }
+
     /// Source connection ID
     public var sourceConnectionID: ConnectionID {
         state.withLock { $0.sourceConnectionID }

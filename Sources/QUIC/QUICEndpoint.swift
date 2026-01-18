@@ -132,8 +132,13 @@ public actor QUICEndpoint {
         let sourceConnectionID = ConnectionID.random(length: 8)
         let destinationConnectionID = ConnectionID.random(length: 8)
 
-        // Create TLS provider
-        let tlsProvider = MockTLSProvider(configuration: TLSConfiguration())
+        // Create TLS provider (use factory if provided, otherwise MockTLSProvider)
+        let tlsProvider: any TLS13Provider
+        if let factory = configuration.tlsProviderFactory {
+            tlsProvider = factory(true)  // isClient = true
+        } else {
+            tlsProvider = MockTLSProvider(configuration: TLSConfiguration())
+        }
 
         // Create transport parameters from configuration
         let transportParameters = TransportParameters(from: configuration, sourceConnectionID: sourceConnectionID)
@@ -219,8 +224,13 @@ public actor QUICEndpoint {
         // Generate our source connection ID
         let sourceConnectionID = ConnectionID.random(length: 8)
 
-        // Create TLS provider
-        let tlsProvider = MockTLSProvider(configuration: TLSConfiguration())
+        // Create TLS provider (use factory if provided, otherwise MockTLSProvider)
+        let tlsProvider: any TLS13Provider
+        if let factory = configuration.tlsProviderFactory {
+            tlsProvider = factory(false)  // isClient = false (server mode)
+        } else {
+            tlsProvider = MockTLSProvider(configuration: TLSConfiguration())
+        }
 
         // Create transport parameters from configuration
         let transportParameters = TransportParameters(from: configuration, sourceConnectionID: sourceConnectionID)

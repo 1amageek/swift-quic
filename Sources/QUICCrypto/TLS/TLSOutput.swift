@@ -24,6 +24,10 @@ public enum TLSOutput: Sendable {
 
     /// An error occurred during TLS processing
     case error(TLSError)
+
+    /// A TLS alert to be sent to the peer (RFC 8446 Section 6)
+    /// For QUIC, this is converted to a CONNECTION_CLOSE frame
+    case alert(TLSAlert)
 }
 
 // MARK: - Keys Available Info
@@ -100,4 +104,27 @@ public enum TLSError: Error, Sendable {
 
     /// Internal error
     case internalError(String)
+
+    /// Convert this error to a TLS Alert
+    public var toAlert: TLSAlert {
+        switch self {
+        case .handshakeFailed(let alert, _):
+            if let desc = AlertDescription(rawValue: alert) {
+                return TLSAlert(description: desc)
+            }
+            return TLSAlert(description: .handshakeFailure)
+        case .certificateVerificationFailed:
+            return TLSAlert(description: .badCertificate)
+        case .noCipherSuiteMatch:
+            return TLSAlert(description: .handshakeFailure)
+        case .noALPNMatch:
+            return TLSAlert(description: .noApplicationProtocol)
+        case .invalidTransportParameters:
+            return TLSAlert(description: .illegalParameter)
+        case .unexpectedMessage:
+            return TLSAlert(description: .unexpectedMessage)
+        case .internalError:
+            return TLSAlert(description: .internalError)
+        }
+    }
 }

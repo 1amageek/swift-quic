@@ -4,6 +4,24 @@
 
 import Foundation
 import QUICCore
+import QUICCrypto
+
+// MARK: - TLS Provider Factory
+
+/// Factory for creating TLS 1.3 providers.
+///
+/// This allows custom TLS implementations (like libp2p's TLS with
+/// X.509 certificate extensions) to be injected into QUIC connections.
+///
+/// ## Example
+///
+/// ```swift
+/// var config = QUICConfiguration()
+/// config.tlsProviderFactory = { isClient in
+///     MyCustomTLSProvider(isClient: isClient)
+/// }
+/// ```
+public typealias TLSProviderFactory = @Sendable (_ isClient: Bool) -> any TLS13Provider
 
 // MARK: - QUIC Configuration
 
@@ -71,6 +89,16 @@ public struct QUICConfiguration: Sendable {
     /// Whether to verify peer certificates (default: true)
     public var verifyPeer: Bool
 
+    /// Custom TLS provider factory.
+    ///
+    /// When set, this factory is used to create TLS providers for new connections
+    /// instead of the default MockTLSProvider. This enables custom TLS
+    /// implementations like libp2p's certificate-based peer authentication.
+    ///
+    /// - Parameter isClient: `true` for client connections, `false` for server connections
+    /// - Returns: A TLS 1.3 provider instance
+    public var tlsProviderFactory: TLSProviderFactory?
+
     // MARK: - Initialization
 
     /// Creates a default configuration
@@ -91,12 +119,27 @@ public struct QUICConfiguration: Sendable {
         self.certificatePath = nil
         self.privateKeyPath = nil
         self.verifyPeer = true
+        self.tlsProviderFactory = nil
     }
 
     /// Creates a configuration for libp2p
     public static func libp2p() -> QUICConfiguration {
         var config = QUICConfiguration()
         config.alpn = ["libp2p"]
+        return config
+    }
+
+    /// Creates a configuration for libp2p with a custom TLS provider factory.
+    ///
+    /// Use this when implementing libp2p TLS certificate authentication,
+    /// where PeerID is embedded in X.509 certificate extensions.
+    ///
+    /// - Parameter tlsProviderFactory: Factory that creates TLS providers with libp2p certificate support
+    /// - Returns: A configuration ready for libp2p QUIC connections
+    public static func libp2p(tlsProviderFactory: @escaping TLSProviderFactory) -> QUICConfiguration {
+        var config = QUICConfiguration()
+        config.alpn = ["libp2p"]
+        config.tlsProviderFactory = tlsProviderFactory
         return config
     }
 }
