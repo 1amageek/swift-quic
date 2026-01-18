@@ -1,0 +1,615 @@
+/// Stream Manager (RFC 9000 Section 2)
+///
+/// Manages all streams for a QUIC connection.
+
+import Foundation
+import Synchronization
+import QUICCore
+
+/// Error types for StreamManager operations
+public enum StreamManagerError: Error, Sendable {
+    /// Maximum streams limit reached
+    case streamLimitReached(bidirectional: Bool)
+    /// Stream does not exist
+    case streamNotFound(UInt64)
+    /// Invalid stream ID for the role
+    case invalidStreamID(UInt64)
+    /// Stream already exists
+    case streamAlreadyExists(UInt64)
+    /// Connection-level flow control violated
+    case connectionFlowControlViolation
+    /// Stream error
+    case streamError(StreamError)
+}
+
+/// Manages all streams for a QUIC connection
+public final class StreamManager: Sendable {
+    private let state: Mutex<StreamManagerState>
+
+    private struct StreamManagerState {
+        /// Active streams by ID
+        var streams: [UInt64: DataStream]
+
+        /// Flow controller
+        var flowController: FlowController
+
+        /// Next local bidirectional stream index
+        var nextLocalBidiStreamIndex: UInt64
+
+        /// Next local unidirectional stream index
+        var nextLocalUniStreamIndex: UInt64
+
+        /// Whether this endpoint is a client
+        let isClient: Bool
+
+        /// Initial send limit for locally-initiated bidirectional streams
+        var initialSendMaxDataBidiLocal: UInt64
+
+        /// Initial send limit for remotely-initiated bidirectional streams
+        var initialSendMaxDataBidiRemote: UInt64
+
+        /// Initial send limit for unidirectional streams
+        var initialSendMaxDataUni: UInt64
+
+        /// Maximum buffer size per stream
+        let maxBufferSize: UInt64
+    }
+
+    /// Creates a new StreamManager
+    /// - Parameters:
+    ///   - isClient: Whether this endpoint is a client
+    ///   - initialMaxData: Initial connection-level receive limit
+    ///   - initialMaxStreamDataBidiLocal: Initial receive limit for local bidi streams
+    ///   - initialMaxStreamDataBidiRemote: Initial receive limit for remote bidi streams
+    ///   - initialMaxStreamDataUni: Initial receive limit for uni streams
+    ///   - initialMaxStreamsBidi: Initial bidirectional stream limit
+    ///   - initialMaxStreamsUni: Initial unidirectional stream limit
+    ///   - peerInitialMaxData: Peer's initial MAX_DATA (our send limit)
+    ///   - peerInitialMaxStreamDataBidiLocal: Peer's initial limit for their local bidi
+    ///   - peerInitialMaxStreamDataBidiRemote: Peer's initial limit for their remote bidi
+    ///   - peerInitialMaxStreamDataUni: Peer's initial limit for uni
+    ///   - peerInitialMaxStreamsBidi: Peer's initial MAX_STREAMS_BIDI
+    ///   - peerInitialMaxStreamsUni: Peer's initial MAX_STREAMS_UNI
+    ///   - maxBufferSize: Maximum buffer size per stream
+    public init(
+        isClient: Bool,
+        initialMaxData: UInt64 = 1024 * 1024,
+        initialMaxStreamDataBidiLocal: UInt64 = 256 * 1024,
+        initialMaxStreamDataBidiRemote: UInt64 = 256 * 1024,
+        initialMaxStreamDataUni: UInt64 = 256 * 1024,
+        initialMaxStreamsBidi: UInt64 = 100,
+        initialMaxStreamsUni: UInt64 = 100,
+        peerInitialMaxData: UInt64 = 0,
+        peerInitialMaxStreamDataBidiLocal: UInt64 = 0,
+        peerInitialMaxStreamDataBidiRemote: UInt64 = 0,
+        peerInitialMaxStreamDataUni: UInt64 = 0,
+        peerInitialMaxStreamsBidi: UInt64 = 0,
+        peerInitialMaxStreamsUni: UInt64 = 0,
+        maxBufferSize: UInt64 = 16 * 1024 * 1024
+    ) {
+        let flowController = FlowController(
+            isClient: isClient,
+            initialMaxData: initialMaxData,
+            initialMaxStreamDataBidiLocal: initialMaxStreamDataBidiLocal,
+            initialMaxStreamDataBidiRemote: initialMaxStreamDataBidiRemote,
+            initialMaxStreamDataUni: initialMaxStreamDataUni,
+            initialMaxStreamsBidi: initialMaxStreamsBidi,
+            initialMaxStreamsUni: initialMaxStreamsUni,
+            peerMaxData: peerInitialMaxData,
+            peerMaxStreamsBidi: peerInitialMaxStreamsBidi,
+            peerMaxStreamsUni: peerInitialMaxStreamsUni
+        )
+
+        self.state = Mutex(StreamManagerState(
+            streams: [:],
+            flowController: flowController,
+            nextLocalBidiStreamIndex: 0,
+            nextLocalUniStreamIndex: 0,
+            isClient: isClient,
+            initialSendMaxDataBidiLocal: peerInitialMaxStreamDataBidiLocal,
+            initialSendMaxDataBidiRemote: peerInitialMaxStreamDataBidiRemote,
+            initialSendMaxDataUni: peerInitialMaxStreamDataUni,
+            maxBufferSize: maxBufferSize
+        ))
+    }
+
+    // MARK: - Stream Lifecycle
+
+    /// Open a new locally-initiated stream
+    /// - Parameter bidirectional: Whether to create a bidirectional stream
+    /// - Returns: The new stream ID
+    /// - Throws: StreamManagerError if stream limit reached
+    public func openStream(bidirectional: Bool) throws -> UInt64 {
+        try state.withLock { state in
+            // Check stream limit
+            guard state.flowController.canOpenStream(bidirectional: bidirectional) else {
+                throw StreamManagerError.streamLimitReached(bidirectional: bidirectional)
+            }
+
+            // Generate stream ID
+            let streamID: UInt64
+            if bidirectional {
+                streamID = StreamID.make(
+                    index: state.nextLocalBidiStreamIndex,
+                    isClient: state.isClient,
+                    isBidirectional: true
+                )
+                state.nextLocalBidiStreamIndex += 1
+            } else {
+                streamID = StreamID.make(
+                    index: state.nextLocalUniStreamIndex,
+                    isClient: state.isClient,
+                    isBidirectional: false
+                )
+                state.nextLocalUniStreamIndex += 1
+            }
+
+            // Create stream
+            let sendLimit = getSendLimit(for: streamID, state: state)
+            let recvLimit = getRecvLimit(for: streamID, state: state)
+
+            let stream = DataStream(
+                id: streamID,
+                isClient: state.isClient,
+                initialSendMaxData: sendLimit,
+                initialRecvMaxData: recvLimit,
+                maxBufferSize: state.maxBufferSize
+            )
+
+            state.streams[streamID] = stream
+            state.flowController.recordLocalStreamOpened(bidirectional: bidirectional)
+            state.flowController.initializeStream(streamID)
+
+            return streamID
+        }
+    }
+
+    /// Get or create a stream for incoming data
+    /// - Parameter streamID: The stream ID from the received frame
+    /// - Returns: The stream ID (same as input)
+    /// - Throws: StreamManagerError on validation failures
+    public func getOrCreateStream(id streamID: UInt64) throws -> UInt64 {
+        try state.withLock { state in
+            // If stream exists, return it
+            if state.streams[streamID] != nil {
+                return streamID
+            }
+
+            // Validate stream ID
+            let isRemotelyInitiated = isRemoteStream(streamID, isClient: state.isClient)
+            guard isRemotelyInitiated else {
+                throw StreamManagerError.invalidStreamID(streamID)
+            }
+
+            let isBidi = StreamID.isBidirectional(streamID)
+
+            // Check if peer can open more streams
+            guard state.flowController.canAcceptRemoteStream(bidirectional: isBidi) else {
+                throw StreamManagerError.streamLimitReached(bidirectional: isBidi)
+            }
+
+            // Create stream
+            let sendLimit = getSendLimit(for: streamID, state: state)
+            let recvLimit = getRecvLimit(for: streamID, state: state)
+
+            let stream = DataStream(
+                id: streamID,
+                isClient: state.isClient,
+                initialSendMaxData: sendLimit,
+                initialRecvMaxData: recvLimit,
+                maxBufferSize: state.maxBufferSize
+            )
+
+            state.streams[streamID] = stream
+            state.flowController.recordRemoteStreamOpened(bidirectional: isBidi)
+            state.flowController.initializeStream(streamID)
+
+            return streamID
+        }
+    }
+
+    /// Close a stream
+    /// - Parameter streamID: Stream to close
+    public func closeStream(id streamID: UInt64) {
+        state.withLock { state in
+            guard let stream = state.streams.removeValue(forKey: streamID) else {
+                return
+            }
+
+            let isBidi = stream.isBidirectional
+            let isLocal = stream.isLocallyInitiated
+
+            if isLocal {
+                state.flowController.recordLocalStreamClosed(bidirectional: isBidi)
+            } else {
+                state.flowController.recordRemoteStreamClosed(bidirectional: isBidi)
+            }
+
+            state.flowController.removeStream(streamID)
+        }
+    }
+
+    // MARK: - Frame Processing
+
+    /// Process incoming STREAM frame
+    /// - Parameter frame: The received STREAM frame
+    /// - Throws: StreamManagerError on validation failures
+    public func receive(frame: StreamFrame) throws {
+        try state.withLock { state in
+            // Get or create stream
+            if state.streams[frame.streamID] == nil {
+                _ = try getOrCreateStreamInternal(frame.streamID, state: &state)
+            }
+
+            guard let stream = state.streams[frame.streamID] else {
+                throw StreamManagerError.streamNotFound(frame.streamID)
+            }
+
+            // Calculate end offset for flow control
+            let endOffset = frame.offset + UInt64(frame.data.count)
+
+            // Calculate new bytes (not previously counted) for connection-level flow control
+            // This correctly handles out-of-order data by counting only the actual new bytes,
+            // not the gap. For example:
+            //   - currentHighest = 0, frame offset = 100, length = 50
+            //   - newBytes = max(0, 150 - max(0, 100)) = 50 (not 150!)
+            let currentHighest = state.flowController.streamBytesReceived(for: frame.streamID)
+            let newBytes: UInt64
+            if endOffset > currentHighest {
+                // Only count bytes that extend beyond what we've already counted
+                // max(currentHighest, frame.offset) gives the start of the new portion
+                newBytes = endOffset - max(currentHighest, frame.offset)
+            } else {
+                newBytes = 0
+            }
+
+            // Check connection-level flow control for new bytes only
+            guard state.flowController.canReceive(bytes: newBytes) else {
+                throw StreamManagerError.connectionFlowControlViolation
+            }
+
+            // Process on stream (DataStream is now a class - no writeback needed)
+            do {
+                try stream.receive(frame)
+            } catch let error as StreamError {
+                throw StreamManagerError.streamError(error)
+            }
+
+            // Record only new bytes at connection level (avoids double-counting retransmissions)
+            let actualNewBytes = state.flowController.recordStreamBytesReceived(frame.streamID, endOffset: endOffset)
+            if actualNewBytes > 0 {
+                state.flowController.recordBytesReceived(actualNewBytes)
+            }
+        }
+    }
+
+    /// Process RESET_STREAM frame
+    /// - Parameter frame: The received RESET_STREAM frame
+    public func handleResetStream(_ frame: ResetStreamFrame) throws {
+        try state.withLock { state in
+            let stream: DataStream
+            if let existing = state.streams[frame.streamID] {
+                stream = existing
+            } else {
+                // Create stream if it doesn't exist (peer may have sent RESET before data)
+                _ = try getOrCreateStreamInternal(frame.streamID, state: &state)
+                guard let newStream = state.streams[frame.streamID] else { return }
+                stream = newStream
+            }
+
+            // DataStream validates final size against stream-level flow control
+            try stream.handleResetStream(errorCode: frame.applicationErrorCode, finalSize: frame.finalSize)
+
+            // Update connection-level flow control with final size
+            // Count any new bytes up to the final size
+            let currentHighest = state.flowController.streamBytesReceived(for: frame.streamID)
+            if frame.finalSize > currentHighest {
+                let newBytes = frame.finalSize - currentHighest
+                state.flowController.recordBytesReceived(newBytes)
+                state.flowController.recordStreamBytesReceived(frame.streamID, endOffset: frame.finalSize)
+            }
+        }
+    }
+
+    /// Process STOP_SENDING frame
+    /// - Parameter frame: The received STOP_SENDING frame
+    public func handleStopSending(_ frame: StopSendingFrame) {
+        state.withLock { state in
+            guard let stream = state.streams[frame.streamID] else { return }
+            stream.handleStopSending(errorCode: frame.applicationErrorCode)
+        }
+    }
+
+    /// Process MAX_STREAM_DATA frame
+    /// - Parameter frame: The received MAX_STREAM_DATA frame
+    public func handleMaxStreamData(_ frame: MaxStreamDataFrame) {
+        state.withLock { state in
+            guard let stream = state.streams[frame.streamID] else { return }
+            stream.updateSendMaxData(frame.maxStreamData)
+        }
+    }
+
+    /// Process MAX_DATA frame
+    /// - Parameter frame: The received MAX_DATA frame
+    public func handleMaxData(_ frame: MaxDataFrame) {
+        state.withLock { state in
+            state.flowController.updateConnectionSendLimit(frame.maxData)
+        }
+    }
+
+    /// Process MAX_STREAMS frame
+    /// - Parameter frame: The received MAX_STREAMS frame
+    public func handleMaxStreams(_ frame: MaxStreamsFrame) {
+        state.withLock { state in
+            state.flowController.updateRemoteStreamLimit(frame.maxStreams, bidirectional: frame.isBidirectional)
+        }
+    }
+
+    /// Update peer's initial stream data limits (called when peer transport parameters are received)
+    /// - Parameters:
+    ///   - bidiLocal: Peer's initial_max_stream_data_bidi_local (our send limit for streams we open)
+    ///   - bidiRemote: Peer's initial_max_stream_data_bidi_remote (our send limit for streams peer opens)
+    ///   - uni: Peer's initial_max_stream_data_uni (our send limit for uni streams)
+    public func updatePeerStreamDataLimits(
+        bidiLocal: UInt64,
+        bidiRemote: UInt64,
+        uni: UInt64
+    ) {
+        state.withLock { state in
+            // Update initial values for new streams
+            state.initialSendMaxDataBidiLocal = bidiLocal
+            state.initialSendMaxDataBidiRemote = bidiRemote
+            state.initialSendMaxDataUni = uni
+
+            // Update existing streams' send limits
+            // This is critical for streams opened before handshake completion
+            for (streamID, stream) in state.streams {
+                let newLimit = getSendLimit(for: streamID, state: state)
+                stream.updateSendMaxData(newLimit)
+            }
+        }
+    }
+
+    // MARK: - Data Access
+
+    /// Read data from a stream
+    /// - Parameter streamID: Stream to read from
+    /// - Returns: Available data, or nil if none
+    public func read(streamID: UInt64) -> Data? {
+        state.withLock { state in
+            guard let stream = state.streams[streamID] else { return nil }
+            return stream.read()
+        }
+    }
+
+    /// Write data to a stream
+    /// - Parameters:
+    ///   - streamID: Stream to write to
+    ///   - data: Data to write
+    /// - Throws: StreamManagerError on failures
+    public func write(streamID: UInt64, data: Data) throws {
+        try state.withLock { state in
+            guard let stream = state.streams[streamID] else {
+                throw StreamManagerError.streamNotFound(streamID)
+            }
+
+            do {
+                try stream.write(data)
+            } catch let error as StreamError {
+                throw StreamManagerError.streamError(error)
+            }
+        }
+    }
+
+    /// Finish writing to a stream (send FIN)
+    /// - Parameter streamID: Stream to finish
+    /// - Throws: StreamManagerError on failures
+    public func finish(streamID: UInt64) throws {
+        try state.withLock { state in
+            guard let stream = state.streams[streamID] else {
+                throw StreamManagerError.streamNotFound(streamID)
+            }
+
+            do {
+                try stream.finish()
+            } catch let error as StreamError {
+                throw StreamManagerError.streamError(error)
+            }
+        }
+    }
+
+    // MARK: - Frame Generation
+
+    /// Generate outgoing STREAM frames
+    /// - Parameter maxBytes: Maximum total bytes for frames
+    /// - Returns: Array of STREAM frames to send
+    public func generateStreamFrames(maxBytes: Int) -> [StreamFrame] {
+        state.withLock { state in
+            var frames: [StreamFrame] = []
+            var remainingBytes = maxBytes
+
+            // Simple round-robin across streams with data to send
+            for (_, stream) in state.streams {
+                guard stream.hasDataToSend && remainingBytes > 0 else { continue }
+
+                // Check connection-level flow control
+                let connectionWindow = state.flowController.connectionSendWindow
+                let streamWindow = stream.sendWindow
+                let effectiveWindow = min(connectionWindow, streamWindow)
+
+                if effectiveWindow == 0 { continue }
+
+                // Apply both connection and stream window limits
+                let maxBytesToSend = min(remainingBytes, Int(effectiveWindow))
+                let streamFrames = stream.generateFrames(maxBytes: maxBytesToSend)
+                for frame in streamFrames {
+                    state.flowController.recordBytesSent(UInt64(frame.data.count))
+                    remainingBytes -= 11 + frame.data.count  // Approximate overhead
+                }
+
+                frames.append(contentsOf: streamFrames)
+            }
+
+            return frames
+        }
+    }
+
+    /// Generate flow control frames (MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS)
+    /// - Returns: Array of control frames to send
+    public func generateFlowControlFrames() -> [Frame] {
+        state.withLock { state in
+            var frames: [Frame] = []
+
+            // Connection-level MAX_DATA
+            if let maxData = state.flowController.generateMaxData() {
+                frames.append(.maxData(maxData.maxData))
+            }
+
+            // Stream-level MAX_STREAM_DATA
+            for streamID in state.streams.keys {
+                if let maxStreamData = state.flowController.generateMaxStreamData(for: streamID) {
+                    frames.append(.maxStreamData(maxStreamData))
+
+                    // Sync DataStream's receive limit to match FlowController
+                    if let stream = state.streams[streamID] {
+                        stream.updateRecvMaxData(maxStreamData.maxStreamData)
+                    }
+                }
+            }
+
+            // MAX_STREAMS
+            if let maxStreamsBidi = state.flowController.generateMaxStreams(bidirectional: true) {
+                frames.append(.maxStreams(maxStreamsBidi))
+            }
+            if let maxStreamsUni = state.flowController.generateMaxStreams(bidirectional: false) {
+                frames.append(.maxStreams(maxStreamsUni))
+            }
+
+            return frames
+        }
+    }
+
+    /// Generate RESET_STREAM frames for streams that need them
+    /// This is called to respond to STOP_SENDING frames from peer
+    /// - Returns: Array of RESET_STREAM frames to send
+    public func generateResetFrames() -> [ResetStreamFrame] {
+        state.withLock { state in
+            var frames: [ResetStreamFrame] = []
+
+            for (_, stream) in state.streams {
+                // Check if this stream received STOP_SENDING and hasn't sent RESET_STREAM yet
+                if stream.needsResetStream,
+                   let errorCode = stream.stopSendingErrorCode,
+                   let frame = stream.generateResetStream(errorCode: errorCode) {
+                    frames.append(frame)
+                }
+            }
+
+            return frames
+        }
+    }
+
+    // MARK: - Stream Status
+
+    /// Check if a stream exists
+    /// - Parameter streamID: Stream to check
+    /// - Returns: true if stream exists
+    public func hasStream(id streamID: UInt64) -> Bool {
+        state.withLock { $0.streams[streamID] != nil }
+    }
+
+    /// Check if stream has data to read
+    /// - Parameter streamID: Stream to check
+    /// - Returns: true if data available
+    public func hasDataToRead(streamID: UInt64) -> Bool {
+        state.withLock { state in
+            state.streams[streamID]?.hasDataToRead ?? false
+        }
+    }
+
+    /// Check if stream has data to send
+    /// - Parameter streamID: Stream to check
+    /// - Returns: true if data pending
+    public func hasDataToSend(streamID: UInt64) -> Bool {
+        state.withLock { state in
+            state.streams[streamID]?.hasDataToSend ?? false
+        }
+    }
+
+    /// Get number of active streams
+    public var activeStreamCount: Int {
+        state.withLock { $0.streams.count }
+    }
+
+    /// Get all active stream IDs
+    public var activeStreamIDs: [UInt64] {
+        state.withLock { Array($0.streams.keys) }
+    }
+
+    // MARK: - Private Helpers
+
+    private func isRemoteStream(_ streamID: UInt64, isClient: Bool) -> Bool {
+        let isClientInitiated = StreamID.isClientInitiated(streamID)
+        return (isClient && !isClientInitiated) || (!isClient && isClientInitiated)
+    }
+
+    private func getSendLimit(for streamID: UInt64, state: StreamManagerState) -> UInt64 {
+        let isLocal = !isRemoteStream(streamID, isClient: state.isClient)
+        let isBidi = StreamID.isBidirectional(streamID)
+
+        if isBidi {
+            return isLocal ? state.initialSendMaxDataBidiLocal : state.initialSendMaxDataBidiRemote
+        } else {
+            return state.initialSendMaxDataUni
+        }
+    }
+
+    private func getRecvLimit(for streamID: UInt64, state: StreamManagerState) -> UInt64 {
+        let isLocal = !isRemoteStream(streamID, isClient: state.isClient)
+        let isBidi = StreamID.isBidirectional(streamID)
+
+        if isBidi {
+            // For locally-initiated bidi streams, use our local bidi limit
+            // For remotely-initiated bidi streams, use our remote bidi limit
+            return isLocal
+                ? state.flowController.initialMaxStreamDataBidiLocal
+                : state.flowController.initialMaxStreamDataBidiRemote
+        } else {
+            return state.flowController.initialMaxStreamDataUni
+        }
+    }
+
+    private func getOrCreateStreamInternal(_ streamID: UInt64, state: inout StreamManagerState) throws -> UInt64 {
+        if state.streams[streamID] != nil {
+            return streamID
+        }
+
+        let isRemotelyInitiated = isRemoteStream(streamID, isClient: state.isClient)
+        guard isRemotelyInitiated else {
+            throw StreamManagerError.invalidStreamID(streamID)
+        }
+
+        let isBidi = StreamID.isBidirectional(streamID)
+
+        guard state.flowController.canAcceptRemoteStream(bidirectional: isBidi) else {
+            throw StreamManagerError.streamLimitReached(bidirectional: isBidi)
+        }
+
+        let sendLimit = getSendLimit(for: streamID, state: state)
+        let recvLimit = getRecvLimit(for: streamID, state: state)
+
+        let stream = DataStream(
+            id: streamID,
+            isClient: state.isClient,
+            initialSendMaxData: sendLimit,
+            initialRecvMaxData: recvLimit,
+            maxBufferSize: state.maxBufferSize
+        )
+
+        state.streams[streamID] = stream
+        state.flowController.recordRemoteStreamOpened(bidirectional: isBidi)
+        state.flowController.initializeStream(streamID)
+
+        return streamID
+    }
+}

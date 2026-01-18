@@ -60,6 +60,7 @@ let package = Package(
             dependencies: [
                 "QUICCore",
                 "QUICCrypto",
+                "QUICStream",
             ],
             path: "Sources/QUICConnection"
         ),
@@ -129,6 +130,12 @@ let package = Package(
             name: "QUICRecoveryTests",
             dependencies: ["QUICRecovery", "QUICCore"],
             path: "Tests/QUICRecoveryTests"
+        ),
+
+        .testTarget(
+            name: "QUICStreamTests",
+            dependencies: ["QUICStream", "QUICCore"],
+            path: "Tests/QUICStreamTests"
         ),
 
         .testTarget(

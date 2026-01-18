@@ -160,6 +160,18 @@ public struct StopSendingFrame: Sendable, Hashable {
     }
 }
 
+// MARK: - MAX_DATA Frame
+
+/// MAX_DATA frame (RFC 9000 Section 19.9)
+public struct MaxDataFrame: Sendable, Hashable {
+    /// Maximum amount of data that can be sent on the connection
+    public let maxData: UInt64
+
+    public init(maxData: UInt64) {
+        self.maxData = maxData
+    }
+}
+
 // MARK: - MAX_STREAM_DATA Frame
 
 /// MAX_STREAM_DATA frame (RFC 9000 Section 19.10)
@@ -189,6 +201,18 @@ public struct MaxStreamsFrame: Sendable, Hashable {
     public init(maxStreams: UInt64, isBidirectional: Bool) {
         self.maxStreams = maxStreams
         self.isBidirectional = isBidirectional
+    }
+}
+
+// MARK: - DATA_BLOCKED Frame
+
+/// DATA_BLOCKED frame (RFC 9000 Section 19.12)
+public struct DataBlockedFrame: Sendable, Hashable {
+    /// Connection data limit at which blocking occurred
+    public let dataLimit: UInt64
+
+    public init(dataLimit: UInt64) {
+        self.dataLimit = dataLimit
     }
 }
 

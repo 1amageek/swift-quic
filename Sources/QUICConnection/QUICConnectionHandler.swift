@@ -9,6 +9,7 @@ import Synchronization
 import QUICCore
 import QUICRecovery
 import QUICCrypto
+import QUICStream
 
 // MARK: - Connection Handler
 
@@ -31,6 +32,9 @@ public final class QUICConnectionHandler: Sendable {
 
     /// Crypto stream manager
     private let cryptoStreamManager: CryptoStreamManager
+
+    /// Data stream manager
+    private let streamManager: StreamManager
 
     /// Key schedule
     private let keySchedule: Mutex<KeySchedule>
@@ -78,6 +82,18 @@ public final class QUICConnectionHandler: Sendable {
 
         self.pnSpaceManager = PacketNumberSpaceManager()
         self.cryptoStreamManager = CryptoStreamManager()
+
+        // Initialize stream manager with transport parameters
+        self.streamManager = StreamManager(
+            isClient: role == .client,
+            initialMaxData: transportParameters.initialMaxData,
+            initialMaxStreamDataBidiLocal: transportParameters.initialMaxStreamDataBidiLocal,
+            initialMaxStreamDataBidiRemote: transportParameters.initialMaxStreamDataBidiRemote,
+            initialMaxStreamDataUni: transportParameters.initialMaxStreamDataUni,
+            initialMaxStreamsBidi: transportParameters.initialMaxStreamsBidi,
+            initialMaxStreamsUni: transportParameters.initialMaxStreamsUni
+        )
+
         self.keySchedule = Mutex(KeySchedule())
         self.localTransportParams = transportParameters
         self.cryptoContexts = Mutex([:])
@@ -176,7 +192,30 @@ public final class QUICConnectionHandler: Sendable {
                 result.handshakeComplete = true
 
             case .stream(let streamFrame):
-                result.streamData.append((streamFrame.streamID, streamFrame.data))
+                try streamManager.receive(frame: streamFrame)
+                // Read available data from the stream
+                if let data = streamManager.read(streamID: streamFrame.streamID) {
+                    result.streamData.append((streamFrame.streamID, data))
+                }
+
+            case .resetStream(let resetFrame):
+                try streamManager.handleResetStream(resetFrame)
+
+            case .stopSending(let stopFrame):
+                streamManager.handleStopSending(stopFrame)
+
+            case .maxData(let maxData):
+                streamManager.handleMaxData(MaxDataFrame(maxData: maxData))
+
+            case .maxStreamData(let maxStreamDataFrame):
+                streamManager.handleMaxStreamData(maxStreamDataFrame)
+
+            case .maxStreams(let maxStreamsFrame):
+                streamManager.handleMaxStreams(maxStreamsFrame)
+
+            case .dataBlocked, .streamDataBlocked, .streamsBlocked:
+                // Generate flow control frames as needed
+                break
 
             case .padding, .ping:
                 // No action needed
@@ -230,6 +269,32 @@ public final class QUICConnectionHandler: Sendable {
         handshakeComplete.withLock { $0 = true }
         connectionState.withLock { $0.status = .established }
         pnSpaceManager.handshakeConfirmed = true
+    }
+
+    /// Sets peer transport parameters (called after TLS handshake)
+    /// - Parameter params: Peer's transport parameters
+    public func setPeerTransportParameters(_ params: TransportParameters) {
+        peerTransportParams.withLock { $0 = params }
+
+        // Update stream manager with peer's limits
+        streamManager.handleMaxData(MaxDataFrame(maxData: params.initialMaxData))
+        streamManager.handleMaxStreams(MaxStreamsFrame(
+            maxStreams: params.initialMaxStreamsBidi,
+            isBidirectional: true
+        ))
+        streamManager.handleMaxStreams(MaxStreamsFrame(
+            maxStreams: params.initialMaxStreamsUni,
+            isBidirectional: false
+        ))
+
+        // Update per-stream data limits
+        // Note: Peer's bidi_local is our send limit for streams WE open
+        //       Peer's bidi_remote is our send limit for streams PEER opens
+        streamManager.updatePeerStreamDataLimits(
+            bidiLocal: params.initialMaxStreamDataBidiLocal,
+            bidiRemote: params.initialMaxStreamDataBidiRemote,
+            uni: params.initialMaxStreamDataUni
+        )
     }
 
     // MARK: - Key Management
@@ -300,6 +365,20 @@ public final class QUICConnectionHandler: Sendable {
                 ackDelayExponent: ackDelayExponent
             ) {
                 queueFrame(.ack(ackFrame), level: level)
+            }
+        }
+
+        // Generate stream frames (only at application level)
+        if handshakeComplete.withLock({ $0 }) {
+            let streamFrames = streamManager.generateStreamFrames(maxBytes: 1200)
+            for streamFrame in streamFrames {
+                queueFrame(.stream(streamFrame), level: .application)
+            }
+
+            // Generate flow control frames
+            let flowFrames = streamManager.generateFlowControlFrames()
+            for flowFrame in flowFrames {
+                queueFrame(flowFrame, level: .application)
             }
         }
 
@@ -388,6 +467,69 @@ public final class QUICConnectionHandler: Sendable {
 
         // Return earliest
         return [lossTime, ptoTime, ackTime].compactMap { $0 }.min()
+    }
+
+    // MARK: - Stream Management
+
+    /// Opens a new stream
+    /// - Parameter bidirectional: Whether to create a bidirectional stream
+    /// - Returns: The new stream ID
+    /// - Throws: StreamManagerError if stream limit reached
+    public func openStream(bidirectional: Bool) throws -> UInt64 {
+        try streamManager.openStream(bidirectional: bidirectional)
+    }
+
+    /// Writes data to a stream
+    /// - Parameters:
+    ///   - streamID: Stream to write to
+    ///   - data: Data to write
+    /// - Throws: StreamManagerError on failures
+    public func writeToStream(_ streamID: UInt64, data: Data) throws {
+        try streamManager.write(streamID: streamID, data: data)
+    }
+
+    /// Finishes writing to a stream (sends FIN)
+    /// - Parameter streamID: Stream to finish
+    /// - Throws: StreamManagerError on failures
+    public func finishStream(_ streamID: UInt64) throws {
+        try streamManager.finish(streamID: streamID)
+    }
+
+    /// Reads data from a stream
+    /// - Parameter streamID: Stream to read from
+    /// - Returns: Available data, or nil if none
+    public func readFromStream(_ streamID: UInt64) -> Data? {
+        streamManager.read(streamID: streamID)
+    }
+
+    /// Closes a stream
+    /// - Parameter streamID: Stream to close
+    public func closeStream(_ streamID: UInt64) {
+        streamManager.closeStream(id: streamID)
+    }
+
+    /// Checks if a stream has data to read
+    /// - Parameter streamID: Stream to check
+    /// - Returns: true if data available
+    public func streamHasDataToRead(_ streamID: UInt64) -> Bool {
+        streamManager.hasDataToRead(streamID: streamID)
+    }
+
+    /// Checks if a stream has data to send
+    /// - Parameter streamID: Stream to check
+    /// - Returns: true if data pending
+    public func streamHasDataToSend(_ streamID: UInt64) -> Bool {
+        streamManager.hasDataToSend(streamID: streamID)
+    }
+
+    /// Gets all active stream IDs
+    public var activeStreamIDs: [UInt64] {
+        streamManager.activeStreamIDs
+    }
+
+    /// Gets the number of active streams
+    public var activeStreamCount: Int {
+        streamManager.activeStreamCount
     }
 
     // MARK: - Connection Close
