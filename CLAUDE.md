@@ -108,10 +108,12 @@ swift-quic/
 │   │   ├── PathManager.swift
 │   │   └── IdleTimeout.swift
 │   │
-│   ├── QUICStream/              # Stream management
-│   │   ├── StreamState.swift
-│   │   ├── StreamManager.swift
-│   │   └── FlowControl.swift
+│   ├── QUICStream/              # Stream management (RFC 9000 Section 2-4)
+│   │   ├── DataStream.swift       # Individual stream with send/receive state machines
+│   │   ├── StreamManager.swift    # Stream multiplexing, creation, lifecycle
+│   │   ├── FlowController.swift   # Connection & stream-level flow control
+│   │   ├── DataBuffer.swift       # Out-of-order data reassembly
+│   │   └── StreamState.swift      # Send/receive state enums
 │   │
 │   ├── QUICRecovery/            # Loss detection & congestion
 │   │   ├── LossDetection.swift
@@ -356,46 +358,53 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 
 ## Implementation Phases
 
-### Phase 1: Core Types (QUICCore)
-- [ ] Varint encoding/decoding
-- [ ] ConnectionID
-- [ ] PacketHeader (Long/Short)
-- [ ] All Frame types
-- [ ] Packet number encoding
+### Phase 1: Core Types (QUICCore) ✅
+- [x] Varint encoding/decoding
+- [x] ConnectionID
+- [x] PacketHeader (Long/Short)
+- [x] All Frame types (19 types)
+- [x] Packet number encoding
 
-### Phase 2: Crypto (QUICCrypto)
-- [ ] HKDF key derivation
-- [ ] Initial secrets (derived from Connection ID)
-- [ ] AES-128-GCM AEAD
-- [ ] Header protection (AES-ECB)
+### Phase 2: Crypto (QUICCrypto) ✅
+- [x] HKDF key derivation
+- [x] Initial secrets (derived from Connection ID)
+- [x] AES-128-GCM AEAD
+- [x] Header protection (AES-ECB)
 - [ ] ChaCha20-Poly1305 (optional)
 
-### Phase 3: TLS 1.3 Integration
-- [ ] TLS 1.3 state machine
-- [ ] Certificate handling
-- [ ] ALPN negotiation
+### Phase 3: TLS 1.3 Integration ✅
+- [x] TLS13Provider protocol
+- [x] MockTLSProvider for testing
+- [x] CryptoStreamManager
+- [x] TransportParameters encoding/decoding
+- [x] KeySchedule with key update
 - [ ] libp2p extension support
 
-### Phase 4: Connection Layer
-- [ ] Connection state machine
-- [ ] Initial packet handling
-- [ ] Handshake completion
-- [ ] Connection ID management
+### Phase 4: Connection Layer ✅
+- [x] Connection state machine
+- [x] QUICConnectionHandler orchestrator
+- [x] Packet number space management
+- [x] Connection ID management
 
-### Phase 5: Stream Layer
-- [ ] Stream state machine
-- [ ] Flow control (connection & stream level)
-- [ ] Stream multiplexing
+### Phase 5: Recovery (QUICRecovery) ✅
+- [x] RTT estimation (RTTEstimator)
+- [x] Loss detection (LossDetector)
+- [x] ACK management (AckManager)
+- [ ] Congestion control (NewReno, CUBIC)
 
-### Phase 6: Recovery
-- [ ] RTT estimation
-- [ ] Loss detection
-- [ ] Congestion control (NewReno first, then CUBIC)
+### Phase 6: Stream Layer (QUICStream) ✅
+- [x] DataStream (send/receive state machines)
+- [x] StreamManager (multiplexing, lifecycle)
+- [x] FlowController (connection & stream level)
+- [x] DataBuffer (out-of-order reassembly)
+- [x] STOP_SENDING/RESET_STREAM handling
+- [ ] Priority scheduling
 
 ### Phase 7: Integration
 - [ ] UDP transport integration (swift-nio-udp)
 - [ ] Public API (QUICClient, QUICListener)
 - [ ] libp2p Transport wrapper
+- [ ] Interoperability testing (quiche, quinn)
 
 ## Dependencies
 

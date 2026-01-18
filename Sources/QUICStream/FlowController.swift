@@ -313,6 +313,11 @@ public struct FlowController: Sendable {
         streamBytesReceived.removeValue(forKey: streamID)
     }
 
+    /// Get all tracked stream IDs (for cleanup on connection close)
+    public var trackedStreamIDs: [UInt64] {
+        Array(streamRecvLimits.keys)
+    }
+
     // MARK: - Stream Concurrency
 
     /// Check if we can open a new locally-initiated stream

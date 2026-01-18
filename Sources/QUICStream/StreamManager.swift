@@ -229,6 +229,35 @@ public final class StreamManager: Sendable {
         }
     }
 
+    /// Close all streams (for connection close)
+    /// - Parameter errorCode: Optional error code for RESET_STREAM frames
+    /// - Returns: Array of RESET_STREAM frames to send for active streams
+    public func closeAllStreams(errorCode: UInt64? = nil) -> [ResetStreamFrame] {
+        state.withLock { state in
+            var resetFrames: [ResetStreamFrame] = []
+
+            // Generate RESET_STREAM for streams that can still send
+            if let code = errorCode {
+                for (_, stream) in state.streams {
+                    if let frame = stream.generateResetStream(errorCode: code) {
+                        resetFrames.append(frame)
+                    }
+                }
+            }
+
+            // Clear all streams
+            state.streams.removeAll()
+
+            // Reset flow controller stream tracking
+            // Note: Connection-level counters remain for any final frames
+            for streamID in state.flowController.trackedStreamIDs {
+                state.flowController.removeStream(streamID)
+            }
+
+            return resetFrames
+        }
+    }
+
     // MARK: - Frame Processing
 
     /// Process incoming STREAM frame

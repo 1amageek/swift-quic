@@ -36,6 +36,8 @@ dependencies: [
 ┌─────────────────────────────────────────────────────────────┐
 │  QUICConnection (Connection Handler)                        │
 ├─────────────────────────────────────────────────────────────┤
+│  QUICStream (Stream Multiplexing, Flow Control)             │
+├─────────────────────────────────────────────────────────────┤
 │  Packet Codec (Encoding/Decoding with Encryption)           │
 ├─────────────────────────────────────────────────────────────┤
 │  Frame Codec (All 19 QUIC Frame Types)                      │
@@ -88,6 +90,16 @@ Connection state management:
 - **ConnectionState**: State machine for QUIC connections
 - **QUICConnectionHandler**: Main connection orchestrator
 - **CryptoStreamManager**: CRYPTO frame reassembly
+
+### QUICStream
+
+Stream management and flow control (RFC 9000 Section 2-4):
+
+- **DataStream**: Individual stream state machine with send/receive buffers
+- **StreamManager**: Stream multiplexing, creation, and lifecycle management
+- **FlowController**: Connection and stream-level flow control
+- **DataBuffer**: Out-of-order data reassembly with FIN tracking
+- **StreamState**: Send/receive state machines per RFC 9000
 
 ## Usage
 
@@ -238,7 +250,7 @@ Run all tests:
 swift test
 ```
 
-135 tests covering:
+272 tests covering:
 - Frame encoding/decoding for all 19 frame types
 - Packet encoding/decoding with header protection
 - Coalesced packet building and parsing
@@ -246,6 +258,9 @@ swift test
 - ConnectionID operations
 - Header validation
 - Loss detection and recovery (AckManager, LossDetector)
+- Stream management (DataStream, StreamManager, FlowController)
+- Flow control (connection and stream level)
+- Out-of-order data reassembly (DataBuffer)
 - Performance benchmarks
 
 Run specific test suites:
@@ -254,12 +269,17 @@ Run specific test suites:
 swift test --filter FrameCodecTests
 swift test --filter PacketCodecTests
 swift test --filter CoalescedPacketsTests
+swift test --filter QUICStreamTests
 ```
 
 ## RFC Compliance
 
 ### Implemented
 
+- **RFC 9000 Section 2**: Stream types (bidirectional, unidirectional) with proper ID assignment
+- **RFC 9000 Section 3**: Stream state machines (send/receive states)
+- **RFC 9000 Section 4**: Flow control (connection and stream level)
+- **RFC 9000 Section 4.5**: RESET_STREAM final size validation
 - **RFC 9000 Section 12.4**: Varint-encoded frame types (supports extended frame types)
 - **RFC 9000 Section 14.1**: Initial packet minimum size (1200 bytes) with automatic padding
 - **RFC 9000 Section 17**: Long and Short header formats with validation
@@ -272,6 +292,8 @@ swift test --filter CoalescedPacketsTests
 - ACK range count validation (prevents memory exhaustion attacks)
 - PATH_CHALLENGE/PATH_RESPONSE 8-byte payload enforcement
 - STREAM/DATAGRAM frame boundary validation
+- Flow control violation detection (connection close on violation)
+- RESET_STREAM final size validation against advertised limits
 
 ## Roadmap
 
@@ -294,9 +316,12 @@ swift test --filter CoalescedPacketsTests
   - [x] TransportParameters encoding/decoding
   - [x] KeySchedule with key update support
   - [x] KeyPhaseManager for 1-RTT key rotation
-- [ ] Phase 4: Stream Management
-  - [ ] Stream state machine
-  - [ ] Flow control (connection/stream level)
+- [x] Phase 4: Stream Management (RFC 9000 Section 2-4)
+  - [x] DataStream with send/receive state machines
+  - [x] StreamManager for multiplexing and lifecycle
+  - [x] FlowController (connection and stream level)
+  - [x] DataBuffer for out-of-order reassembly
+  - [x] STOP_SENDING/RESET_STREAM handling
   - [ ] Priority scheduling
 - [ ] Phase 5: Full Integration
   - [ ] E2E handshake with real TLS
