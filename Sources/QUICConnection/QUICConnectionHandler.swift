@@ -1,0 +1,519 @@
+/// QUIC Connection Handler
+///
+/// Main orchestrator for QUIC connection management.
+/// Handles packet processing, loss detection, ACK generation,
+/// and TLS handshake coordination.
+
+import Foundation
+import Synchronization
+import QUICCore
+import QUICRecovery
+import QUICCrypto
+
+// MARK: - Connection Handler
+
+/// Main handler for a QUIC connection
+///
+/// Orchestrates all connection components:
+/// - Packet reception and transmission
+/// - Loss detection and recovery
+/// - ACK generation and processing
+/// - TLS handshake coordination
+/// - Key schedule management
+public final class QUICConnectionHandler: Sendable {
+    // MARK: - Properties
+
+    /// Connection state
+    private let connectionState: Mutex<ConnectionState>
+
+    /// Packet number space manager (loss detection + ACK management)
+    private let pnSpaceManager: PacketNumberSpaceManager
+
+    /// Crypto stream manager
+    private let cryptoStreamManager: CryptoStreamManager
+
+    /// Key schedule
+    private let keySchedule: Mutex<KeySchedule>
+
+    /// TLS provider (optional - can be set later)
+    private let tlsProvider: Mutex<(any TLS13Provider)?> = Mutex(nil)
+
+    /// Local transport parameters
+    private let localTransportParams: TransportParameters
+
+    /// Peer transport parameters (set after handshake)
+    private let peerTransportParams: Mutex<TransportParameters?> = Mutex(nil)
+
+    /// Crypto contexts for each encryption level
+    private let cryptoContexts: Mutex<[EncryptionLevel: CryptoContext]>
+
+    /// Pending outbound packets
+    private let outboundQueue: Mutex<[OutboundPacket]> = Mutex([])
+
+    /// Whether handshake is complete
+    private let handshakeComplete: Mutex<Bool> = Mutex(false)
+
+    // MARK: - Initialization
+
+    /// Creates a new connection handler
+    /// - Parameters:
+    ///   - role: Connection role (client or server)
+    ///   - version: QUIC version
+    ///   - sourceConnectionID: Local connection ID
+    ///   - destinationConnectionID: Peer's connection ID
+    ///   - transportParameters: Local transport parameters
+    public init(
+        role: ConnectionRole,
+        version: QUICVersion,
+        sourceConnectionID: ConnectionID,
+        destinationConnectionID: ConnectionID,
+        transportParameters: TransportParameters
+    ) {
+        self.connectionState = Mutex(ConnectionState(
+            role: role,
+            version: version,
+            sourceConnectionID: sourceConnectionID,
+            destinationConnectionID: destinationConnectionID
+        ))
+
+        self.pnSpaceManager = PacketNumberSpaceManager()
+        self.cryptoStreamManager = CryptoStreamManager()
+        self.keySchedule = Mutex(KeySchedule())
+        self.localTransportParams = transportParameters
+        self.cryptoContexts = Mutex([:])
+    }
+
+    // MARK: - TLS Provider
+
+    /// Sets the TLS provider for this connection
+    /// - Parameter provider: The TLS 1.3 provider to use
+    public func setTLSProvider(_ provider: any TLS13Provider) {
+        tlsProvider.withLock { $0 = provider }
+    }
+
+    // MARK: - Initial Key Derivation
+
+    /// Derives and installs initial keys
+    /// - Returns: Tuple of client and server key material
+    public func deriveInitialKeys() throws -> (client: KeyMaterial, server: KeyMaterial) {
+        let (dcid, version) = connectionState.withLock { state in
+            (state.currentDestinationCID, state.version)
+        }
+
+        let (clientKeys, serverKeys) = try keySchedule.withLock { schedule in
+            try schedule.deriveInitialKeys(connectionID: dcid, version: version)
+        }
+
+        // Create and install crypto contexts
+        let role = connectionState.withLock { $0.role }
+        let (readKeys, writeKeys) = role == .client ?
+            (serverKeys, clientKeys) : (clientKeys, serverKeys)
+
+        let opener = try AES128GCMOpener(keyMaterial: readKeys)
+        let sealer = try AES128GCMSealer(keyMaterial: writeKeys)
+
+        cryptoContexts.withLock { contexts in
+            contexts[.initial] = CryptoContext(opener: opener, sealer: sealer)
+        }
+
+        return (client: clientKeys, server: serverKeys)
+    }
+
+    // MARK: - Packet Reception
+
+    /// Records a received packet for ACK tracking
+    /// - Parameters:
+    ///   - packetNumber: The packet number
+    ///   - level: The encryption level
+    ///   - isAckEliciting: Whether the packet is ACK-eliciting
+    ///   - receiveTime: When the packet was received
+    public func recordReceivedPacket(
+        packetNumber: UInt64,
+        level: EncryptionLevel,
+        isAckEliciting: Bool,
+        receiveTime: ContinuousClock.Instant = .now
+    ) {
+        pnSpaceManager.onPacketReceived(
+            packetNumber: packetNumber,
+            level: level,
+            isAckEliciting: isAckEliciting,
+            receiveTime: receiveTime
+        )
+
+        // Update connection state
+        connectionState.withLock { state in
+            state.updateLargestReceived(packetNumber, level: level)
+        }
+    }
+
+    // MARK: - Frame Processing
+
+    /// Processes frames from a decrypted packet
+    /// - Parameters:
+    ///   - frames: The frames to process
+    ///   - level: The encryption level
+    /// - Returns: Processing result
+    public func processFrames(
+        _ frames: [Frame],
+        level: EncryptionLevel
+    ) throws -> FrameProcessingResult {
+        var result = FrameProcessingResult()
+
+        for frame in frames {
+            switch frame {
+            case .ack(let ackFrame):
+                try processAckFrame(ackFrame, level: level)
+
+            case .crypto(let cryptoFrame):
+                try processCryptoFrame(cryptoFrame, level: level, result: &result)
+
+            case .connectionClose(let closeFrame):
+                processConnectionClose(closeFrame)
+                result.connectionClosed = true
+
+            case .handshakeDone:
+                processHandshakeDone()
+                result.handshakeComplete = true
+
+            case .stream(let streamFrame):
+                result.streamData.append((streamFrame.streamID, streamFrame.data))
+
+            case .padding, .ping:
+                // No action needed
+                break
+
+            default:
+                // Other frames handled as needed
+                break
+            }
+        }
+
+        return result
+    }
+
+    /// Processes an ACK frame
+    private func processAckFrame(_ ackFrame: AckFrame, level: EncryptionLevel) throws {
+        let now = ContinuousClock.Instant.now
+        let maxAckDelay = Duration.milliseconds(Int64(localTransportParams.maxAckDelay))
+        _ = pnSpaceManager.onAckReceived(
+            ackFrame: ackFrame,
+            level: level,
+            receiveTime: now,
+            maxAckDelay: maxAckDelay
+        )
+    }
+
+    /// Processes a CRYPTO frame
+    private func processCryptoFrame(
+        _ cryptoFrame: CryptoFrame,
+        level: EncryptionLevel,
+        result: inout FrameProcessingResult
+    ) throws {
+        // Buffer the crypto data
+        try cryptoStreamManager.receive(cryptoFrame, at: level)
+
+        // Try to read complete data
+        if let data = cryptoStreamManager.read(at: level) {
+            result.cryptoData.append((level, data))
+        }
+    }
+
+    /// Processes CONNECTION_CLOSE frame
+    private func processConnectionClose(_ closeFrame: ConnectionCloseFrame) {
+        connectionState.withLock { state in
+            state.status = .draining
+        }
+    }
+
+    /// Processes HANDSHAKE_DONE frame
+    private func processHandshakeDone() {
+        handshakeComplete.withLock { $0 = true }
+        connectionState.withLock { $0.status = .established }
+        pnSpaceManager.handshakeConfirmed = true
+    }
+
+    // MARK: - Key Management
+
+    /// Installs keys for an encryption level
+    /// - Parameter info: Information about the available keys
+    public func installKeys(_ info: KeysAvailableInfo) throws {
+        let role = connectionState.withLock { $0.role }
+
+        // Determine which keys to use for read/write based on role
+        let readKeys: KeyMaterial
+        let writeKeys: KeyMaterial
+        if role == .client {
+            readKeys = try KeyMaterial.derive(from: info.serverSecret)
+            writeKeys = try KeyMaterial.derive(from: info.clientSecret)
+        } else {
+            readKeys = try KeyMaterial.derive(from: info.clientSecret)
+            writeKeys = try KeyMaterial.derive(from: info.serverSecret)
+        }
+
+        let opener = try AES128GCMOpener(keyMaterial: readKeys)
+        let sealer = try AES128GCMSealer(keyMaterial: writeKeys)
+
+        cryptoContexts.withLock { contexts in
+            contexts[info.level] = CryptoContext(opener: opener, sealer: sealer)
+        }
+
+        // Update key schedule
+        keySchedule.withLock { schedule in
+            switch info.level {
+            case .handshake:
+                _ = try? schedule.setHandshakeSecrets(
+                    clientSecret: info.clientSecret,
+                    serverSecret: info.serverSecret
+                )
+            case .application:
+                _ = try? schedule.setApplicationSecrets(
+                    clientSecret: info.clientSecret,
+                    serverSecret: info.serverSecret
+                )
+            default:
+                break
+            }
+        }
+    }
+
+    /// Gets the crypto context for an encryption level
+    /// - Parameter level: The encryption level
+    /// - Returns: The crypto context, if available
+    public func cryptoContext(for level: EncryptionLevel) -> CryptoContext? {
+        cryptoContexts.withLock { $0[level] }
+    }
+
+    // MARK: - Packet Transmission
+
+    /// Gets pending packets to send
+    /// - Returns: Array of outbound packets
+    public func getOutboundPackets() -> [OutboundPacket] {
+        let now = ContinuousClock.Instant.now
+        let ackDelayExponent = localTransportParams.ackDelayExponent
+        var packets: [OutboundPacket] = []
+
+        // Check if ACKs need to be sent
+        for level in [EncryptionLevel.initial, .handshake, .application] {
+            if let ackFrame = pnSpaceManager.generateAckFrame(
+                for: level,
+                now: now,
+                ackDelayExponent: ackDelayExponent
+            ) {
+                queueFrame(.ack(ackFrame), level: level)
+            }
+        }
+
+        // Get queued packets
+        packets = outboundQueue.withLock { queue in
+            let result = queue
+            queue.removeAll()
+            return result
+        }
+
+        return packets
+    }
+
+    /// Queues a frame to be sent
+    public func queueFrame(_ frame: Frame, level: EncryptionLevel) {
+        let packet = OutboundPacket(frames: [frame], level: level)
+        outboundQueue.withLock { $0.append(packet) }
+    }
+
+    /// Queues CRYPTO frames to be sent
+    public func queueCryptoData(_ data: Data, level: EncryptionLevel) {
+        let frames = cryptoStreamManager.createFrames(for: data, at: level)
+        for frame in frames {
+            queueFrame(.crypto(frame), level: level)
+        }
+    }
+
+    /// Records a sent packet for loss detection
+    /// - Parameter packet: The sent packet
+    public func recordSentPacket(_ packet: SentPacket) {
+        pnSpaceManager.onPacketSent(packet)
+    }
+
+    /// Gets the next packet number for an encryption level
+    /// - Parameter level: The encryption level
+    /// - Returns: The next packet number
+    public func getNextPacketNumber(for level: EncryptionLevel) -> UInt64 {
+        connectionState.withLock { state in
+            state.getNextPacketNumber(for: level)
+        }
+    }
+
+    // MARK: - Timer Management
+
+    /// Called when a timer expires
+    /// - Returns: Actions to take (retransmit, probe, etc.)
+    public func onTimerExpired() -> TimerAction {
+        let now = ContinuousClock.Instant.now
+
+        // Check for loss timeout
+        if let (level, lossTime) = pnSpaceManager.earliestLossTime(), lossTime <= now {
+            if let detector = pnSpaceManager.lossDetectors[level] {
+                let rtt = pnSpaceManager.rttEstimator
+                let lostPackets = detector.detectLostPackets(now: now, rttEstimator: rtt)
+                if !lostPackets.isEmpty {
+                    return .retransmit(lostPackets, level: level)
+                }
+            }
+        }
+
+        // Check for PTO
+        let maxAckDelay = Duration.milliseconds(Int64(localTransportParams.maxAckDelay))
+        let ptoDeadline = pnSpaceManager.nextPTODeadline(now: now, maxAckDelay: maxAckDelay)
+        if ptoDeadline <= now {
+            pnSpaceManager.onPTOExpired()
+            return .probe
+        }
+
+        return .none
+    }
+
+    /// Gets the next timer deadline
+    /// - Returns: When the next timer should fire
+    public func nextTimerDeadline() -> ContinuousClock.Instant? {
+        let now = ContinuousClock.Instant.now
+        let maxAckDelay = Duration.milliseconds(Int64(localTransportParams.maxAckDelay))
+
+        // Get earliest loss time
+        let lossTime = pnSpaceManager.earliestLossTime()?.time
+
+        // Get PTO time
+        let ptoTime = pnSpaceManager.nextPTODeadline(now: now, maxAckDelay: maxAckDelay)
+
+        // Get ACK time
+        let ackTime = pnSpaceManager.earliestAckTime()?.time
+
+        // Return earliest
+        return [lossTime, ptoTime, ackTime].compactMap { $0 }.min()
+    }
+
+    // MARK: - Connection Close
+
+    /// Closes the connection
+    /// - Parameter error: Optional error reason
+    public func close(error: ConnectionCloseError? = nil) {
+        connectionState.withLock { state in
+            state.status = .draining
+        }
+
+        // Queue CONNECTION_CLOSE frame
+        let closeFrame = ConnectionCloseFrame(
+            errorCode: error?.code ?? 0,
+            frameType: nil,
+            reasonPhrase: error?.reason ?? ""
+        )
+        queueFrame(.connectionClose(closeFrame), level: .application)
+    }
+
+    // MARK: - Status
+
+    /// Current connection status
+    public var status: ConnectionStatus {
+        connectionState.withLock { $0.status }
+    }
+
+    /// Whether the handshake is complete
+    public var isHandshakeComplete: Bool {
+        handshakeComplete.withLock { $0 }
+    }
+
+    /// Current RTT estimate
+    public var rttEstimate: Duration {
+        pnSpaceManager.rttEstimator.smoothedRTT
+    }
+
+    /// Connection role
+    public var role: ConnectionRole {
+        connectionState.withLock { $0.role }
+    }
+
+    /// Current source connection ID
+    public var sourceConnectionID: ConnectionID {
+        connectionState.withLock { $0.currentSourceCID }
+    }
+
+    /// Current destination connection ID
+    public var destinationConnectionID: ConnectionID {
+        connectionState.withLock { $0.currentDestinationCID }
+    }
+
+    /// QUIC version
+    public var version: QUICVersion {
+        connectionState.withLock { $0.version }
+    }
+
+    /// Discards an encryption level
+    /// - Parameter level: The level to discard
+    public func discardLevel(_ level: EncryptionLevel) {
+        pnSpaceManager.discardLevel(level)
+        cryptoStreamManager.discardLevel(level)
+        cryptoContexts.withLock { $0.removeValue(forKey: level) }
+        keySchedule.withLock { $0.discardKeys(for: level) }
+    }
+}
+
+// MARK: - Supporting Types
+
+/// Result of processing frames
+public struct FrameProcessingResult: Sendable {
+    /// Crypto data received at each level
+    public var cryptoData: [(EncryptionLevel, Data)] = []
+
+    /// Stream data received (stream ID, data)
+    public var streamData: [(UInt64, Data)] = []
+
+    /// Whether the handshake completed
+    public var handshakeComplete: Bool = false
+
+    /// Whether the connection was closed
+    public var connectionClosed: Bool = false
+}
+
+/// Packet to be sent
+public struct OutboundPacket: Sendable {
+    /// Frames in this packet
+    public let frames: [Frame]
+
+    /// Encryption level
+    public let level: EncryptionLevel
+
+    /// Creation time
+    public let createdAt: ContinuousClock.Instant
+
+    /// Creates an outbound packet
+    public init(frames: [Frame], level: EncryptionLevel) {
+        self.frames = frames
+        self.level = level
+        self.createdAt = .now
+    }
+}
+
+/// Action to take on timer expiry
+public enum TimerAction: Sendable {
+    /// No action needed
+    case none
+
+    /// Retransmit lost packets at the specified level
+    case retransmit([SentPacket], level: EncryptionLevel)
+
+    /// Send probe packets
+    case probe
+}
+
+/// Error for connection close
+public struct ConnectionCloseError: Sendable {
+    /// Error code
+    public let code: UInt64
+
+    /// Reason phrase
+    public let reason: String
+
+    /// Creates a connection close error
+    public init(code: UInt64, reason: String = "") {
+        self.code = code
+        self.reason = reason
+    }
+}

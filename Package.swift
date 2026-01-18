@@ -126,6 +126,12 @@ let package = Package(
         ),
 
         .testTarget(
+            name: "QUICRecoveryTests",
+            dependencies: ["QUICRecovery", "QUICCore"],
+            path: "Tests/QUICRecoveryTests"
+        ),
+
+        .testTarget(
             name: "QUICTests",
             dependencies: ["QUIC"],
             path: "Tests/QUICTests"

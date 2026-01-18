@@ -71,11 +71,23 @@ Cryptographic operations:
 - **AEAD**: AES-128-GCM encryption
 - **HeaderProtection**: AES-ECB header protection
 
+### QUICRecovery
+
+Loss detection and congestion control (RFC 9002):
+
+- **RTTEstimator**: Smoothed RTT calculation with min RTT tracking
+- **AckManager**: Interval-based ACK frame generation with O(1) sequential packet tracking
+- **LossDetector**: Packet/time threshold loss detection with single-pass processing
+- **PacketNumberSpaceManager**: Multi-level packet number space coordination
+- **SentPacket**: Sent packet metadata for loss tracking
+
 ### QUICConnection
 
 Connection state management:
 
 - **ConnectionState**: State machine for QUIC connections
+- **QUICConnectionHandler**: Main connection orchestrator
+- **CryptoStreamManager**: CRYPTO frame reassembly
 
 ## Usage
 
@@ -190,12 +202,27 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 | Coalesced packet parsing | 324k ops/sec |
 | Packet type sorting | 524k ops/sec |
 
+### Loss Detection & Recovery (QUICRecovery)
+
+| Operation | Performance |
+|-----------|-------------|
+| Sequential packet recording | 6.5M ops/sec |
+| Packet recording with gaps | 1.2M ops/sec |
+| ACK frame generation | 67k ops/sec |
+| Packet send recording | 4.7M ops/sec |
+| ACK processing (100 packets) | 12k ops/sec |
+| Loss detection | 14k ops/sec |
+| Multi-range ACK (25 ranges) | 4k ops/sec |
+| Full ACK cycle (50 packets) | 10k packets/sec |
+
 ### Memory Efficiency
 
 | Metric | Value |
 |--------|-------|
 | STREAM frame overhead (100B-10KB) | 4 bytes |
 | Coalesced packet overhead | 0 bytes |
+| 10K sequential packets storage | 1 range |
+| AckManager max ranges | 256 |
 
 Run benchmarks:
 
@@ -211,13 +238,15 @@ Run all tests:
 swift test
 ```
 
-125 tests covering:
+135 tests covering:
 - Frame encoding/decoding for all 19 frame types
 - Packet encoding/decoding with header protection
 - Coalesced packet building and parsing
 - Varint encoding/decoding
 - ConnectionID operations
 - Header validation
+- Loss detection and recovery (AckManager, LossDetector)
+- Performance benchmarks
 
 Run specific test suites:
 
@@ -252,15 +281,26 @@ swift test --filter CoalescedPacketsTests
   - [x] Coalesced Packets
   - [x] Initial packet padding (1200 bytes minimum)
   - [x] Retry packet integrity tag parsing
-- [ ] Phase 2: Connection Handler
-  - [ ] QUICConnectionHandler actor
-  - [ ] PacketReceiver
-  - [ ] AckManager
-  - [ ] LossDetector
-- [ ] Phase 3: TLS 1.3 Integration
-  - [ ] CRYPTO frame handling
-  - [ ] Transport Parameters
-  - [ ] Key Schedule
+- [x] Phase 2: Connection Handler (RFC 9002)
+  - [x] QUICConnectionHandler orchestrator
+  - [x] AckManager with interval-based tracking
+  - [x] LossDetector with packet/time threshold
+  - [x] RTTEstimator with smoothed RTT
+  - [x] PacketNumberSpaceManager
+- [x] Phase 3: TLS 1.3 Integration (RFC 9001)
+  - [x] TLS13Provider protocol
+  - [x] MockTLSProvider for testing
+  - [x] CryptoStreamManager for CRYPTO frame handling
+  - [x] TransportParameters encoding/decoding
+  - [x] KeySchedule with key update support
+  - [x] KeyPhaseManager for 1-RTT key rotation
+- [ ] Phase 4: Stream Management
+  - [ ] Stream state machine
+  - [ ] Flow control (connection/stream level)
+  - [ ] Priority scheduling
+- [ ] Phase 5: Full Integration
+  - [ ] E2E handshake with real TLS
+  - [ ] Interoperability testing (quiche, quinn)
 
 ## References
 

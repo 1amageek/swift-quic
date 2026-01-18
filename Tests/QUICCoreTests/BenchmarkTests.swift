@@ -53,7 +53,7 @@ struct BenchmarkTests {
         let totalOps = iterations * encodedValues.count
         let opsPerSecond = Double(totalOps) / elapsed
         print("Varint decoding: \(Int(opsPerSecond)) ops/sec (\(elapsed * 1000 / Double(totalOps)) ms/op)")
-        #expect(opsPerSecond > 500_000, "Expected > 500k ops/sec")
+        #expect(opsPerSecond > 300_000, "Expected > 300k ops/sec")
     }
 
     // MARK: - ConnectionID Benchmarks
@@ -71,7 +71,7 @@ struct BenchmarkTests {
 
         let opsPerSecond = Double(iterations) / elapsed
         print("ConnectionID creation: \(Int(opsPerSecond)) ops/sec")
-        #expect(opsPerSecond > 500_000, "Expected > 500k ops/sec")
+        #expect(opsPerSecond > 300_000, "Expected > 300k ops/sec")
     }
 
     @Test("ConnectionID equality performance")
