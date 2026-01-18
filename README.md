@@ -103,6 +103,8 @@ Loss detection and congestion control (RFC 9002):
 - **LossDetector**: Packet/time threshold loss detection with single-pass processing
 - **PacketNumberSpaceManager**: Multi-level packet number space coordination
 - **SentPacket**: Sent packet metadata for loss tracking
+- **CongestionController**: Congestion control protocol with pacing support
+- **NewRenoCongestionController**: NewReno implementation with slow start, congestion avoidance, and recovery
 
 ### QUICConnection
 
@@ -289,13 +291,16 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 
 | Operation | Performance |
 |-----------|-------------|
-| Sequential packet recording | 3.6M ops/sec |
+| Sequential packet recording | 9.8M ops/sec |
 | Packet recording with gaps | 476k ops/sec |
 | ACK frame generation | 32.5k ops/sec |
 | Packet send recording | 5.3M ops/sec |
-| ACK processing (100 packets) | 6.5k ops/sec |
-| Loss detection | 6.1k ops/sec |
-| Multi-range ACK (25 ranges) | 2.9k ops/sec |
+| Full ACK cycle (50 packets) | 22.2k cycles/sec |
+| ACK processing (100 packets) | 15.2k ops/sec |
+| Multi-range ACK (25 ranges) | 4.4k ops/sec |
+| LossDetector send phase | 8.4M pkt/sec |
+| LossDetector ACK (no loss) | 43.0k ack/sec |
+| LossDetector ACK (with loss) | 46.5k ack/sec |
 
 ### Packet Operations
 
@@ -380,6 +385,11 @@ swift test --filter Benchmark
   - Priority-based stream scheduling
   - Fair queuing within same priority level (round-robin)
   - Mutable stream priorities
+- **RFC 9002 Section 7**: Congestion Control
+  - NewReno congestion controller with slow start, congestion avoidance, recovery
+  - Pacing support for burst prevention
+  - Persistent congestion detection
+  - ECN congestion event handling
 
 ### Security
 
@@ -424,10 +434,14 @@ swift test --filter Benchmark
   - [x] ConnectionRouter with DCID routing
   - [x] PacketProcessor for encryption integration
   - [x] Graceful shutdown with continuation cleanup
-- [ ] Phase 6: Full Integration
+- [x] Phase 6: Congestion Control (RFC 9002 Section 7)
+  - [x] CongestionController protocol with pacing support
+  - [x] NewRenoCongestionController (slow start, congestion avoidance, recovery)
+  - [x] Persistent congestion detection
+  - [x] ECN congestion event handling
+- [ ] Phase 7: Full Integration
   - [ ] E2E handshake with real TLS
   - [ ] Interoperability testing (quiche, quinn)
-  - [ ] Congestion control (New Reno, Cubic)
 
 ## References
 

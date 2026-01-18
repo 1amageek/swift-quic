@@ -32,10 +32,17 @@ public final class PacketProcessor: Sendable {
     private let decoder = PacketDecoder()
 
     /// Local DCID length (for short header parsing)
-    private let dcidLength: Mutex<Int>
+    /// Uses Atomic for lock-free reads on the hot path
+    private let _dcidLength: Atomic<Int>
 
     /// Largest packet numbers received per level (for PN decoding)
     private let largestReceivedPN: Mutex<[EncryptionLevel: UInt64]>
+
+    /// Current DCID length (lock-free read)
+    @inline(__always)
+    public var dcidLengthValue: Int {
+        _dcidLength.load(ordering: .relaxed)
+    }
 
     // MARK: - Initialization
 
@@ -43,7 +50,7 @@ public final class PacketProcessor: Sendable {
     /// - Parameter dcidLength: Expected DCID length for short headers
     public init(dcidLength: Int = 8) {
         self.contexts = Mutex([:])
-        self.dcidLength = Mutex(dcidLength)
+        self._dcidLength = Atomic(dcidLength)
         self.largestReceivedPN = Mutex([:])
     }
 
@@ -73,7 +80,7 @@ public final class PacketProcessor: Sendable {
     /// Updates the DCID length (for short header parsing)
     /// - Parameter length: The new DCID length
     public func setDCIDLength(_ length: Int) {
-        dcidLength.withLock { $0 = length }
+        _dcidLength.store(length, ordering: .relaxed)
     }
 
     // MARK: - Unified Key Management
@@ -155,8 +162,8 @@ public final class PacketProcessor: Sendable {
         // Get largest PN for this level
         let largestPN = largestReceivedPN.withLock { $0[level] ?? 0 }
 
-        // Get DCID length
-        let dcid = dcidLength.withLock { $0 }
+        // Get DCID length (lock-free)
+        let dcid = dcidLengthValue
 
         // Decode packet
         let parsed = try decoder.decodePacket(
@@ -179,8 +186,8 @@ public final class PacketProcessor: Sendable {
     /// - Returns: Array of parsed packets
     /// - Throws: Error if any packet fails to decrypt
     public func decryptDatagram(_ datagram: Data) throws -> [ParsedPacket] {
-        // Split coalesced packets
-        let dcid = dcidLength.withLock { $0 }
+        // Split coalesced packets (lock-free read)
+        let dcid = dcidLengthValue
         let packetInfos = try CoalescedPacketParser.parse(datagram: datagram, dcidLength: dcid)
 
         var results: [ParsedPacket] = []
@@ -310,18 +317,47 @@ public final class PacketProcessor: Sendable {
         let firstByte = data[data.startIndex]
 
         if PacketHeader.isLongHeader(firstByte: firstByte) {
-            // Long header: parse to get DCID
-            let (header, _) = try PacketHeader.parse(from: data)
-            return header.destinationConnectionID
+            // Long header: use fast path extraction
+            return try extractLongHeaderDCIDFast(from: data)
         } else {
-            // Short header: DCID follows first byte
-            let dcid = dcidLength.withLock { $0 }
+            // Short header: DCID follows first byte (lock-free read)
+            let dcid = dcidLengthValue
             guard data.count >= 1 + dcid else {
                 throw PacketCodecError.insufficientData
             }
             let dcidBytes = data[(data.startIndex + 1)..<(data.startIndex + 1 + dcid)]
             return ConnectionID(bytes: Data(dcidBytes))
         }
+    }
+
+    /// Fast path for extracting DCID from long header without full parsing
+    /// - Parameter data: The packet data
+    /// - Returns: The destination connection ID
+    /// - Throws: Error if the header cannot be parsed
+    @inline(__always)
+    private func extractLongHeaderDCIDFast(from data: Data) throws -> ConnectionID {
+        // Long header format:
+        // 1 byte: header form + type
+        // 4 bytes: version
+        // 1 byte: DCID length
+        // N bytes: DCID
+        guard data.count >= 6 else {
+            throw PacketCodecError.insufficientData
+        }
+
+        let startIndex = data.startIndex
+        let dcidLen = Int(data[startIndex + 5])
+
+        guard dcidLen <= 20 else {
+            throw PacketCodecError.invalidPacketFormat("DCID length exceeds maximum (20)")
+        }
+
+        guard data.count >= 6 + dcidLen else {
+            throw PacketCodecError.insufficientData
+        }
+
+        let dcidBytes = data[(startIndex + 6)..<(startIndex + 6 + dcidLen)]
+        return ConnectionID(bytes: Data(dcidBytes))
     }
 
     /// Extracts packet type from a packet without decryption
@@ -361,6 +397,123 @@ public final class PacketProcessor: Sendable {
         } else {
             return .oneRTT
         }
+    }
+
+    // MARK: - Optimized Header Extraction
+
+    /// Header information extracted in a single pass
+    public struct HeaderInfo: Sendable {
+        public let dcid: ConnectionID
+        public let packetType: PacketType
+        public let scid: ConnectionID?
+    }
+
+    /// Extracts all routing-relevant header information in a single pass
+    ///
+    /// This is more efficient than calling extractDestinationConnectionID()
+    /// and extractPacketType() separately, as it parses the header only once.
+    ///
+    /// - Parameter data: The packet data
+    /// - Returns: Header information including DCID, packet type, and SCID (for Initial)
+    /// - Throws: Error if the header cannot be parsed
+    @inline(__always)
+    public func extractHeaderInfo(from data: Data) throws -> HeaderInfo {
+        guard !data.isEmpty else {
+            throw PacketCodecError.insufficientData
+        }
+
+        let startIndex = data.startIndex
+        let firstByte = data[startIndex]
+
+        if PacketHeader.isLongHeader(firstByte: firstByte) {
+            return try extractLongHeaderInfo(from: data, firstByte: firstByte)
+        } else {
+            // Short header: 1-RTT packet
+            let dcidLen = dcidLengthValue
+            guard data.count >= 1 + dcidLen else {
+                throw PacketCodecError.insufficientData
+            }
+            let dcidBytes = data[(startIndex + 1)..<(startIndex + 1 + dcidLen)]
+            return HeaderInfo(
+                dcid: ConnectionID(bytes: Data(dcidBytes)),
+                packetType: .oneRTT,
+                scid: nil
+            )
+        }
+    }
+
+    /// Extracts header info from long header packets
+    @inline(__always)
+    private func extractLongHeaderInfo(from data: Data, firstByte: UInt8) throws -> HeaderInfo {
+        // Long header format:
+        // 1 byte: header form + type
+        // 4 bytes: version
+        // 1 byte: DCID length
+        // N bytes: DCID
+        // 1 byte: SCID length
+        // M bytes: SCID
+
+        guard data.count >= 6 else {
+            throw PacketCodecError.insufficientData
+        }
+
+        let startIndex = data.startIndex
+
+        // Check version for version negotiation
+        let version = UInt32(data[startIndex + 1]) << 24 |
+                     UInt32(data[startIndex + 2]) << 16 |
+                     UInt32(data[startIndex + 3]) << 8 |
+                     UInt32(data[startIndex + 4])
+
+        let packetType: PacketType
+        if version == 0 {
+            packetType = .versionNegotiation
+        } else {
+            let typeValue = (firstByte >> 4) & 0x03
+            switch typeValue {
+            case 0x00: packetType = .initial
+            case 0x01: packetType = .zeroRTT
+            case 0x02: packetType = .handshake
+            case 0x03: packetType = .retry
+            default: packetType = .initial
+            }
+        }
+
+        // Extract DCID
+        let dcidLen = Int(data[startIndex + 5])
+        guard dcidLen <= 20 else {
+            throw PacketCodecError.invalidPacketFormat("DCID length exceeds maximum (20)")
+        }
+
+        var offset = startIndex + 6
+        guard data.count >= offset + dcidLen else {
+            throw PacketCodecError.insufficientData
+        }
+
+        let dcidBytes = data[offset..<(offset + dcidLen)]
+        let dcid = ConnectionID(bytes: Data(dcidBytes))
+        offset += dcidLen
+
+        // Extract SCID for Initial packets (needed for routing)
+        var scid: ConnectionID? = nil
+        if packetType == .initial {
+            guard data.count >= offset + 1 else {
+                throw PacketCodecError.insufficientData
+            }
+            let scidLen = Int(data[offset])
+            guard scidLen <= 20 else {
+                throw PacketCodecError.invalidPacketFormat("SCID length exceeds maximum (20)")
+            }
+            offset += 1
+
+            guard data.count >= offset + scidLen else {
+                throw PacketCodecError.insufficientData
+            }
+            let scidBytes = data[offset..<(offset + scidLen)]
+            scid = ConnectionID(bytes: Data(scidBytes))
+        }
+
+        return HeaderInfo(dcid: dcid, packetType: packetType, scid: scid)
     }
 }
 

@@ -56,6 +56,27 @@ struct BenchmarkTests {
         #expect(opsPerSecond > 300_000, "Expected > 300k ops/sec")
     }
 
+    @Test("Varint decoding fast path (readVarintValue)")
+    func varintDecodingFastPath() throws {
+        // Focus on 1-byte values which are the most common in QUIC
+        let oneByteValues = (0..<64).map { Varint(UInt64($0)).encode() }
+        let iterations = 50_000
+
+        let start = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<iterations {
+            for encoded in oneByteValues {
+                var reader = DataReader(encoded)
+                _ = try reader.readVarintValue()
+            }
+        }
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+
+        let totalOps = iterations * oneByteValues.count
+        let opsPerSecond = Double(totalOps) / elapsed
+        print("Varint fast path (1-byte): \(Int(opsPerSecond)) ops/sec")
+        #expect(opsPerSecond > 2_000_000, "Expected > 2M ops/sec for 1-byte varints")
+    }
+
     // MARK: - ConnectionID Benchmarks
 
     @Test("ConnectionID creation performance")

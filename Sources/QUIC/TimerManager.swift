@@ -205,7 +205,10 @@ public final class TimerManager: Sendable {
     /// Number of active (non-closed) connections
     public var activeConnectionCount: Int {
         connections.withLock { conns in
-            conns.values.filter { !$0.isClosed }.count
+            // Use reduce to count in single pass without intermediate array allocation
+            conns.values.reduce(0) { count, info in
+                info.isClosed ? count : count + 1
+            }
         }
     }
 }

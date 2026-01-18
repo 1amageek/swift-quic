@@ -23,6 +23,15 @@ public final class PacketNumberSpaceManager: Sendable {
     /// Whether handshake is confirmed
     private let _handshakeConfirmed: Mutex<Bool>
 
+    /// Peer's max_ack_delay transport parameter
+    ///
+    /// RFC 9002 Section 5.3: This value is used to cap the ack_delay field
+    /// when calculating RTT samples, and for PTO/persistent congestion calculation.
+    ///
+    /// Default: 25ms (RFC 9000 Section 18.2)
+    /// Set this when peer's transport parameters are received.
+    private let _peerMaxAckDelay: Mutex<Duration>
+
     /// Creates a new PacketNumberSpaceManager
     /// - Parameter maxAckDelay: Maximum ACK delay for ACK generation
     public init(maxAckDelay: Duration = LossDetectionConstants.defaultMaxAckDelay) {
@@ -42,6 +51,7 @@ public final class PacketNumberSpaceManager: Sendable {
         self._rttEstimator = Mutex(RTTEstimator())
         self._ptoCount = Mutex(0)
         self._handshakeConfirmed = Mutex(false)
+        self._peerMaxAckDelay = Mutex(LossDetectionConstants.defaultMaxAckDelay)
     }
 
     /// Gets the current RTT estimator state
@@ -60,22 +70,42 @@ public final class PacketNumberSpaceManager: Sendable {
         set { _handshakeConfirmed.withLock { $0 = newValue } }
     }
 
+    /// Peer's max_ack_delay transport parameter
+    ///
+    /// Set this when peer's transport parameters are received during handshake.
+    /// Before handshake completion, the default value (25ms) is used.
+    public var peerMaxAckDelay: Duration {
+        get { _peerMaxAckDelay.withLock { $0 } }
+        set { _peerMaxAckDelay.withLock { $0 = newValue } }
+    }
+
+    /// Effective max_ack_delay considering handshake state
+    ///
+    /// RFC 9002 Section 5.3: Before the handshake is confirmed, an endpoint
+    /// might not have received the peer's max_ack_delay value. In this case,
+    /// max_ack_delay should be treated as 0.
+    private var effectiveMaxAckDelay: Duration {
+        handshakeConfirmed ? peerMaxAckDelay : .zero
+    }
+
     /// Updates RTT from a new sample
+    ///
+    /// Uses the internally managed `peerMaxAckDelay` value.
+    ///
     /// - Parameters:
     ///   - sample: The RTT sample
-    ///   - ackDelay: The ack delay reported by peer
-    ///   - maxAckDelay: The peer's max_ack_delay transport parameter
+    ///   - ackDelay: The ack delay reported by peer in the ACK frame
     public func updateRTT(
         sample: Duration,
-        ackDelay: Duration,
-        maxAckDelay: Duration
+        ackDelay: Duration
     ) {
         let confirmed = handshakeConfirmed
+        let maxDelay = peerMaxAckDelay
         _rttEstimator.withLock { estimator in
             estimator.updateRTT(
                 rttSample: sample,
                 ackDelay: ackDelay,
-                maxAckDelay: maxAckDelay,
+                maxAckDelay: maxDelay,
                 handshakeConfirmed: confirmed
             )
         }
@@ -89,19 +119,16 @@ public final class PacketNumberSpaceManager: Sendable {
     }
 
     /// Calculates the next PTO deadline
-    /// - Parameters:
-    ///   - now: Current time
-    ///   - maxAckDelay: The peer's max_ack_delay
+    ///
+    /// Uses the internally managed `peerMaxAckDelay` value.
+    ///
+    /// - Parameter now: Current time
     /// - Returns: The PTO deadline
-    public func nextPTODeadline(
-        now: ContinuousClock.Instant,
-        maxAckDelay: Duration
-    ) -> ContinuousClock.Instant {
-        let confirmed = handshakeConfirmed
-        let effectiveMaxAckDelay = confirmed ? maxAckDelay : .zero
+    public func nextPTODeadline(now: ContinuousClock.Instant) -> ContinuousClock.Instant {
+        let maxDelay = effectiveMaxAckDelay
 
         let pto = _rttEstimator.withLock { rtt in
-            rtt.probeTimeout(maxAckDelay: effectiveMaxAckDelay)
+            rtt.probeTimeout(maxAckDelay: maxDelay)
         }
 
         let ptoMultiplier = _ptoCount.withLock { 1 << $0 }  // 2^pto_count
@@ -195,17 +222,18 @@ public final class PacketNumberSpaceManager: Sendable {
     }
 
     /// Processes an ACK frame
+    ///
+    /// Uses the internally managed `peerMaxAckDelay` for RTT calculation.
+    ///
     /// - Parameters:
     ///   - ackFrame: The received ACK frame
     ///   - level: The encryption level
     ///   - receiveTime: When the ACK was received
-    ///   - maxAckDelay: The peer's max_ack_delay
     /// - Returns: The loss detection result
     public func onAckReceived(
         ackFrame: AckFrame,
         level: EncryptionLevel,
-        receiveTime: ContinuousClock.Instant,
-        maxAckDelay: Duration
+        receiveTime: ContinuousClock.Instant
     ) -> LossDetectionResult {
         guard let lossDetector = lossDetectors[level] else {
             return .empty
@@ -222,8 +250,7 @@ public final class PacketNumberSpaceManager: Sendable {
         if let sample = result.rttSample {
             updateRTT(
                 sample: sample,
-                ackDelay: result.ackDelay,
-                maxAckDelay: maxAckDelay
+                ackDelay: result.ackDelay
             )
         }
 
@@ -247,5 +274,64 @@ public final class PacketNumberSpaceManager: Sendable {
         ackDelayExponent: UInt64
     ) -> AckFrame? {
         ackManagers[level]?.generateAckFrame(now: now, ackDelayExponent: ackDelayExponent)
+    }
+
+    // MARK: - Persistent Congestion Detection
+
+    /// Checks if persistent congestion has occurred
+    ///
+    /// RFC 9002 Section 7.6.2: Establishing Persistent Congestion
+    ///
+    /// Persistent congestion is detected when the time between the oldest
+    /// and newest lost ACK-eliciting packets exceeds the congestion period:
+    ///
+    /// ```
+    /// congestion_period = 2 * PTO * kPersistentCongestionThreshold
+    /// ```
+    ///
+    /// Where:
+    /// - PTO = smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay
+    /// - kPersistentCongestionThreshold = 3 (RFC 9002 default)
+    ///
+    /// Requirements for persistent congestion:
+    /// 1. At least 2 ACK-eliciting packets must be lost
+    /// 2. The time span between oldest and newest must exceed congestion_period
+    /// 3. None of the lost packets were sent before the most recent RTT sample
+    ///    (not implemented here - caller should filter if needed)
+    ///
+    /// - Note: Uses `effectiveMaxAckDelay` which is 0 before handshake confirmation
+    ///   and `peerMaxAckDelay` after. This affects PTO calculation.
+    ///
+    /// - Parameter lostPackets: The packets detected as lost in this ACK processing
+    /// - Returns: `true` if persistent congestion is detected
+    public func checkPersistentCongestion(lostPackets: [SentPacket]) -> Bool {
+        // Requirement 1: Need at least 2 lost packets to measure a time span
+        guard lostPackets.count >= 2 else { return false }
+
+        // Only ACK-eliciting packets count for persistent congestion
+        let ackEliciting = lostPackets.filter { $0.ackEliciting }
+        guard ackEliciting.count >= 2 else { return false }
+
+        // Find the time span between oldest and newest lost packets
+        let sorted = ackEliciting.sorted { $0.timeSent < $1.timeSent }
+        guard let oldest = sorted.first, let newest = sorted.last else {
+            return false
+        }
+
+        let timeSpan = newest.timeSent - oldest.timeSent
+
+        // Calculate congestion period using current RTT estimates
+        // Note: effectiveMaxAckDelay is 0 before handshake is confirmed
+        let maxDelay = effectiveMaxAckDelay
+
+        let pto = _rttEstimator.withLock { rtt in
+            rtt.probeTimeout(maxAckDelay: maxDelay)
+        }
+
+        // RFC 9002: congestion_period = 2 * PTO * kPersistentCongestionThreshold
+        // With threshold=3: congestion_period = 6 * PTO
+        let congestionPeriod = pto * 2 * LossDetectionConstants.persistentCongestionThreshold
+
+        return timeSpan >= congestionPeriod
     }
 }

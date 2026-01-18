@@ -13,7 +13,8 @@ public final class LossDetector: Sendable {
 
     private struct LossState {
         /// Sent packets awaiting acknowledgment, keyed by packet number
-        var sentPackets: [UInt64: SentPacket] = [:]
+        /// Initial capacity of 128 to reduce rehashing during normal operation
+        var sentPackets: [UInt64: SentPacket]
 
         /// Largest packet number acknowledged
         var largestAckedPacket: UInt64?
@@ -29,6 +30,12 @@ public final class LossDetector: Sendable {
 
         /// Smallest unacked packet number (for fast iteration)
         var smallestUnacked: UInt64?
+
+        init() {
+            // Pre-allocate capacity to reduce rehashing
+            // Typical QUIC connections have <1000 packets in flight
+            self.sentPackets = Dictionary(minimumCapacity: 128)
+        }
     }
 
     /// Creates a new LossDetector
@@ -66,8 +73,13 @@ public final class LossDetector: Sendable {
         ackReceivedTime: ContinuousClock.Instant,
         rttEstimator: RTTEstimator
     ) -> LossDetectionResult {
+        // Estimate capacity based on ACK ranges to avoid reallocations
+        let estimatedAcked = min(
+            ackFrame.ackRanges.reduce(0) { $0 + Int($1.rangeLength) + 1 },
+            256
+        )
         var ackedPackets: [SentPacket] = []
-        ackedPackets.reserveCapacity(32)
+        ackedPackets.reserveCapacity(estimatedAcked)
         var lostPackets: [SentPacket] = []
         lostPackets.reserveCapacity(8)
         var rttSample: Duration? = nil
@@ -261,7 +273,14 @@ public final class LossDetector: Sendable {
     /// Gets packets that need retransmission (ack-eliciting packets still in flight)
     public func getRetransmittablePackets() -> [SentPacket] {
         state.withLock { state in
-            state.sentPackets.values.filter { $0.ackEliciting }
+            // Use lazy filter to avoid intermediate array allocation,
+            // then collect only matching packets
+            var result: [SentPacket] = []
+            result.reserveCapacity(state.ackElicitingInFlight)
+            for packet in state.sentPackets.values where packet.ackEliciting {
+                result.append(packet)
+            }
+            return result
         }
     }
 

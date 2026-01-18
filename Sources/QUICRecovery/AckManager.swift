@@ -47,6 +47,10 @@ public final class AckManager: Sendable {
         /// Total packet count for memory management
         var totalPacketCount: Int = 0
 
+        /// Cache for sequential packet fast path
+        /// Tracks the end of the last range for O(1) sequential insert
+        var lastRangeEnd: UInt64?
+
         init(maxAckDelay: Duration) {
             self.maxAckDelay = maxAckDelay
             self.receivedRanges = []
@@ -131,8 +135,34 @@ public final class AckManager: Sendable {
     }
 
     /// Inserts a packet number into the ranges, merging as needed
-    /// Uses unified binary search for O(log n) performance
+    /// Uses fast path for sequential packets, binary search for others
     private func insertPacket(
+        _ packetNumber: UInt64,
+        receiveTime: ContinuousClock.Instant,
+        into state: inout AckState
+    ) {
+        // Fast path: sequential packet (most common case in QUIC)
+        // ~90% of packets arrive in order, so this saves binary search overhead
+        if let lastEnd = state.lastRangeEnd, packetNumber == lastEnd + 1 {
+            // Extend the last range - O(1) operation
+            let lastIndex = state.receivedRanges.count - 1
+            state.receivedRanges[lastIndex].end = packetNumber
+            state.receivedRanges[lastIndex].receiveTime = max(
+                state.receivedRanges[lastIndex].receiveTime,
+                receiveTime
+            )
+            state.lastRangeEnd = packetNumber
+            state.totalPacketCount += 1
+            return
+        }
+
+        // Slow path: out-of-order or first packet
+        insertPacketSlow(packetNumber, receiveTime: receiveTime, into: &state)
+    }
+
+    /// Slow path for inserting out-of-order packets
+    @inline(never)
+    private func insertPacketSlow(
         _ packetNumber: UInt64,
         receiveTime: ContinuousClock.Instant,
         into state: inout AckState
@@ -166,6 +196,10 @@ public final class AckManager: Sendable {
                     state.receivedRanges[insertIndex].receiveTime
                 )
                 state.receivedRanges.remove(at: insertIndex)
+                // Update lastRangeEnd if we extended the last range
+                if prevIndex == state.receivedRanges.count - 1 {
+                    state.lastRangeEnd = state.receivedRanges[prevIndex].end
+                }
             } else if canExtendPrevious {
                 // Extend previous range
                 state.receivedRanges[insertIndex - 1].end = packetNumber
@@ -173,6 +207,10 @@ public final class AckManager: Sendable {
                     state.receivedRanges[insertIndex - 1].receiveTime,
                     receiveTime
                 )
+                // Update lastRangeEnd if we extended the last range
+                if insertIndex - 1 == state.receivedRanges.count - 1 {
+                    state.lastRangeEnd = packetNumber
+                }
             } else if canExtendNext {
                 // Extend next range
                 state.receivedRanges[insertIndex].start = packetNumber
@@ -185,11 +223,18 @@ public final class AckManager: Sendable {
                 let newRange = PacketRange(start: packetNumber, end: packetNumber, receiveTime: receiveTime)
                 state.receivedRanges.insert(newRange, at: insertIndex)
 
+                // Update lastRangeEnd if this is now the last range
+                if insertIndex == state.receivedRanges.count - 1 {
+                    state.lastRangeEnd = packetNumber
+                }
+
                 // Prune if too many ranges (25% removal for smoother degradation)
                 if state.receivedRanges.count > Self.maxRanges {
                     // Remove oldest (smallest) ranges, keep 75%
                     let toRemove = state.receivedRanges.count - (Self.maxRanges * 3 / 4)
                     state.receivedRanges.removeFirst(toRemove)
+                    // Update lastRangeEnd after pruning
+                    state.lastRangeEnd = state.receivedRanges.last?.end
                 }
             }
         }
@@ -299,6 +344,7 @@ public final class AckManager: Sendable {
             state.shouldAckImmediately = false
             state.ackAlarm = nil
             state.totalPacketCount = 0
+            state.lastRangeEnd = nil
         }
     }
 

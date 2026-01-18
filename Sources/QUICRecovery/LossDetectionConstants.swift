@@ -43,4 +43,31 @@ public enum LossDetectionConstants {
     /// Persistent congestion threshold (in PTO periods)
     /// RFC 9002 Section 6.4: "3 consecutive PTOs"
     public static let persistentCongestionThreshold: Int = 3
+
+    // MARK: - Congestion Control Constants (RFC 9002 Section 7)
+
+    /// Default maximum datagram size (bytes)
+    /// RFC 9002 Section 7.2: Used to calculate initial window
+    public static let maxDatagramSize: Int = 1200
+
+    /// Initial congestion window
+    /// RFC 9002 Section 7.2: "The initial congestion window is the minimum of
+    /// 10 * max_datagram_size and max(14720, 2 * max_datagram_size)"
+    public static var initialWindow: Int {
+        min(10 * maxDatagramSize, max(14720, 2 * maxDatagramSize))
+    }
+
+    /// Minimum congestion window (in bytes)
+    /// RFC 9002 Section 7.2: "2 * max_datagram_size"
+    public static var minimumWindow: Int {
+        2 * maxDatagramSize
+    }
+
+    /// Loss reduction factor
+    /// RFC 9002 Section 7.3.2: Multiplicative decrease factor (0.5 for NewReno)
+    public static let lossReductionFactor: Double = 0.5
+
+    /// Initial burst tokens for pacing
+    /// Number of packets that can be sent immediately at connection start
+    public static let initialBurstTokens: Int = 10
 }

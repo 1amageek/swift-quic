@@ -61,6 +61,7 @@ let package = Package(
                 "QUICCore",
                 "QUICCrypto",
                 "QUICStream",
+                "QUICRecovery",
             ],
             path: "Sources/QUICConnection"
         ),

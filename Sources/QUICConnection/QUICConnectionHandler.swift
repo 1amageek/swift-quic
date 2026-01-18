@@ -30,6 +30,9 @@ public final class QUICConnectionHandler: Sendable {
     /// Packet number space manager (loss detection + ACK management)
     private let pnSpaceManager: PacketNumberSpaceManager
 
+    /// Congestion controller
+    private let congestionController: NewRenoCongestionController
+
     /// Crypto stream manager
     private let cryptoStreamManager: CryptoStreamManager
 
@@ -81,6 +84,7 @@ public final class QUICConnectionHandler: Sendable {
         ))
 
         self.pnSpaceManager = PacketNumberSpaceManager()
+        self.congestionController = NewRenoCongestionController()
         self.cryptoStreamManager = CryptoStreamManager()
 
         // Initialize stream manager with transport parameters
@@ -247,15 +251,60 @@ public final class QUICConnectionHandler: Sendable {
     }
 
     /// Processes an ACK frame
+    ///
+    /// RFC 9002 compliant ACK processing:
+    /// 1. Process ACK to detect acked/lost packets and update RTT
+    /// 2. Notify congestion controller of acknowledged packets
+    /// 3. Handle packet loss with congestion control
+    ///
+    /// - Note: Uses internally managed `peerMaxAckDelay` for RTT/PTO calculations.
     private func processAckFrame(_ ackFrame: AckFrame, level: EncryptionLevel) throws {
         let now = ContinuousClock.Instant.now
-        let maxAckDelay = Duration.milliseconds(Int64(localTransportParams.maxAckDelay))
-        _ = pnSpaceManager.onAckReceived(
+
+        let result = pnSpaceManager.onAckReceived(
             ackFrame: ackFrame,
             level: level,
-            receiveTime: now,
-            maxAckDelay: maxAckDelay
+            receiveTime: now
         )
+
+        // Congestion Control: process acknowledged packets
+        if !result.ackedPackets.isEmpty {
+            congestionController.onPacketsAcknowledged(
+                packets: result.ackedPackets,
+                now: now,
+                rtt: pnSpaceManager.rttEstimator
+            )
+        }
+
+        // Congestion Control: process lost packets
+        if !result.lostPackets.isEmpty {
+            // RFC 9002 Section 7.6.2 - Persistent Congestion
+            //
+            // Per the RFC, persistent congestion detection happens AFTER loss detection,
+            // and causes an ADDITIONAL response beyond normal loss handling:
+            // - Normal loss: cwnd reduced by half, enter recovery
+            // - Persistent congestion: cwnd collapsed to minimum, ssthresh reset
+            //
+            // Implementation note:
+            // We use if-else here because persistent congestion subsumes normal loss:
+            // - Both would enter recovery, but persistent congestion also resets ssthresh
+            // - Applying loss first (cwnd/2) then persistent congestion (cwnd=minimum)
+            //   would give the same result as applying persistent congestion alone
+            // - The key difference is ssthresh reset, which only persistent congestion does
+            //
+            // This optimization is valid because:
+            // - minimum_window (2*MSS) < cwnd/2 for any cwnd > 4*MSS (always true after slow start)
+            // - Persistent congestion resets to slow start (ssthresh=∞), which is the desired behavior
+            if pnSpaceManager.checkPersistentCongestion(lostPackets: result.lostPackets) {
+                congestionController.onPersistentCongestion()
+            } else {
+                congestionController.onPacketsLost(
+                    packets: result.lostPackets,
+                    now: now,
+                    rtt: pnSpaceManager.rttEstimator
+                )
+            }
+        }
     }
 
     /// Processes a CRYPTO frame
@@ -288,9 +337,16 @@ public final class QUICConnectionHandler: Sendable {
     }
 
     /// Sets peer transport parameters (called after TLS handshake)
+    ///
+    /// This updates various components with the peer's advertised limits and settings,
+    /// including the critical `max_ack_delay` used for RTT/PTO calculations.
+    ///
     /// - Parameter params: Peer's transport parameters
     public func setPeerTransportParameters(_ params: TransportParameters) {
         peerTransportParams.withLock { $0 = params }
+
+        // RFC 9002: Set peer's max_ack_delay for RTT/PTO calculations
+        pnSpaceManager.peerMaxAckDelay = .milliseconds(Int64(params.maxAckDelay))
 
         // Update stream manager with peer's limits
         streamManager.handleMaxData(MaxDataFrame(maxData: params.initialMaxData))
@@ -422,10 +478,16 @@ public final class QUICConnectionHandler: Sendable {
         }
     }
 
-    /// Records a sent packet for loss detection
+    /// Records a sent packet for loss detection and congestion control
     /// - Parameter packet: The sent packet
     public func recordSentPacket(_ packet: SentPacket) {
         pnSpaceManager.onPacketSent(packet)
+
+        // Notify congestion controller
+        congestionController.onPacketSent(
+            bytes: packet.sentBytes,
+            now: packet.timeSent
+        )
     }
 
     /// Gets the next packet number for an encryption level
@@ -455,9 +517,8 @@ public final class QUICConnectionHandler: Sendable {
             }
         }
 
-        // Check for PTO
-        let maxAckDelay = Duration.milliseconds(Int64(localTransportParams.maxAckDelay))
-        let ptoDeadline = pnSpaceManager.nextPTODeadline(now: now, maxAckDelay: maxAckDelay)
+        // Check for PTO (uses internally managed peerMaxAckDelay)
+        let ptoDeadline = pnSpaceManager.nextPTODeadline(now: now)
         if ptoDeadline <= now {
             pnSpaceManager.onPTOExpired()
             return .probe
@@ -470,19 +531,60 @@ public final class QUICConnectionHandler: Sendable {
     /// - Returns: When the next timer should fire
     public func nextTimerDeadline() -> ContinuousClock.Instant? {
         let now = ContinuousClock.Instant.now
-        let maxAckDelay = Duration.milliseconds(Int64(localTransportParams.maxAckDelay))
 
         // Get earliest loss time
         let lossTime = pnSpaceManager.earliestLossTime()?.time
 
-        // Get PTO time
-        let ptoTime = pnSpaceManager.nextPTODeadline(now: now, maxAckDelay: maxAckDelay)
+        // Get PTO time (uses internally managed peerMaxAckDelay)
+        let ptoTime = pnSpaceManager.nextPTODeadline(now: now)
 
         // Get ACK time
         let ackTime = pnSpaceManager.earliestAckTime()?.time
 
+        // Get pacing time (for smooth transmission)
+        let pacingTime = congestionController.nextSendTime()
+
         // Return earliest
-        return [lossTime, ptoTime, ackTime].compactMap { $0 }.min()
+        return [lossTime, ptoTime, ackTime, pacingTime].compactMap { $0 }.min()
+    }
+
+    // MARK: - Congestion Control
+
+    /// Checks if a packet can be sent (congestion window and pacing check)
+    /// - Parameters:
+    ///   - size: Size of the packet in bytes
+    ///   - now: Current time
+    /// - Returns: `true` if the packet can be sent
+    public func canSendPacket(size: Int, now: ContinuousClock.Instant = .now) -> Bool {
+        // 1. Check congestion window
+        let bytesInFlight = pnSpaceManager.totalBytesInFlight
+        guard congestionController.availableWindow(bytesInFlight: bytesInFlight) >= size else {
+            return false
+        }
+
+        // 2. Check pacing
+        if let nextTime = congestionController.nextSendTime() {
+            guard now >= nextTime else {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    /// Current congestion window in bytes
+    public var congestionWindow: Int {
+        congestionController.congestionWindow
+    }
+
+    /// Available window for sending (congestion window minus bytes in flight)
+    public var availableWindow: Int {
+        congestionController.availableWindow(bytesInFlight: pnSpaceManager.totalBytesInFlight)
+    }
+
+    /// Current congestion control state
+    public var congestionState: CongestionState {
+        congestionController.currentState
     }
 
     // MARK: - Stream Management

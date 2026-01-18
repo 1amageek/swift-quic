@@ -75,9 +75,8 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         switch frame {
         case .padding(let count):
             // PADDING frames are just 0x00 bytes
-            for _ in 0..<count {
-                writer.writeByte(0x00)
-            }
+            // Use batch append for efficiency instead of byte-by-byte loop
+            writer.writeBytes(Data(repeating: 0x00, count: count))
 
         case .ping:
             // PING frame: just type byte

@@ -60,7 +60,8 @@ public struct RTTEstimator: Sendable {
             hasEstimate = true
             minRTT = rttSample
             smoothedRTT = rttSample
-            rttVariance = rttSample / 2
+            // Use FastDuration for division
+            rttVariance = (rttSample.fast / 2).duration
             return
         }
 
@@ -69,23 +70,34 @@ public struct RTTEstimator: Sendable {
             minRTT = rttSample
         }
 
+        // Use FastDuration for all calculations (avoids repeated components decomposition)
+        let fastSample = rttSample.fast
+        let fastMinRTT = minRTT.fast
+        var fastAdjusted = fastSample
+
         // Adjust for ack delay only after handshake is confirmed
         // RFC 9002 Section 5.3: "An endpoint MUST NOT subtract the acknowledgment
         // delay from the RTT sample if the resulting value is smaller than the min_rtt."
-        var adjustedRTT = rttSample
         if handshakeConfirmed {
-            let cappedAckDelay = min(ackDelay, maxAckDelay)
-            if adjustedRTT > minRTT + cappedAckDelay {
-                adjustedRTT = rttSample - cappedAckDelay
+            let fastAckDelay = ackDelay.fast
+            let fastMaxAckDelay = maxAckDelay.fast
+            let cappedAckDelay = FastDuration.min(fastAckDelay, fastMaxAckDelay)
+            if fastAdjusted > fastMinRTT + cappedAckDelay {
+                fastAdjusted = fastSample - cappedAckDelay
             }
         }
 
-        // Update smoothed RTT and variance using EWMA
+        // Update smoothed RTT and variance using EWMA with FastDuration
         // smoothed_rtt = 7/8 * smoothed_rtt + 1/8 * adjusted_rtt
         // rttvar = 3/4 * rttvar + 1/4 * |smoothed_rtt - adjusted_rtt|
-        let rttDiff = Duration.abs(smoothedRTT - adjustedRTT)
-        rttVariance = (rttVariance * 3 + rttDiff) / 4
-        smoothedRTT = (smoothedRTT * 7 + adjustedRTT) / 8
+        let fastSmoothed = smoothedRTT.fast
+        let fastVariance = rttVariance.fast
+        let rttDiff = FastDuration.abs(fastSmoothed - fastAdjusted)
+        let newVariance = (fastVariance * 3 + rttDiff) / 4
+        let newSmoothed = (fastSmoothed * 7 + fastAdjusted) / 8
+
+        rttVariance = newVariance.duration
+        smoothedRTT = newSmoothed.duration
     }
 
     /// Calculates the Probe Timeout (PTO) value

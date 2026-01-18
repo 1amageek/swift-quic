@@ -146,11 +146,25 @@ public struct DataReader: Sendable {
         }
 
         let firstByte = data[position]
+
+        // Fast path for 1-byte values (0-63), which are the most common case
+        // ~80% of varints in QUIC are 1-byte (stream IDs, small lengths, frame types)
+        if firstByte & 0xC0 == 0 {
+            position += 1
+            return UInt64(firstByte)
+        }
+
+        // Slow path for multi-byte values
+        return try readVarintValueSlow(firstByte: firstByte)
+    }
+
+    /// Slow path for multi-byte varint values
+    @usableFromInline
+    mutating func readVarintValueSlow(firstByte: UInt8) throws -> UInt64 {
         let prefix = firstByte >> 6
 
         let length: Int
         switch prefix {
-        case 0b00: length = 1
         case 0b01: length = 2
         case 0b10: length = 4
         default:   length = 8  // 0b11
@@ -162,8 +176,6 @@ public struct DataReader: Sendable {
 
         let value: UInt64
         switch length {
-        case 1:
-            value = UInt64(firstByte & 0x3F)
         case 2:
             value = UInt64(firstByte & 0x3F) << 8
                 | UInt64(data[position + 1])

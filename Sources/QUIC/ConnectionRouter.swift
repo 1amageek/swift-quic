@@ -87,24 +87,16 @@ public final class ConnectionRouter: Sendable {
     ///   - remoteAddress: Where the packet came from
     /// - Returns: The routing result
     public func route(data: Data, from remoteAddress: SocketAddress) -> RouteResult {
-        // Extract DCID from packet
-        let dcid: ConnectionID
-        let packetType: PacketType
-        let scid: ConnectionID?
-
+        // Extract header info in a single pass (optimized path)
+        let headerInfo: PacketProcessor.HeaderInfo
         do {
-            dcid = try packetProcessor.extractDestinationConnectionID(from: data)
-            packetType = try packetProcessor.extractPacketType(from: data)
-
-            // For Initial packets, also extract source CID
-            if packetType == .initial {
-                scid = try extractSourceConnectionID(from: data)
-            } else {
-                scid = nil
-            }
+            headerInfo = try packetProcessor.extractHeaderInfo(from: data)
         } catch {
             return .invalid(error)
         }
+
+        let dcid = headerInfo.dcid
+        let packetType = headerInfo.packetType
 
         // Look up connection by DCID
         if let connection = connections.withLock({ $0[dcid] }) {
@@ -116,7 +108,7 @@ public final class ConnectionRouter: Sendable {
         if isServer && packetType == .initial {
             return .newConnection(IncomingConnectionInfo(
                 destinationConnectionID: dcid,
-                sourceConnectionID: scid ?? ConnectionID.random(length: 8),
+                sourceConnectionID: headerInfo.scid ?? ConnectionID.random(length: 8),
                 packetType: packetType,
                 remoteAddress: remoteAddress,
                 data: data
