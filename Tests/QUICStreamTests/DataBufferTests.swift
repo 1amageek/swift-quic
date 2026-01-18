@@ -359,4 +359,80 @@ struct DataBufferTests {
         let rest = buffer.readAllContiguous()
         #expect(rest == Data([3, 4, 5, 6, 7, 8, 9, 10, 11, 12]))
     }
+
+    // MARK: - FIN Validation Tests (Issue A)
+
+    @Test("FIN received after out-of-order data beyond final size throws error")
+    func finAfterDataBeyondFinalSize() throws {
+        var buffer = DataBuffer()
+
+        // First receive data at offset 100
+        try buffer.insert(offset: 100, data: Data(repeating: 0, count: 50), fin: false)
+
+        // Then receive FIN at offset 50 - should fail because buffered data exceeds it
+        #expect(throws: DataBufferError.self) {
+            try buffer.insert(offset: 0, data: Data(repeating: 0, count: 50), fin: true)
+        }
+    }
+
+    @Test("FIN with data that matches buffered segments succeeds")
+    func finMatchingBufferedData() throws {
+        var buffer = DataBuffer()
+
+        // First receive data at offset 50
+        try buffer.insert(offset: 50, data: Data(repeating: 0, count: 50), fin: false)
+
+        // Then receive FIN at offset 100 - should succeed
+        try buffer.insert(offset: 0, data: Data(repeating: 0, count: 50), fin: false)
+        try buffer.insert(offset: 100, data: Data(), fin: true)
+
+        #expect(buffer.finalSize == 100)
+        #expect(buffer.totalBytes == 100)
+    }
+
+    // MARK: - Buffer Overflow with Overlaps Tests (Issue B)
+
+    @Test("Duplicate data does not trigger false buffer overflow")
+    func duplicateDataNoFalseOverflow() throws {
+        var buffer = DataBuffer(maxBufferSize: 100)
+
+        // Fill to 90 bytes
+        try buffer.insert(offset: 0, data: Data(repeating: 0, count: 90), fin: false)
+
+        // Insert 20 bytes that completely overlap - should NOT overflow
+        try buffer.insert(offset: 0, data: Data(repeating: 0, count: 20), fin: false)
+
+        #expect(buffer.totalBytes == 90)
+    }
+
+    @Test("Partially overlapping data calculates correct overflow")
+    func partialOverlapCorrectOverflow() throws {
+        var buffer = DataBuffer(maxBufferSize: 100)
+
+        // Fill to 90 bytes (offset 0-90)
+        try buffer.insert(offset: 0, data: Data(repeating: 0, count: 90), fin: false)
+
+        // Insert 20 bytes at offset 80 (10 overlap, 10 new) - total 100, should succeed
+        try buffer.insert(offset: 80, data: Data(repeating: 0, count: 20), fin: false)
+
+        #expect(buffer.totalBytes == 100)
+
+        // Insert 1 more byte - should overflow
+        #expect(throws: DataBufferError.self) {
+            try buffer.insert(offset: 100, data: Data([1]), fin: false)
+        }
+    }
+
+    @Test("Large overlapping insert at buffer limit succeeds")
+    func largeOverlappingInsertAtLimit() throws {
+        var buffer = DataBuffer(maxBufferSize: 100)
+
+        // Fill to 100 bytes
+        try buffer.insert(offset: 0, data: Data(repeating: 0, count: 100), fin: false)
+
+        // Insert 50 bytes that completely overlap - should succeed (no new bytes)
+        try buffer.insert(offset: 25, data: Data(repeating: 0, count: 50), fin: false)
+
+        #expect(buffer.totalBytes == 100)
+    }
 }

@@ -63,6 +63,16 @@ public struct DataBuffer: Sendable {
                     )
                 }
             } else {
+                // Validate that no existing segments exceed the new final size
+                for segment in segments {
+                    let segmentEnd = segment.offset + UInt64(segment.data.count)
+                    if segmentEnd > endOffset {
+                        throw DataBufferError.dataExceedsFinalSize(
+                            finalSize: endOffset,
+                            receivedEnd: segmentEnd
+                        )
+                    }
+                }
                 finalSize = endOffset
             }
         }
@@ -80,15 +90,6 @@ public struct DataBuffer: Sendable {
         // Don't insert empty data (FIN was already processed above)
         guard !data.isEmpty else { return }
 
-        // Check buffer overflow
-        let newTotal = UInt64(totalBytes) + UInt64(data.count)
-        guard newTotal <= maxBufferSize else {
-            throw DataBufferError.bufferOverflow(
-                maxSize: maxBufferSize,
-                requested: newTotal
-            )
-        }
-
         // Skip data that's already been read
         if endOffset <= readOffset {
             return  // Already consumed
@@ -104,6 +105,16 @@ public struct DataBuffer: Sendable {
         } else {
             insertOffset = offset
             insertData = data
+        }
+
+        // Check buffer overflow (using actual non-overlapping bytes)
+        let actualNewBytes = calculateNonOverlappingBytes(insertOffset, insertData)
+        let newTotal = UInt64(totalBytes) + actualNewBytes
+        guard newTotal <= maxBufferSize else {
+            throw DataBufferError.bufferOverflow(
+                maxSize: maxBufferSize,
+                requested: newTotal
+            )
         }
 
         // Find insertion point (binary search for efficiency)
@@ -131,6 +142,29 @@ public struct DataBuffer: Sendable {
             }
         }
         return low
+    }
+
+    /// Calculates non-overlapping bytes that would be added by new data
+    /// - Parameters:
+    ///   - offset: The offset of the new data
+    ///   - data: The data to insert
+    /// - Returns: The number of bytes that don't overlap with existing segments
+    private func calculateNonOverlappingBytes(_ offset: UInt64, _ data: Data) -> UInt64 {
+        guard !data.isEmpty else { return 0 }
+
+        let endOffset = offset + UInt64(data.count)
+        var nonOverlapping = UInt64(data.count)
+
+        for segment in segments {
+            let segmentEnd = segment.offset + UInt64(segment.data.count)
+            // Calculate overlap range
+            let overlapStart = max(offset, segment.offset)
+            let overlapEnd = min(endOffset, segmentEnd)
+            if overlapStart < overlapEnd {
+                nonOverlapping -= (overlapEnd - overlapStart)
+            }
+        }
+        return nonOverlapping
     }
 
     /// Merges overlapping and adjacent segments

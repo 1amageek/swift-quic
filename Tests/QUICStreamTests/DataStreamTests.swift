@@ -499,6 +499,128 @@ struct DataStreamTests {
         #expect(stream.state.sendState == .dataRecvd)
     }
 
+    // MARK: - RFC 9000 Section 4.5: Stream Final Size Tests
+
+    /// RFC 9000 Section 4.5:
+    /// "A receiver MUST close the connection with error FLOW_CONTROL_ERROR
+    /// if a sender violates the advertised connection or stream data limits"
+    @Test("RFC 9000 4.5: RESET_STREAM with final size exceeding flow control limit throws error")
+    func resetStreamExceedsFlowControlLimit() throws {
+        var stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 100  // Stream receive limit = 100
+        )
+
+        // RESET_STREAM with finalSize > recvMaxData should throw
+        #expect(throws: StreamError.self) {
+            try stream.handleResetStream(errorCode: 0, finalSize: 150)
+        }
+    }
+
+    /// RFC 9000 Section 4.5:
+    /// "Once a final size for a stream is known, it cannot change"
+    @Test("RFC 9000 4.5: RESET_STREAM with conflicting final size throws error")
+    func resetStreamConflictingFinalSize() throws {
+        var stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+
+        // First: Receive FIN with final size 50
+        let finFrame = StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data(repeating: 0, count: 50),
+            fin: true
+        )
+        try stream.receive(finFrame)
+        #expect(stream.state.finalSize == 50)
+
+        // Then: RESET_STREAM with different final size should throw
+        #expect(throws: StreamError.self) {
+            try stream.handleResetStream(errorCode: 0, finalSize: 100)
+        }
+    }
+
+    /// RFC 9000 Section 4.5:
+    /// "The final size is the amount of flow control credit that is consumed by a stream"
+    @Test("RFC 9000 4.5: RESET_STREAM with matching final size succeeds")
+    func resetStreamMatchingFinalSize() throws {
+        var stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+
+        // First: Receive FIN with final size 50
+        let finFrame = StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data(repeating: 0, count: 50),
+            fin: true
+        )
+        try stream.receive(finFrame)
+
+        // RESET_STREAM with same final size should succeed
+        try stream.handleResetStream(errorCode: 42, finalSize: 50)
+        #expect(stream.state.recvState == .resetRecvd)
+    }
+
+    /// RFC 9000 Section 4.5:
+    /// "An endpoint that receives a RESET_STREAM frame for a send-only stream
+    /// MUST terminate the connection with error STREAM_STATE_ERROR"
+    @Test("RFC 9000 4.5: Final size from RESET_STREAM must not exceed stream limit")
+    func resetStreamFinalSizeAtExactLimit() throws {
+        var stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 100
+        )
+
+        // RESET_STREAM with finalSize exactly at limit should succeed
+        try stream.handleResetStream(errorCode: 0, finalSize: 100)
+        #expect(stream.state.finalSize == 100)
+        #expect(stream.state.recvState == .resetRecvd)
+    }
+
+    /// RFC 9000 Section 4.5:
+    /// "Endpoints MUST NOT send data on a stream at or beyond the final size"
+    @Test("RFC 9000 4.5: Data received beyond final size from FIN is rejected")
+    func dataReceivedBeyondFinalSize() throws {
+        var stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+
+        // First: Receive FIN with final size 50
+        let finFrame = StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data(repeating: 0, count: 50),
+            fin: true
+        )
+        try stream.receive(finFrame)
+
+        // Then: Data at offset 40 with length 20 (ends at 60 > 50) should throw
+        let badFrame = StreamFrame(
+            streamID: 0,
+            offset: 40,
+            data: Data(repeating: 0, count: 20),
+            fin: false
+        )
+        #expect(throws: StreamError.self) {
+            try stream.receive(badFrame)
+        }
+    }
+
     // MARK: - Stream Closed Tests
 
     @Test("Bidirectional stream closed")
@@ -545,5 +667,48 @@ struct DataStreamTests {
         stream.acknowledgeData(upTo: 3)
 
         #expect(stream.isClosed)
+    }
+
+    // MARK: - Stream ID Mismatch Tests (Issue C)
+
+    @Test("Stream ID mismatch throws error instead of crash")
+    func streamIDMismatchThrows() throws {
+        let stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+
+        // Create a frame with wrong stream ID
+        let wrongFrame = StreamFrame(streamID: 4, offset: 0, data: Data([1, 2, 3]), fin: false)
+
+        #expect(throws: StreamError.self) {
+            try stream.receive(wrongFrame)
+        }
+    }
+
+    @Test("Stream ID mismatch error contains correct IDs")
+    func streamIDMismatchErrorContainsIDs() throws {
+        let stream = DataStream(
+            id: 8,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+
+        let wrongFrame = StreamFrame(streamID: 12, offset: 0, data: Data([1]), fin: false)
+
+        do {
+            try stream.receive(wrongFrame)
+            Issue.record("Expected StreamError.streamIDMismatch to be thrown")
+        } catch let error as StreamError {
+            if case .streamIDMismatch(let expected, let received) = error {
+                #expect(expected == 8)
+                #expect(received == 12)
+            } else {
+                Issue.record("Wrong error type: \(error)")
+            }
+        }
     }
 }

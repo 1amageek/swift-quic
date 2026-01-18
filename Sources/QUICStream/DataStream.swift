@@ -22,6 +22,8 @@ public enum StreamError: Error, Sendable {
     case bufferError(DataBufferError)
     /// Final size mismatch
     case finalSizeMismatch(expected: UInt64, received: UInt64)
+    /// Stream ID mismatch (internal error)
+    case streamIDMismatch(expected: UInt64, received: UInt64)
 }
 
 /// Internal state for DataStream (protected by Mutex)
@@ -233,7 +235,7 @@ public final class DataStream: Sendable {
     public func receive(_ frame: StreamFrame) throws {
         try _internal.withLock { `internal` in
             guard frame.streamID == id else {
-                fatalError("Frame streamID mismatch")
+                throw StreamError.streamIDMismatch(expected: id, received: frame.streamID)
             }
 
             // Check if we can receive on this stream

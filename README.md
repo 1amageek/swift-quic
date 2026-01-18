@@ -250,7 +250,7 @@ Run all tests:
 swift test
 ```
 
-272 tests covering:
+290 tests covering:
 - Frame encoding/decoding for all 19 frame types
 - Packet encoding/decoding with header protection
 - Coalesced packet building and parsing
@@ -261,6 +261,7 @@ swift test
 - Stream management (DataStream, StreamManager, FlowController)
 - Flow control (connection and stream level)
 - Out-of-order data reassembly (DataBuffer)
+- RFC 9000 Section 4.5 compliance (Stream Final Size)
 - Performance benchmarks
 
 Run specific test suites:
@@ -278,8 +279,12 @@ swift test --filter QUICStreamTests
 
 - **RFC 9000 Section 2**: Stream types (bidirectional, unidirectional) with proper ID assignment
 - **RFC 9000 Section 3**: Stream state machines (send/receive states)
+- **RFC 9000 Section 3.5**: STOP_SENDING triggers RESET_STREAM generation
 - **RFC 9000 Section 4**: Flow control (connection and stream level)
-- **RFC 9000 Section 4.5**: RESET_STREAM final size validation
+- **RFC 9000 Section 4.5**: Stream Final Size validation
+  - Final size immutability enforcement
+  - RESET_STREAM final size vs flow control limit validation
+  - Out-of-order FIN validation against buffered data
 - **RFC 9000 Section 12.4**: Varint-encoded frame types (supports extended frame types)
 - **RFC 9000 Section 14.1**: Initial packet minimum size (1200 bytes) with automatic padding
 - **RFC 9000 Section 17**: Long and Short header formats with validation

@@ -267,9 +267,81 @@ if let data = manager.read(streamID: remoteStreamID) {
 swift test --filter QUICStreamTests
 ```
 
-106 tests covering:
+124 tests covering:
 - DataStream state machine
 - StreamManager multiplexing
 - FlowController limits
 - DataBuffer reassembly
 - Edge cases and error handling
+- **RFC 9000 Section 4.5 compliance** (Final Size)
+
+### RFC準拠テスト
+
+テストはRFC 9000の仕様に基づいて記述されている。各テストはRFCセクション番号を含み、
+対応する仕様要件をdocコメントで引用している。
+
+```swift
+/// RFC 9000 Section 4.5:
+/// "A receiver MUST close the connection with error FLOW_CONTROL_ERROR
+/// if a sender violates the advertised connection or stream data limits"
+@Test("RFC 9000 4.5: RESET_STREAM with final size exceeding flow control limit throws error")
+func resetStreamExceedsFlowControlLimit() throws { ... }
+```
+
+**カバーされているRFCセクション**:
+- Section 2.1: Stream ID Assignment
+- Section 3: Stream States
+- Section 3.5: STOP_SENDING / RESET_STREAM
+- Section 4: Flow Control
+- Section 4.5: Stream Final Size
+
+## 設計上の注意点
+
+### 再送バッファについて
+
+`DataStream.generateStreamFrames()` は送信バッファを消費してフレームを生成する。
+ACK受信前にバッファが空になるため、DataStream単体では再送できない。
+
+**設計意図**:
+- 再送はQUICRecoveryモジュールの責務
+- `LossDetector`が送信済みフレームを追跡
+- パケットロス検出時にRecoveryモジュールが再送を制御
+
+**使用時の注意**:
+- `generateStreamFrames()`の戻り値フレームはRecoveryモジュールに渡すこと
+- StreamManager単体での再送は未サポート
+
+### DataBufferのオーバーフロー検出
+
+重複・オーバーラップするセグメントがある場合、実際に追加されるバイト数のみをカウントする。
+
+```swift
+// 例: 90バイトのバッファに20バイトの完全重複データを挿入
+// → 実際の新規バイト = 0、オーバーフローにならない
+let actualNewBytes = calculateNonOverlappingBytes(offset, data)
+```
+
+**経緯**: Codexレビューで検出。マージ前に`data.count`でオーバーフロー判定していたため、
+重複データで誤ったオーバーフローエラーが発生していた。
+
+### FIN受信時の既存バッファ検証
+
+FIN受信時に`finalSize`を設定する前に、既存のバッファセグメントが`finalSize`を超えていないか検証する。
+
+**経緯**: out-of-orderでFINより後のデータが先に到着した場合、
+FIN設定後にそのデータが`finalSize`を超えていることを検出できなかった。
+
+```
+問題シナリオ:
+1. offset=100, length=50 受信 → バッファに格納
+2. offset=50, FIN=true 受信 → finalSize=50
+3. バッファ内の100-150は検出されない ← 修正済み
+```
+
+### streamIDミスマッチのエラーハンドリング
+
+`DataStream.receive()`でフレームの`streamID`がストリームの`id`と一致しない場合、
+`fatalError`ではなく`StreamError.streamIDMismatch`をthrowする。
+
+**経緯**: Codexレビューで指摘。fatalErrorはプロセス全体をクラッシュさせるため、
+回復可能なエラーとして扱うべき。これはStreamManagerのディスパッチロジックのバグを示す。

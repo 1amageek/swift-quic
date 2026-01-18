@@ -474,4 +474,172 @@ struct StreamManagerTests {
         let totalBytes = frames.reduce(0) { $0 + $1.data.count }
         #expect(totalBytes <= 30, "Total bytes \(totalBytes) should not exceed stream window 30")
     }
+
+    // MARK: - Cleanup Tests
+
+    @Test("closeAllStreams removes all streams")
+    func closeAllStreamsRemovesAll() throws {
+        let manager = StreamManager(
+            isClient: true,
+            peerInitialMaxStreamDataBidiLocal: 1000,
+            peerInitialMaxStreamsBidi: 10
+        )
+
+        // Open multiple streams
+        let id1 = try manager.openStream(bidirectional: true)
+        let id2 = try manager.openStream(bidirectional: true)
+        let id3 = try manager.openStream(bidirectional: true)
+
+        #expect(manager.activeStreamCount == 3)
+
+        // Close all without error code
+        let resetFrames = manager.closeAllStreams()
+
+        #expect(manager.activeStreamCount == 0)
+        #expect(!manager.hasStream(id: id1))
+        #expect(!manager.hasStream(id: id2))
+        #expect(!manager.hasStream(id: id3))
+        #expect(resetFrames.isEmpty)  // No RESET_STREAM when no error code
+    }
+
+    @Test("closeAllStreams generates RESET_STREAM frames with error code")
+    func closeAllStreamsGeneratesResetFrames() throws {
+        let manager = StreamManager(
+            isClient: true,
+            peerInitialMaxStreamDataBidiLocal: 1000,
+            peerInitialMaxStreamsBidi: 10
+        )
+
+        // Open streams and write data
+        let id1 = try manager.openStream(bidirectional: true)
+        let id2 = try manager.openStream(bidirectional: true)
+        try manager.write(streamID: id1, data: Data([1, 2, 3]))
+        try manager.write(streamID: id2, data: Data([4, 5, 6]))
+
+        // Close all with error code
+        let resetFrames = manager.closeAllStreams(errorCode: 42)
+
+        #expect(manager.activeStreamCount == 0)
+        #expect(resetFrames.count == 2)
+
+        // Verify reset frames have correct error code
+        for frame in resetFrames {
+            #expect(frame.applicationErrorCode == 42)
+        }
+    }
+
+    @Test("closeAllStreams cleans up flow controller tracking")
+    func closeAllStreamsCleansFlowController() throws {
+        let manager = StreamManager(
+            isClient: true,
+            initialMaxStreamDataBidiRemote: 1000,
+            peerInitialMaxStreamDataBidiLocal: 1000,
+            peerInitialMaxStreamsBidi: 10
+        )
+
+        // Open local stream
+        _ = try manager.openStream(bidirectional: true)
+
+        // Receive data on remote stream (creates stream 1)
+        let frame = StreamFrame(streamID: 1, offset: 0, data: Data([1, 2, 3]), fin: false)
+        try manager.receive(frame: frame)
+
+        #expect(manager.activeStreamCount == 2)
+
+        // Close all
+        _ = manager.closeAllStreams()
+
+        #expect(manager.activeStreamCount == 0)
+
+        // Can open new streams (limits freed)
+        let newID = try manager.openStream(bidirectional: true)
+        #expect(newID == 4)  // Next client bidi ID
+    }
+
+    @Test("closeAllStreams with buffered receive data")
+    func closeAllStreamsWithBufferedData() throws {
+        let manager = StreamManager(
+            isClient: true,
+            initialMaxStreamDataBidiRemote: 1000,
+            peerInitialMaxStreamDataBidiLocal: 1000,
+            peerInitialMaxStreamsBidi: 10
+        )
+
+        // Receive data on remote stream
+        let frame = StreamFrame(streamID: 1, offset: 0, data: Data(repeating: 0xAB, count: 100), fin: false)
+        try manager.receive(frame: frame)
+
+        #expect(manager.hasDataToRead(streamID: 1))
+
+        // Close all - should discard buffered data
+        _ = manager.closeAllStreams()
+
+        #expect(manager.activeStreamCount == 0)
+        #expect(!manager.hasStream(id: 1))
+    }
+
+    @Test("closeAllStreams is idempotent")
+    func closeAllStreamsIdempotent() throws {
+        let manager = StreamManager(
+            isClient: true,
+            peerInitialMaxStreamDataBidiLocal: 1000,
+            peerInitialMaxStreamsBidi: 10
+        )
+
+        _ = try manager.openStream(bidirectional: true)
+        #expect(manager.activeStreamCount == 1)
+
+        // First close
+        let frames1 = manager.closeAllStreams(errorCode: 1)
+        #expect(manager.activeStreamCount == 0)
+
+        // Second close (should be no-op)
+        let frames2 = manager.closeAllStreams(errorCode: 1)
+        #expect(manager.activeStreamCount == 0)
+        #expect(frames2.isEmpty)  // No frames since no streams
+
+        // streams.count check
+        #expect(frames1.count == 1)
+    }
+
+    @Test("Individual stream cleanup releases resources")
+    func individualStreamCleanup() throws {
+        let manager = StreamManager(
+            isClient: true,
+            initialMaxStreamDataBidiRemote: 1000,
+            peerInitialMaxStreamDataBidiLocal: 1000,
+            peerInitialMaxStreamsBidi: 2
+        )
+
+        // Open max streams
+        let id1 = try manager.openStream(bidirectional: true)
+        let id2 = try manager.openStream(bidirectional: true)
+
+        // At limit
+        #expect(throws: StreamManagerError.self) {
+            _ = try manager.openStream(bidirectional: true)
+        }
+
+        // Write and receive data
+        try manager.write(streamID: id1, data: Data([1, 2, 3]))
+        let frame = StreamFrame(streamID: id2, offset: 0, data: Data([4, 5, 6]), fin: true)
+        try manager.receive(frame: StreamFrame(streamID: id1, offset: 0, data: Data([7, 8, 9]), fin: false))
+
+        // Close first stream
+        manager.closeStream(id: id1)
+
+        #expect(manager.activeStreamCount == 1)
+        #expect(!manager.hasStream(id: id1))
+        #expect(manager.hasStream(id: id2))
+
+        // Can open new stream (limit freed)
+        let id3 = try manager.openStream(bidirectional: true)
+        #expect(id3 == 8)
+
+        // Close remaining
+        manager.closeStream(id: id2)
+        manager.closeStream(id: id3)
+
+        #expect(manager.activeStreamCount == 0)
+    }
 }
