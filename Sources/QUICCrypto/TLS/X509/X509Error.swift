@@ -91,6 +91,12 @@ public enum X509Error: Error, Sendable {
     /// Certificate revoked
     case certificateRevoked
 
+    /// Invalid Extended Key Usage (RFC 5280 Section 4.2.1.12)
+    case invalidExtendedKeyUsage(required: String, found: [String])
+
+    /// Malformed Subject Alternative Name entry
+    case malformedSAN(type: String, value: String)
+
     // MARK: - Internal Errors
 
     /// Internal error
@@ -152,6 +158,10 @@ extension X509Error: CustomStringConvertible {
             return "Issuer certificate not found: \(issuer)"
         case .certificateRevoked:
             return "Certificate has been revoked"
+        case .invalidExtendedKeyUsage(let required, let found):
+            return "Invalid Extended Key Usage: required \(required), found \(found.isEmpty ? "none" : found.joined(separator: ", "))"
+        case .malformedSAN(let type, let value):
+            return "Malformed Subject Alternative Name: \(type) = \(value)"
         case .internalError(let reason):
             return "Internal error: \(reason)"
         }

@@ -5,6 +5,7 @@
 
 import Foundation
 import Synchronization
+import Logging
 import QUICCore
 import QUICCrypto
 import QUICConnection
@@ -76,6 +77,9 @@ public actor QUICEndpoint {
     /// Stop signal for the I/O loop
     private var shouldStop: Bool = false
 
+    /// Logger for endpoint events
+    private let logger = Logger(label: "quic.endpoint")
+
     // MARK: - Initialization
 
     /// Creates a client endpoint
@@ -93,6 +97,95 @@ public actor QUICEndpoint {
         self.router = ConnectionRouter(isServer: isServer, dcidLength: 8)
         self.timerManager = TimerManager(idleTimeout: configuration.maxIdleTimeout)
         self.isServer = isServer
+    }
+
+    // MARK: - TLS Provider Creation
+
+    /// Creates a TLS provider based on the security mode configuration.
+    ///
+    /// This method enforces the security mode hierarchy:
+    /// 1. If `securityMode` is set, use it
+    /// 2. Otherwise, if `tlsProviderFactory` is set (legacy), use it
+    /// 3. Otherwise, throw `QUICSecurityError.tlsProviderNotConfigured`
+    ///
+    /// - Parameter isClient: Whether this is for a client connection
+    /// - Returns: A configured TLS provider
+    /// - Throws: `QUICSecurityError.tlsProviderNotConfigured` if no TLS provider is configured
+    private func createTLSProvider(isClient: Bool) throws -> any TLS13Provider {
+        // Priority 1: Check securityMode (new API)
+        if let securityMode = configuration.securityMode {
+            switch securityMode {
+            case .production(let factory):
+                return factory()
+            case .development(let factory):
+                return factory()
+            case .testing:
+                logger.warning(
+                    "Using MockTLSProvider in testing mode - NOT FOR PRODUCTION USE",
+                    metadata: ["isClient": "\(isClient)"]
+                )
+                return MockTLSProvider(configuration: TLSConfiguration())
+            }
+        }
+
+        // Priority 2: Check legacy tlsProviderFactory
+        if let factory = configuration.tlsProviderFactory {
+            return factory(isClient)
+        }
+
+        // No TLS provider configured - fail safely
+        logger.error(
+            "TLS provider not configured. Set securityMode or tlsProviderFactory before connecting.",
+            metadata: ["isClient": "\(isClient)"]
+        )
+        throw QUICSecurityError.tlsProviderNotConfigured
+    }
+
+    /// Creates a TLS provider with session resumption configuration.
+    ///
+    /// - Parameters:
+    ///   - isClient: Whether this is for a client connection
+    ///   - sessionTicket: Optional session ticket for resumption
+    ///   - maxEarlyDataSize: Maximum early data size for 0-RTT
+    /// - Returns: A configured TLS provider
+    /// - Throws: `QUICSecurityError.tlsProviderNotConfigured` if no TLS provider is configured
+    private func createTLSProvider(
+        isClient: Bool,
+        sessionTicket: Data?,
+        maxEarlyDataSize: UInt32?
+    ) throws -> any TLS13Provider {
+        // Priority 1: Check securityMode (new API)
+        if let securityMode = configuration.securityMode {
+            switch securityMode {
+            case .production(let factory):
+                return factory()
+            case .development(let factory):
+                return factory()
+            case .testing:
+                logger.warning(
+                    "Using MockTLSProvider in testing mode - NOT FOR PRODUCTION USE",
+                    metadata: ["isClient": "\(isClient)"]
+                )
+                var tlsConfig = TLSConfiguration()
+                tlsConfig.sessionTicket = sessionTicket
+                if let maxSize = maxEarlyDataSize {
+                    tlsConfig.maxEarlyDataSize = maxSize
+                }
+                return MockTLSProvider(configuration: tlsConfig)
+            }
+        }
+
+        // Priority 2: Check legacy tlsProviderFactory
+        if let factory = configuration.tlsProviderFactory {
+            return factory(isClient)
+        }
+
+        // No TLS provider configured - fail safely
+        logger.error(
+            "TLS provider not configured. Set securityMode or tlsProviderFactory before connecting.",
+            metadata: ["isClient": "\(isClient)"]
+        )
+        throw QUICSecurityError.tlsProviderNotConfigured
     }
 
     // MARK: - Server API
@@ -171,13 +264,8 @@ public actor QUICEndpoint {
             throw QUICError.internalError("Failed to generate connection IDs")
         }
 
-        // Create TLS provider (use factory if provided, otherwise MockTLSProvider)
-        let tlsProvider: any TLS13Provider
-        if let factory = configuration.tlsProviderFactory {
-            tlsProvider = factory(true)  // isClient = true
-        } else {
-            tlsProvider = MockTLSProvider(configuration: TLSConfiguration())
-        }
+        // Create TLS provider (fails if not configured)
+        let tlsProvider = try createTLSProvider(isClient: true)
 
         // Create transport parameters from configuration
         let transportParameters = TransportParameters(from: configuration, sourceConnectionID: sourceConnectionID)
@@ -284,16 +372,12 @@ public actor QUICEndpoint {
             throw QUICError.internalError("Failed to generate connection IDs")
         }
 
-        // Create TLS provider with session ticket for resumption
-        let tlsProvider: any TLS13Provider
-        if let factory = configuration.tlsProviderFactory {
-            tlsProvider = factory(true)  // isClient = true
-        } else {
-            var tlsConfig = TLSConfiguration()
-            tlsConfig.sessionTicket = session.ticket.ticket
-            tlsConfig.maxEarlyDataSize = session.maxEarlyDataSize
-            tlsProvider = MockTLSProvider(configuration: tlsConfig)
-        }
+        // Create TLS provider with session ticket for resumption (fails if not configured)
+        let tlsProvider = try createTLSProvider(
+            isClient: true,
+            sessionTicket: session.ticket.ticket,
+            maxEarlyDataSize: session.maxEarlyDataSize
+        )
 
         // Create transport parameters from configuration
         let transportParameters = TransportParameters(from: configuration, sourceConnectionID: sourceConnectionID)
@@ -398,13 +482,8 @@ public actor QUICEndpoint {
             throw QUICError.internalError("Failed to generate connection ID")
         }
 
-        // Create TLS provider (use factory if provided, otherwise MockTLSProvider)
-        let tlsProvider: any TLS13Provider
-        if let factory = configuration.tlsProviderFactory {
-            tlsProvider = factory(false)  // isClient = false (server mode)
-        } else {
-            tlsProvider = MockTLSProvider(configuration: TLSConfiguration())
-        }
+        // Create TLS provider (fails if not configured)
+        let tlsProvider = try createTLSProvider(isClient: false)
 
         // Create transport parameters from configuration
         let transportParameters = TransportParameters(from: configuration, sourceConnectionID: sourceConnectionID)

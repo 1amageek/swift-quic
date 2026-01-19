@@ -18,6 +18,16 @@ public struct X509ValidationOptions: Sendable {
     /// Whether to check KeyUsage extensions
     public var checkKeyUsage: Bool
 
+    /// Whether to check Extended Key Usage extensions
+    public var checkExtendedKeyUsage: Bool
+
+    /// Required Extended Key Usage for the leaf certificate
+    /// If set, the certificate must contain this EKU (or anyExtendedKeyUsage)
+    public var requiredEKU: RequiredEKU?
+
+    /// Whether to validate SAN format (DNS names, IP addresses)
+    public var validateSANFormat: Bool
+
     /// Hostname to verify against SubjectAltName/CN
     public var hostname: String?
 
@@ -35,6 +45,9 @@ public struct X509ValidationOptions: Sendable {
         checkValidity: Bool = true,
         checkBasicConstraints: Bool = true,
         checkKeyUsage: Bool = true,
+        checkExtendedKeyUsage: Bool = true,
+        requiredEKU: RequiredEKU? = nil,
+        validateSANFormat: Bool = true,
         hostname: String? = nil,
         validationTime: Date = Date(),
         allowSelfSigned: Bool = false,
@@ -43,11 +56,39 @@ public struct X509ValidationOptions: Sendable {
         self.checkValidity = checkValidity
         self.checkBasicConstraints = checkBasicConstraints
         self.checkKeyUsage = checkKeyUsage
+        self.checkExtendedKeyUsage = checkExtendedKeyUsage
+        self.requiredEKU = requiredEKU
+        self.validateSANFormat = validateSANFormat
         self.hostname = hostname
         self.validationTime = validationTime
         self.allowSelfSigned = allowSelfSigned
         self.maxChainDepth = maxChainDepth
     }
+}
+
+/// Required Extended Key Usage type
+public enum RequiredEKU: Sendable {
+    case serverAuth
+    case clientAuth
+    case codeSigning
+    case emailProtection
+    case timeStamping
+    case ocspSigning
+
+    /// OID for this EKU
+    public var oid: String {
+        switch self {
+        case .serverAuth: return "1.3.6.1.5.5.7.3.1"
+        case .clientAuth: return "1.3.6.1.5.5.7.3.2"
+        case .codeSigning: return "1.3.6.1.5.5.7.3.3"
+        case .emailProtection: return "1.3.6.1.5.5.7.3.4"
+        case .timeStamping: return "1.3.6.1.5.5.7.3.8"
+        case .ocspSigning: return "1.3.6.1.5.5.7.3.9"
+        }
+    }
+
+    /// anyExtendedKeyUsage OID (2.5.29.37.0)
+    public static let anyExtendedKeyUsageOID = "2.5.29.37.0"
 }
 
 // MARK: - X.509 Validator
@@ -104,6 +145,16 @@ public struct X509Validator: Sendable {
         if let hostname = options.hostname {
             try verifyHostname(certificate, hostname: hostname)
         }
+
+        // Verify Extended Key Usage if required
+        if options.checkExtendedKeyUsage {
+            try verifyExtendedKeyUsage(certificate)
+        }
+
+        // Validate SAN format
+        if options.validateSANFormat {
+            try validateSANFormat(certificate)
+        }
     }
 
     /// Validates a single certificate (without chain validation)
@@ -112,6 +163,16 @@ public struct X509Validator: Sendable {
 
         if let hostname = options.hostname {
             try verifyHostname(certificate, hostname: hostname)
+        }
+
+        // Verify Extended Key Usage if required
+        if options.checkExtendedKeyUsage {
+            try verifyExtendedKeyUsage(certificate)
+        }
+
+        // Validate SAN format
+        if options.validateSANFormat {
+            try validateSANFormat(certificate)
         }
     }
 
@@ -369,6 +430,154 @@ public struct X509Validator: Sendable {
         }
 
         return false
+    }
+
+    // MARK: - Extended Key Usage Verification (RFC 5280 Section 4.2.1.12)
+
+    /// Verifies Extended Key Usage of the certificate
+    ///
+    /// RFC 5280: If the extension is present, then the certificate MUST only
+    /// be used for one of the purposes indicated. If multiple purposes are
+    /// indicated the application need not recognize all purposes indicated,
+    /// as long as the intended purpose is present.
+    ///
+    /// If a certificate contains both a key usage extension and an extended
+    /// key usage extension, then both extensions MUST be processed independently
+    /// and the certificate MUST only be used for a purpose consistent with both
+    /// extensions.
+    private func verifyExtendedKeyUsage(_ certificate: X509Certificate) throws {
+        // If no required EKU is specified, skip validation
+        guard let requiredEKU = options.requiredEKU else {
+            return
+        }
+
+        // If EKU extension is not present, the certificate is valid for any purpose
+        // RFC 5280: "If the extension is absent, all purposes are acceptable"
+        guard let eku = certificate.extensions.extendedKeyUsage else {
+            return
+        }
+
+        // Check if the required EKU is present
+        let requiredOID = requiredEKU.oid
+        let hasRequiredUsage = eku.keyPurposes.contains { $0.dotNotation == requiredOID }
+
+        // Check for anyExtendedKeyUsage (2.5.29.37.0) which allows all purposes
+        let hasAnyUsage = eku.keyPurposes.contains { $0.dotNotation == RequiredEKU.anyExtendedKeyUsageOID }
+
+        if hasRequiredUsage || hasAnyUsage {
+            return
+        }
+
+        throw X509Error.invalidExtendedKeyUsage(
+            required: requiredOID,
+            found: eku.keyPurposes.map { $0.dotNotation }
+        )
+    }
+
+    // MARK: - SAN Format Validation
+
+    /// Validates the format of Subject Alternative Name entries
+    ///
+    /// This ensures that SAN entries conform to their respective formats:
+    /// - DNS names: RFC 1035 compliant labels
+    /// - IP addresses: Valid IPv4 (4 bytes) or IPv6 (16 bytes)
+    /// - URIs: Valid URL format
+    private func validateSANFormat(_ certificate: X509Certificate) throws {
+        guard let san = certificate.extensions.subjectAltName else {
+            return
+        }
+
+        // Validate DNS names
+        for dnsName in san.dnsNames {
+            if !isValidDNSName(dnsName) {
+                throw X509Error.malformedSAN(type: "dNSName", value: dnsName)
+            }
+        }
+
+        // Validate IP addresses
+        for ipData in san.ipAddresses {
+            if !isValidIPAddressData(ipData) {
+                throw X509Error.malformedSAN(
+                    type: "iPAddress",
+                    value: ipData.map { String(format: "%02x", $0) }.joined()
+                )
+            }
+        }
+
+        // Validate URIs
+        for uri in san.uris {
+            if !isValidURI(uri) {
+                throw X509Error.malformedSAN(type: "uniformResourceIdentifier", value: uri)
+            }
+        }
+    }
+
+    /// Validates a DNS name according to RFC 1035
+    ///
+    /// Rules:
+    /// - Maximum total length: 253 characters
+    /// - Each label: 1-63 characters
+    /// - Labels contain alphanumeric characters and hyphens
+    /// - Labels cannot start or end with a hyphen
+    /// - Wildcard (*) is only allowed as the leftmost label
+    private func isValidDNSName(_ name: String) -> Bool {
+        // Empty name is invalid
+        guard !name.isEmpty else { return false }
+
+        // Maximum length 253 characters
+        guard name.count <= 253 else { return false }
+
+        let labels = name.split(separator: ".", omittingEmptySubsequences: false).map { String($0) }
+
+        // Must have at least one label
+        guard !labels.isEmpty else { return false }
+
+        for (index, label) in labels.enumerated() {
+            // Each label must be 1-63 characters
+            guard label.count >= 1 && label.count <= 63 else { return false }
+
+            // Wildcard is only allowed as the leftmost label
+            if label == "*" {
+                guard index == 0 else { return false }
+                continue
+            }
+
+            // Check first character: must be alphanumeric
+            guard let first = label.first, first.isLetter || first.isNumber else {
+                return false
+            }
+
+            // Check last character: must be alphanumeric
+            guard let last = label.last, last.isLetter || last.isNumber else {
+                return false
+            }
+
+            // Check all characters: alphanumeric or hyphen
+            for char in label {
+                guard char.isLetter || char.isNumber || char == "-" else {
+                    return false
+                }
+            }
+        }
+
+        return true
+    }
+
+    /// Validates IP address data
+    ///
+    /// - IPv4: exactly 4 bytes
+    /// - IPv6: exactly 16 bytes
+    private func isValidIPAddressData(_ data: Data) -> Bool {
+        return data.count == 4 || data.count == 16
+    }
+
+    /// Validates a URI format
+    private func isValidURI(_ uri: String) -> Bool {
+        guard let url = URL(string: uri) else {
+            return false
+        }
+        // URI must have a scheme
+        return url.scheme != nil
     }
 }
 

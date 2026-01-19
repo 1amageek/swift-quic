@@ -9,6 +9,8 @@ import QUICCore
 
 #if canImport(CommonCrypto)
 import CommonCrypto
+#else
+import _CryptoExtras
 #endif
 
 // MARK: - AES-128 Header Protection
@@ -424,9 +426,14 @@ private func chaCha20KeystreamMask(key: SymmetricKey, counter: Data, nonce: Data
     // Convert key to Data
     let keyData = key.withUnsafeBytes { Data($0) }
 
-    // Convert counter to little-endian UInt32
-    let counterValue = counter.withUnsafeBytes {
-        $0.load(as: UInt32.self)
+    // Convert counter to little-endian UInt32 (RFC 8439)
+    // Safe for unaligned access and works on both little/big-endian platforms
+    let counterValue: UInt32 = counter.withUnsafeBytes { bytes in
+        let b0 = UInt32(bytes[0])
+        let b1 = UInt32(bytes[1]) << 8
+        let b2 = UInt32(bytes[2]) << 16
+        let b3 = UInt32(bytes[3]) << 24
+        return b0 | b1 | b2 | b3
     }
 
     // Generate keystream using RFC 8439 ChaCha20 block function
@@ -436,15 +443,24 @@ private func chaCha20KeystreamMask(key: SymmetricKey, counter: Data, nonce: Data
     return keystream.prefix(5)
 }
 
-/// Performs single-block AES-ECB encryption for header protection
+/// Performs single-block AES-ECB encryption for header protection (RFC 9001 Section 5.4.3)
+///
+/// QUIC Header Protection requires AES-ECB encryption of a single 16-byte block.
+/// On Apple platforms, CommonCrypto is used for optimal performance.
+/// On other platforms (Linux), _CryptoExtras AES._CBC with zero IV is used,
+/// which is mathematically equivalent to ECB for the first block:
+///
+///     CBC: C = AES(key, P ⊕ IV)
+///     When IV = 0: C = AES(key, P ⊕ 0) = AES(key, P) = ECB
+///
 /// - Parameters:
 ///   - key: The AES key (16 bytes for AES-128)
 ///   - block: The 16-byte block to encrypt
 /// - Returns: First 5 bytes of the encrypted block (the mask)
-/// - Throws: CryptoError if encryption fails or platform not supported
+/// - Throws: CryptoError if encryption fails
 private func aesECBEncrypt(key: SymmetricKey, block: Data) throws -> Data {
     #if canImport(CommonCrypto)
-    // Use CommonCrypto for single-block AES-ECB encryption
+    // Apple platforms: Use CommonCrypto for optimal performance
     var output = Data(count: 16)
     var outputLength: size_t = 0
 
@@ -471,17 +487,18 @@ private func aesECBEncrypt(key: SymmetricKey, block: Data) throws -> Data {
 
     return Data(output.prefix(5))
     #else
-    // Non-Apple platforms require alternative implementation
-    // Options:
-    // 1. Use BoringSSL/OpenSSL bindings
-    // 2. Software AES implementation
-    // 3. Link against a crypto library that provides AES-ECB
-    //
-    // For now, throw an error indicating the limitation.
-    // This is a compile-time known limitation for non-Apple platforms.
-    throw CryptoError.unsupportedPlatform(
-        "AES-ECB header protection requires CommonCrypto (Apple platforms). " +
-        "For Linux support, link against a crypto library providing AES-ECB."
-    )
+    // Linux/other platforms: Use _CryptoExtras AES._CBC with zero IV
+    // CBC with IV=0 is equivalent to ECB for the first block
+    do {
+        let zeroIV = try AES._CBC.IV(ivBytes: Data(count: 16))
+        let ciphertext = try AES._CBC.encrypt(block, using: key, iv: zeroIV)
+
+        // CBC output: encrypted block (16 bytes) + PKCS#7 padding block (16 bytes)
+        // The first 16 bytes are the ECB-equivalent encryption result
+        // Return first 5 bytes as the header protection mask
+        return Data(ciphertext.prefix(5))
+    } catch {
+        throw CryptoError.headerProtectionFailed
+    }
     #endif
 }

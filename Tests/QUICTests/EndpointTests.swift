@@ -72,7 +72,7 @@ struct EndpointTests {
 
     @Test("Client can initiate connection")
     func clientInitiatesConnection() async throws {
-        let config = QUICConfiguration()
+        let config = QUICConfiguration.testing()
         let endpoint = QUICEndpoint(configuration: config)
 
         let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
@@ -98,7 +98,7 @@ struct EndpointTests {
 
     @Test("Server accepts new connection")
     func serverAcceptsConnection() async throws {
-        let config = QUICConfiguration()
+        let config = QUICConfiguration.testing()
         let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
         let clientAddress = SocketAddress(ipAddress: "127.0.0.1", port: 54321)
 
@@ -631,7 +631,7 @@ struct ShutdownSafetyTests {
 struct IntegrationTests {
     @Test("Client-Server packet exchange")
     func clientServerPacketExchange() async throws {
-        let config = QUICConfiguration()
+        let config = QUICConfiguration.testing()
         let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
         let clientAddress = SocketAddress(ipAddress: "127.0.0.1", port: 54321)
 
