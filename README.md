@@ -258,81 +258,68 @@ let encoded = try encoder.encodeLongHeaderPacket(
 
 Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 
-### Throughput Capacity
-
-| Scenario | Max Throughput | Latency |
-|----------|---------------|---------|
-| **Short header (1-RTT)** | ~1.7 Gbps | 5.6 μs/packet |
-| **Long header (Initial)** | ~860 Mbps | 11 μs/packet |
-
 ### Packet Processing
 
-| Operation | Performance | Latency |
-|-----------|-------------|---------|
-| Short header parsing | 3.8M ops/sec | 0.26 μs |
-| Long header parsing | 275k ops/sec | 3.6 μs |
-| DCID extraction (short) | 973k ops/sec | 1.0 μs |
-| DCID extraction (long) | 328k ops/sec | 3.0 μs |
-| ConnectionRouter lookup | 233k ops/sec | 4.3 μs |
-| Packet type extraction | 4.7M ops/sec | 0.21 μs |
+| Operation | Performance |
+|-----------|-------------|
+| Short header parsing | 6.3M ops/sec |
+| Long header parsing | 228K ops/sec |
+| DCID extraction (short) | 835K ops/sec |
+| DCID extraction (long) | 923K ops/sec |
+| ConnectionRouter lookup | 428K ops/sec |
+| Packet type extraction | 7.8M ops/sec |
 
 ### Core Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Varint encoding | 8.4M ops/sec |
-| Varint decoding | 743k ops/sec |
-| ConnectionID creation | 578k ops/sec |
-| ConnectionID equality | 66M ops/sec |
-| ConnectionID hash | 14.3M ops/sec |
-| CID Dictionary lookup | 9.8M ops/sec |
+| Varint encoding | 7.8M ops/sec |
+| Varint decoding | 450K ops/sec |
+| Varint fast path (1-byte) | 11.6M ops/sec |
+| ConnectionID creation | 678K ops/sec |
+| ConnectionID equality | 45.3M ops/sec |
+| ConnectionID hash | 16.1M ops/sec |
+| ConnectionID random | 809K ops/sec |
+| CID Dictionary lookup | 10.7M ops/sec |
 
 ### Frame Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| PING frame encoding | 7.3M ops/sec |
-| PING frame decoding | 15.3M ops/sec |
-| ACK frame encoding | 558k ops/sec |
-| ACK frame decoding | 1.5M ops/sec |
-| STREAM frame encoding | 1.2M ops/sec |
-| STREAM frame decoding | 4.8M ops/sec |
-| CRYPTO frame encoding | 779k ops/sec |
-| Multiple frames encoding | 213k ops/sec |
-| Frame roundtrip | 721k ops/sec |
+| PING frame encoding | 9.8M ops/sec |
+| PING frame decoding | 22.0M ops/sec |
+| ACK frame encoding | 610K ops/sec |
+| ACK frame decoding | 2.0M ops/sec |
+| STREAM frame encoding | 2.3M ops/sec |
+| Frame roundtrip | 986K ops/sec |
 
 ### Crypto Operations
 
-| Operation | Performance | Latency |
-|-----------|-------------|---------|
-| Initial key derivation | 12.9k ops/sec | 77 μs |
-| KeyMaterial derivation | 47k ops/sec | 21 μs |
-| AES-GCM Sealer creation | 4.3M ops/sec | 0.23 μs |
-
-### Loss Detection & Recovery
-
 | Operation | Performance |
 |-----------|-------------|
-| Sequential packet recording | 9.8M ops/sec |
-| Packet recording with gaps | 476k ops/sec |
-| ACK frame generation | 32.5k ops/sec |
-| Packet send recording | 5.3M ops/sec |
-| Full ACK cycle (50 packets) | 22.2k cycles/sec |
-| ACK processing (100 packets) | 15.2k ops/sec |
-| Multi-range ACK (25 ranges) | 4.4k ops/sec |
-| LossDetector send phase | 8.4M pkt/sec |
-| LossDetector ACK (no loss) | 43.0k ack/sec |
-| LossDetector ACK (with loss) | 46.5k ack/sec |
+| Initial key derivation | 13.1K ops/sec |
+| KeyMaterial derivation | 49.6K ops/sec |
+| AES-GCM Sealer creation | 12.0M ops/sec |
 
 ### Packet Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Packet number encoding | 5.2M ops/sec |
-| Packet number decoding | 7.3M ops/sec |
-| Coalesced packet building | 607k ops/sec |
-| Coalesced packet parsing | 139k ops/sec |
-| Packet type sorting | 308k ops/sec |
+| Packet number encoding | 4.8M ops/sec |
+| Packet number decoding | 10.2M ops/sec |
+| Coalesced packet building | 823K ops/sec |
+| Coalesced packet parsing | 133K ops/sec |
+
+### Recovery Performance
+
+| Operation | Performance |
+|-----------|-------------|
+| Sequential packet recording | 11.0M ops/sec |
+| ACK frame generation | 34.9K ops/sec |
+| Packet send recording | 3.7M ops/sec |
+| Loss detection | 5.5K ops/sec |
+| Full ACK cycle | 503K pkts/sec |
+| Realistic QUIC stream | 45K pkts/sec |
 
 ### Memory Efficiency
 
@@ -346,7 +333,8 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 Run benchmarks:
 
 ```bash
-swift test --filter Benchmark
+swift test --filter QUICBenchmarks
+swift test --filter RecoveryBenchmarkTests
 ```
 
 ## Testing
@@ -357,7 +345,25 @@ Run all tests:
 swift test
 ```
 
-641 tests covering:
+### Interoperability Testing
+
+Verified interoperability with external QUIC implementations:
+
+| Implementation | Language | Tests |
+|----------------|----------|-------|
+| Quinn | Rust | Basic handshake, Bidirectional stream, Version negotiation, 0-RTT, Path validation, Retry handling |
+| ngtcp2 | C | Basic handshake, Version negotiation, Stream multiplexing |
+
+Run interop tests (requires Docker):
+
+```bash
+cd docker && docker compose up -d
+swift test --filter "QuinnInteropTests|Ngtcp2InteropTests"
+```
+
+### Unit Tests
+
+Coverage includes:
 - Frame encoding/decoding for all 19 frame types
 - Packet encoding/decoding with header protection
 - Coalesced packet building and parsing
@@ -378,17 +384,17 @@ swift test
 - Anti-amplification limit enforcement
 - ManagedConnection shutdown safety (continuation management)
 - AsyncStream lifecycle and graceful termination
-- Performance benchmarks
+- Safe integer conversion (overflow/underflow protection)
 
 Run specific test suites:
 
 ```bash
-swift test --filter FrameCodecTests
-swift test --filter PacketCodecTests
-swift test --filter CoalescedPacketsTests
-swift test --filter QUICStreamTests
-swift test --filter EndpointTests
-swift test --filter Benchmark
+swift test --filter QUICCoreTests      # Core types
+swift test --filter QUICCryptoTests    # Crypto operations
+swift test --filter QUICRecoveryTests  # Loss detection
+swift test --filter QUICStreamTests    # Stream management
+swift test --filter QUICTests          # Integration tests
+swift test --filter QUICBenchmarks     # Benchmarks
 ```
 
 ## RFC Compliance
@@ -493,9 +499,10 @@ swift test --filter Benchmark
   - [x] ACK range underflow validation
   - [x] Race condition prevention in shutdown
   - [x] Double-start vulnerability fix
-- [ ] Phase 10: Interoperability Testing
-  - [ ] quic-go interop tests
-  - [ ] ngtcp2 interop tests
+- [x] Phase 10: Interoperability Testing
+  - [x] Quinn (Rust) interop tests
+  - [x] ngtcp2 (C) interop tests
+  - [x] Docker-based test environment
 
 ## References
 
