@@ -50,6 +50,73 @@
 import Foundation
 import Crypto
 
+// MARK: - Pre-computed HkdfLabel Cache
+
+/// Pre-computed HKDF label structures for TLS 1.3 key derivation
+///
+/// Similar to QUIC labels, TLS uses fixed labels with empty context in many cases.
+/// Pre-computing the full HkdfLabel structure avoids runtime allocation.
+private enum TLSHKDFLabels {
+    // Label bytes (used for slow path with non-empty context)
+    static let derived = Data("tls13 derived".utf8)
+    static let finished = Data("tls13 finished".utf8)
+    static let trafficUpd = Data("tls13 traffic upd".utf8)
+    static let key = Data("tls13 key".utf8)
+    static let iv = Data("tls13 iv".utf8)
+
+    // Pre-computed complete HkdfLabel structures for empty context
+
+    // "derived" with length 32 (SHA-256)
+    static let hkdfLabelDerived32: Data = buildLabel(derived, length: 32)
+    // "derived" with length 48 (SHA-384)
+    static let hkdfLabelDerived48: Data = buildLabel(derived, length: 48)
+
+    // "finished" with length 32 (SHA-256)
+    static let hkdfLabelFinished32: Data = buildLabel(finished, length: 32)
+    // "finished" with length 48 (SHA-384)
+    static let hkdfLabelFinished48: Data = buildLabel(finished, length: 48)
+
+    // "traffic upd" with length 32 (SHA-256)
+    static let hkdfLabelTrafficUpd32: Data = buildLabel(trafficUpd, length: 32)
+    // "traffic upd" with length 48 (SHA-384)
+    static let hkdfLabelTrafficUpd48: Data = buildLabel(trafficUpd, length: 48)
+
+    // "key" with length 16 (AES-128-GCM)
+    static let hkdfLabelKey16: Data = buildLabel(key, length: 16)
+    // "key" with length 32 (AES-256-GCM / ChaCha20)
+    static let hkdfLabelKey32: Data = buildLabel(key, length: 32)
+
+    // "iv" with length 12
+    static let hkdfLabelIV12: Data = buildLabel(iv, length: 12)
+
+    private static func buildLabel(_ labelBytes: Data, length: Int) -> Data {
+        var data = Data(capacity: 4 + labelBytes.count)
+        data.append(UInt8(length >> 8))
+        data.append(UInt8(length & 0xFF))
+        data.append(UInt8(labelBytes.count))
+        data.append(labelBytes)
+        data.append(0x00)  // context length = 0
+        return data
+    }
+
+    /// Returns pre-computed HkdfLabel for empty context labels
+    @inline(__always)
+    static func precomputed(label: String, length: Int) -> Data? {
+        switch (label, length) {
+        case ("derived", 32): return hkdfLabelDerived32
+        case ("derived", 48): return hkdfLabelDerived48
+        case ("finished", 32): return hkdfLabelFinished32
+        case ("finished", 48): return hkdfLabelFinished48
+        case ("traffic upd", 32): return hkdfLabelTrafficUpd32
+        case ("traffic upd", 48): return hkdfLabelTrafficUpd48
+        case ("key", 16): return hkdfLabelKey16
+        case ("key", 32): return hkdfLabelKey32
+        case ("iv", 12): return hkdfLabelIV12
+        default: return nil
+        }
+    }
+}
+
 // MARK: - TLS Key Schedule
 
 /// Manages TLS 1.3 key derivation
@@ -434,15 +501,31 @@ public struct TLSKeySchedule: Sendable {
         context: Data,
         length: Int
     ) -> Data {
-        // HkdfLabel structure:
-        // uint16 length
-        // opaque label<7..255> = "tls13 " + Label
-        // opaque context<0..255> = Context
+        // Fast path: use pre-computed HkdfLabel for empty context
+        if context.isEmpty, let precomputed = TLSHKDFLabels.precomputed(label: label, length: length) {
+            switch cipherSuite {
+            case .tls_aes_256_gcm_sha384:
+                let output = HKDF<SHA384>.expand(
+                    pseudoRandomKey: secret,
+                    info: precomputed,
+                    outputByteCount: length
+                )
+                return output.withUnsafeBytes { Data($0) }
+            default:
+                let output = HKDF<SHA256>.expand(
+                    pseudoRandomKey: secret,
+                    info: precomputed,
+                    outputByteCount: length
+                )
+                return output.withUnsafeBytes { Data($0) }
+            }
+        }
 
+        // Slow path: construct HkdfLabel dynamically
         let fullLabel = "tls13 " + label
         let labelBytes = Data(fullLabel.utf8)
 
-        var hkdfLabel = Data()
+        var hkdfLabel = Data(capacity: 4 + labelBytes.count + context.count)
         // uint16 length
         hkdfLabel.append(UInt8(length >> 8))
         hkdfLabel.append(UInt8(length & 0xFF))
@@ -529,10 +612,31 @@ public struct TrafficKeys: Sendable {
         length: Int,
         cipherSuite: CipherSuite
     ) -> Data {
+        // Fast path: use pre-computed HkdfLabel for "key" and "iv"
+        if let precomputed = TLSHKDFLabels.precomputed(label: label, length: length) {
+            switch cipherSuite {
+            case .tls_aes_256_gcm_sha384:
+                let output = HKDF<SHA384>.expand(
+                    pseudoRandomKey: secret,
+                    info: precomputed,
+                    outputByteCount: length
+                )
+                return output.withUnsafeBytes { Data($0) }
+            default:
+                let output = HKDF<SHA256>.expand(
+                    pseudoRandomKey: secret,
+                    info: precomputed,
+                    outputByteCount: length
+                )
+                return output.withUnsafeBytes { Data($0) }
+            }
+        }
+
+        // Slow path: construct HkdfLabel dynamically
         let fullLabel = "tls13 " + label
         let labelBytes = Data(fullLabel.utf8)
 
-        var hkdfLabel = Data()
+        var hkdfLabel = Data(capacity: 4 + labelBytes.count)
         hkdfLabel.append(UInt8(length >> 8))
         hkdfLabel.append(UInt8(length & 0xFF))
         hkdfLabel.append(UInt8(labelBytes.count))

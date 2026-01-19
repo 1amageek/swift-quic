@@ -78,14 +78,19 @@ public struct AES128GCMOpener: PacketOpener, Sendable {
         let tag = ciphertext.suffix(16)
 
         // Decrypt using AES-GCM
-        let sealedBox = try AES.GCM.SealedBox(
-            nonce: AES.GCM.Nonce(data: nonce),
-            ciphertext: encryptedData,
-            tag: tag
-        )
+        do {
+            let sealedBox = try AES.GCM.SealedBox(
+                nonce: AES.GCM.Nonce(data: nonce),
+                ciphertext: encryptedData,
+                tag: tag
+            )
 
-        let plaintext = try AES.GCM.open(sealedBox, using: key, authenticating: header)
-        return plaintext
+            let plaintext = try AES.GCM.open(sealedBox, using: key, authenticating: header)
+            return plaintext
+        } catch {
+            // Convert CryptoKit errors to QUICError for consistent handling
+            throw QUICError.decryptionFailed
+        }
     }
 
     public func removeHeaderProtection(
@@ -104,9 +109,10 @@ public struct AES128GCMOpener: PacketOpener, Sendable {
         let unprotectedFirstByte = firstByte ^ (mask[0] & firstByteMask)
 
         // Unmask packet number bytes
+        // Use enumerated() to handle Data slices with non-zero startIndex
         var unprotectedPN = Data(capacity: packetNumberBytes.count)
-        for i in 0..<packetNumberBytes.count {
-            unprotectedPN.append(packetNumberBytes[i] ^ mask[i + 1])
+        for (i, byte) in packetNumberBytes.enumerated() {
+            unprotectedPN.append(byte ^ mask[i + 1])
         }
 
         return (unprotectedFirstByte, unprotectedPN)
@@ -177,9 +183,10 @@ public struct AES128GCMSealer: PacketSealer, Sendable {
         let protectedFirstByte = firstByte ^ (mask[0] & firstByteMask)
 
         // Mask packet number bytes
+        // Use enumerated() to handle Data slices with non-zero startIndex
         var protectedPN = Data(capacity: packetNumberBytes.count)
-        for i in 0..<packetNumberBytes.count {
-            protectedPN.append(packetNumberBytes[i] ^ mask[i + 1])
+        for (i, byte) in packetNumberBytes.enumerated() {
+            protectedPN.append(byte ^ mask[i + 1])
         }
 
         return (protectedFirstByte, protectedPN)
@@ -292,14 +299,19 @@ public struct ChaCha20Poly1305Opener: PacketOpener, Sendable {
         let tag = ciphertext.suffix(16)
 
         // Decrypt using ChaCha20-Poly1305
-        let sealedBox = try ChaChaPoly.SealedBox(
-            nonce: ChaChaPoly.Nonce(data: nonce),
-            ciphertext: encryptedData,
-            tag: tag
-        )
+        do {
+            let sealedBox = try ChaChaPoly.SealedBox(
+                nonce: ChaChaPoly.Nonce(data: nonce),
+                ciphertext: encryptedData,
+                tag: tag
+            )
 
-        let plaintext = try ChaChaPoly.open(sealedBox, using: key, authenticating: header)
-        return plaintext
+            let plaintext = try ChaChaPoly.open(sealedBox, using: key, authenticating: header)
+            return plaintext
+        } catch {
+            // Convert CryptoKit errors to QUICError for consistent handling
+            throw QUICError.decryptionFailed
+        }
     }
 
     public func removeHeaderProtection(
@@ -318,9 +330,10 @@ public struct ChaCha20Poly1305Opener: PacketOpener, Sendable {
         let unprotectedFirstByte = firstByte ^ (mask[0] & firstByteMask)
 
         // Unmask packet number bytes
+        // Use enumerated() to handle Data slices with non-zero startIndex
         var unprotectedPN = Data(capacity: packetNumberBytes.count)
-        for i in 0..<packetNumberBytes.count {
-            unprotectedPN.append(packetNumberBytes[i] ^ mask[i + 1])
+        for (i, byte) in packetNumberBytes.enumerated() {
+            unprotectedPN.append(byte ^ mask[i + 1])
         }
 
         return (unprotectedFirstByte, unprotectedPN)
@@ -394,9 +407,10 @@ public struct ChaCha20Poly1305Sealer: PacketSealer, Sendable {
         let protectedFirstByte = firstByte ^ (mask[0] & firstByteMask)
 
         // Mask packet number bytes
+        // Use enumerated() to handle Data slices with non-zero startIndex
         var protectedPN = Data(capacity: packetNumberBytes.count)
-        for i in 0..<packetNumberBytes.count {
-            protectedPN.append(packetNumberBytes[i] ^ mask[i + 1])
+        for (i, byte) in packetNumberBytes.enumerated() {
+            protectedPN.append(byte ^ mask[i + 1])
         }
 
         return (protectedFirstByte, protectedPN)

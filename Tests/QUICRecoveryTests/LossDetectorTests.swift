@@ -172,19 +172,19 @@ struct LossDetectorTests {
         }
 
         // ACK ranges: 15-19, 10-12, 5-7, 0-2
-        // Gap calculation: gap = previousRangeStart - currentRange.end - 2
-        // Range 15-19: rangeLength=4
-        // Range 10-12: gap = 15 - 12 - 2 = 1, rangeLength=2
-        // Range 5-7: gap = 10 - 7 - 2 = 1, rangeLength=2
-        // Range 0-2: gap = 5 - 2 - 2 = 1, rangeLength=2
+        // RFC 9000 Section 19.3.1: gap = smallest_prev - 1 - largest_current
+        // Range 15-19: rangeLength=4 (5 packets: 19-4=15 to 19)
+        // Range 10-12: largest=12, smallest_prev=15, gap = 15 - 1 - 12 = 2, rangeLength=2
+        // Range 5-7: largest=7, smallest_prev=10, gap = 10 - 1 - 7 = 2, rangeLength=2
+        // Range 0-2: largest=2, smallest_prev=5, gap = 5 - 1 - 2 = 2, rangeLength=2
         let ackFrame = AckFrame(
             largestAcknowledged: 19,
             ackDelay: 1000,
             ackRanges: [
                 AckRange(gap: 0, rangeLength: 4),   // 15-19
-                AckRange(gap: 1, rangeLength: 2),   // 10-12
-                AckRange(gap: 1, rangeLength: 2),   // 5-7
-                AckRange(gap: 1, rangeLength: 2)    // 0-2
+                AckRange(gap: 2, rangeLength: 2),   // 10-12
+                AckRange(gap: 2, rangeLength: 2),   // 5-7
+                AckRange(gap: 2, rangeLength: 2)    // 0-2
             ],
             ecnCounts: nil
         )
@@ -570,5 +570,155 @@ struct LossDetectorTests {
         #expect(detector.ackElicitingInFlight == 0)
         #expect(detector.smallestUnacked == nil)
         #expect(detector.largestAckedPacket == nil)
+    }
+
+    // MARK: - DoS Protection Tests
+
+    @Test("Malicious ACK with huge range does not cause CPU exhaustion", .timeLimit(.minutes(1)))
+    func maliciousAckDoSProtection() {
+        let detector = LossDetector()
+        let rttEstimator = RTTEstimator()
+        let now = ContinuousClock.Instant.now
+
+        // Send only 10 packets
+        for i: UInt64 in 0..<10 {
+            let packet = SentPacket(
+                packetNumber: i,
+                encryptionLevel: .application,
+                timeSent: now,
+                ackEliciting: true,
+                inFlight: true,
+                sentBytes: 1200
+            )
+            detector.onPacketSent(packet)
+        }
+
+        // ATTACK: ACK frame with a massive range that would take forever to iterate
+        // This simulates an attacker sending ACK with a huge range starting from
+        // a large value down to 0 (which includes our packets 0-9)
+        // With the old implementation, this would loop billions of times
+        // With the fixed implementation, it only checks our 10 sent packets
+        let maliciousAck = AckFrame(
+            largestAcknowledged: 1_000_000_000,  // 1 billion
+            ackDelay: 0,
+            ackRanges: [
+                AckRange(gap: 0, rangeLength: 1_000_000_000)  // Huge range: 0 to 1 billion
+            ],
+            ecnCounts: nil
+        )
+
+        // This should complete quickly (within the 5 second time limit)
+        // because we iterate over sentPackets (10 items), not the ACK range
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let result = detector.onAckReceived(
+            ackFrame: maliciousAck,
+            ackReceivedTime: now + .milliseconds(10),
+            rttEstimator: rttEstimator
+        )
+        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+
+        // Should complete in under 1 second (actually much faster)
+        #expect(elapsed < 1.0, "ACK processing took \(elapsed) seconds, expected < 1 second")
+
+        // All 10 packets should be acknowledged (they're within the range)
+        #expect(result.ackedPackets.count == 10)
+        #expect(detector.bytesInFlight == 0)
+    }
+
+    @Test("ACK range outside sent packets does not match", .timeLimit(.minutes(1)))
+    func ackRangeOutsideSentPackets() {
+        let detector = LossDetector()
+        let rttEstimator = RTTEstimator()
+        let now = ContinuousClock.Instant.now
+
+        // Send packets 100-109
+        for i: UInt64 in 100..<110 {
+            let packet = SentPacket(
+                packetNumber: i,
+                encryptionLevel: .application,
+                timeSent: now,
+                ackEliciting: true,
+                inFlight: true,
+                sentBytes: 1200
+            )
+            detector.onPacketSent(packet)
+        }
+
+        // ACK a range that doesn't overlap with our sent packets
+        let nonMatchingAck = AckFrame(
+            largestAcknowledged: 50,
+            ackDelay: 0,
+            ackRanges: [AckRange(gap: 0, rangeLength: 50)],  // ACK packets 0-50
+            ecnCounts: nil
+        )
+
+        let result = detector.onAckReceived(
+            ackFrame: nonMatchingAck,
+            ackReceivedTime: now + .milliseconds(10),
+            rttEstimator: rttEstimator
+        )
+
+        // No packets should be acknowledged
+        #expect(result.ackedPackets.isEmpty)
+        #expect(detector.bytesInFlight == 12000)  // All packets still in flight
+    }
+
+    @Test("Multiple ACK ranges with gaps correctly identify packets")
+    func multipleAckRangesWithGaps() {
+        let detector = LossDetector()
+        let rttEstimator = RTTEstimator()
+        let now = ContinuousClock.Instant.now
+
+        // Send packets 0-19
+        for i: UInt64 in 0..<20 {
+            let packet = SentPacket(
+                packetNumber: i,
+                encryptionLevel: .application,
+                timeSent: now,
+                ackEliciting: true,
+                inFlight: true,
+                sentBytes: 1200
+            )
+            detector.onPacketSent(packet)
+        }
+
+        // ACK with gaps (RFC 9000 Section 19.3.1):
+        // Range 1: 15-19 (rangeLength=4 means 5 packets: largest - rangeLength to largest)
+        // Gap: 5 (means 5 unacknowledged packets: 14, 13, 12, 11, 10)
+        // Range 2: 5-9 (rangeLength=4 means 5 packets)
+        let gappedAck = AckFrame(
+            largestAcknowledged: 19,
+            ackDelay: 0,
+            ackRanges: [
+                AckRange(gap: 0, rangeLength: 4),   // 15-19
+                AckRange(gap: 5, rangeLength: 4)    // 5-9
+            ],
+            ecnCounts: nil
+        )
+
+        let result = detector.onAckReceived(
+            ackFrame: gappedAck,
+            ackReceivedTime: now + .milliseconds(10),
+            rttEstimator: rttEstimator
+        )
+
+        // Should ACK packets: 15,16,17,18,19 and 5,6,7,8,9 = 10 packets
+        #expect(result.ackedPackets.count == 10)
+
+        // Verify the correct packets were ACKed
+        let ackedPNs = Set(result.ackedPackets.map { $0.packetNumber })
+        let expectedAcked: Set<UInt64> = [5, 6, 7, 8, 9, 15, 16, 17, 18, 19]
+        #expect(ackedPNs == expectedAcked)
+
+        // RFC 9002 packet threshold loss detection:
+        // Packets with largest_acked - pn > 3 are declared lost.
+        // largest_acked = 19, so packets 0-15 (19 - 3 = 16) that weren't ACKed are lost.
+        // That means: 0,1,2,3,4,10,11,12,13,14 = 10 packets lost
+        let lostPNs = Set(result.lostPackets.map { $0.packetNumber })
+        let expectedLost: Set<UInt64> = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14]
+        #expect(lostPNs == expectedLost, "Lost packets should be 0-4 and 10-14")
+
+        // All packets are either ACKed or lost, so bytesInFlight = 0
+        #expect(detector.bytesInFlight == 0)
     }
 }

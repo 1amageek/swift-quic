@@ -1,0 +1,53 @@
+# QUIC Interoperability Test Environment
+#
+# Usage:
+#   docker compose up -d      # Start servers
+#   docker compose down       # Stop servers
+#   docker compose logs -f    # View logs
+#
+# Prerequisites:
+#   ./certs/generate.sh       # Generate test certificates
+
+version: '3.8'
+
+services:
+  # Quinn server (Rust QUIC implementation)
+  # https://github.com/quinn-rs/quinn-interop
+  # https://hub.docker.com/r/stammw/quinn-interop
+  quinn-server:
+    image: stammw/quinn-interop:latest
+    container_name: quinn-interop
+    ports:
+      - "4433:443/udp"
+    environment:
+      - ROLE=server
+      - TESTCASE=handshake
+      - SSLKEYLOGFILE=/logs/keys.log
+    volumes:
+      - ./certs:/certs:ro
+      - ./www:/www:ro
+      - ./logs:/logs
+    networks:
+      - quic-interop
+
+  # ngtcp2 server (C QUIC implementation)
+  # https://github.com/ngtcp2/ngtcp2
+  # Built from local Dockerfile with quictls
+  ngtcp2-server:
+    build:
+      context: ./ngtcp2
+      dockerfile: Dockerfile
+    image: ngtcp2-server:local
+    container_name: ngtcp2-interop
+    ports:
+      - "4434:443/udp"
+    volumes:
+      - ./certs:/certs:ro
+      - ./www:/www:ro
+      - ./logs:/logs
+    networks:
+      - quic-interop
+
+networks:
+  quic-interop:
+    driver: bridge

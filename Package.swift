@@ -25,7 +25,7 @@ let package = Package(
     ],
     dependencies: [
         // UDP transport
-        .package(path: "../swift-nio-udp"),
+        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.0.0"),
 
         // Cryptography
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
@@ -50,7 +50,8 @@ let package = Package(
                 "QUICCore",
                 .product(name: "Crypto", package: "swift-crypto"),
             ],
-            path: "Sources/QUICCrypto"
+            path: "Sources/QUICCrypto",
+            exclude: ["CONTEXT.md", "TLS/CONTEXT.md"]
         ),
 
         // MARK: - Connection Management
@@ -63,7 +64,8 @@ let package = Package(
                 "QUICStream",
                 "QUICRecovery",
             ],
-            path: "Sources/QUICConnection"
+            path: "Sources/QUICConnection",
+            exclude: ["CONTEXT.md"]
         ),
 
         // MARK: - Stream Management
@@ -73,7 +75,8 @@ let package = Package(
             dependencies: [
                 "QUICCore",
             ],
-            path: "Sources/QUICStream"
+            path: "Sources/QUICStream",
+            exclude: ["CONTEXT.md"]
         ),
 
         // MARK: - Loss Detection & Congestion Control
@@ -83,7 +86,8 @@ let package = Package(
             dependencies: [
                 "QUICCore",
             ],
-            path: "Sources/QUICRecovery"
+            path: "Sources/QUICRecovery",
+            exclude: ["CONTEXT.md"]
         ),
 
         // MARK: - UDP Transport Integration
@@ -110,7 +114,8 @@ let package = Package(
                 "QUICTransport",
                 .product(name: "Logging", package: "swift-log"),
             ],
-            path: "Sources/QUIC"
+            path: "Sources/QUIC",
+            exclude: ["CONTEXT.md"]
         ),
 
         // MARK: - Tests

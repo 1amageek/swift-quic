@@ -494,7 +494,14 @@ public final class StreamManager: Sendable {
 
                 for frame in streamFrames {
                     state.flowController.recordBytesSent(UInt64(frame.data.count))
-                    remainingBytes -= 11 + frame.data.count  // Approximate overhead
+                    // Use accurate frame size calculation instead of fixed approximation
+                    let frameSize = FrameSize.streamFrame(
+                        streamID: frame.streamID,
+                        offset: frame.offset,
+                        dataLength: frame.data.count,
+                        hasLength: frame.hasLength
+                    )
+                    remainingBytes -= frameSize
                 }
 
                 // Advance cursor for fairness within this priority level

@@ -1,0 +1,13 @@
+# Generated certificates (regenerate with ./certs/generate.sh)
+certs/*.pem
+
+# Test files served by QUIC server
+www/*
+
+# Log files
+logs/*
+
+# Keep directories
+!certs/.gitkeep
+!www/.gitkeep
+!logs/.gitkeep

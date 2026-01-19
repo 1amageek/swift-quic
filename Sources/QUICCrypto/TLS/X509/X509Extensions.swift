@@ -26,6 +26,9 @@ public struct X509Extensions: Sendable {
     /// Subject Key Identifier extension
     public var subjectKeyIdentifier: Data?
 
+    /// Name Constraints extension (CA certificates only)
+    public var nameConstraints: NameConstraints?
+
     /// All extensions (including unrecognized ones)
     public var allExtensions: [X509Extension] = []
 
@@ -64,6 +67,8 @@ public struct X509Extensions: Sendable {
             authorityKeyIdentifier = try AuthorityKeyIdentifier.parse(from: ext.extnValue)
         case .subjectKeyIdentifier:
             subjectKeyIdentifier = try parseSubjectKeyIdentifier(from: ext.extnValue)
+        case .nameConstraints:
+            nameConstraints = try NameConstraints.parse(from: ext.extnValue)
         default:
             // Unknown or unhandled extension
             break
@@ -369,5 +374,193 @@ public struct AuthorityKeyIdentifier: Sendable {
         }
 
         return AuthorityKeyIdentifier(keyIdentifier: keyIdentifier)
+    }
+}
+
+// MARK: - Name Constraints
+
+/// Name Constraints extension (RFC 5280 Section 4.2.1.10)
+///
+/// This extension MUST only appear in CA certificates. It indicates a name space
+/// within which all subject names in subsequent certificates in a certification
+/// path MUST be located.
+///
+/// ```
+/// NameConstraints ::= SEQUENCE {
+///     permittedSubtrees       [0] GeneralSubtrees OPTIONAL,
+///     excludedSubtrees        [1] GeneralSubtrees OPTIONAL }
+///
+/// GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree
+///
+/// GeneralSubtree ::= SEQUENCE {
+///     base                    GeneralName,
+///     minimum         [0]     BaseDistance DEFAULT 0,
+///     maximum         [1]     BaseDistance OPTIONAL }
+///
+/// BaseDistance ::= INTEGER (0..MAX)
+/// ```
+public struct NameConstraints: Sendable {
+    /// Permitted name subtrees - certificates MUST be within these namespaces
+    public let permittedSubtrees: [GeneralSubtree]
+
+    /// Excluded name subtrees - certificates MUST NOT be within these namespaces
+    public let excludedSubtrees: [GeneralSubtree]
+
+    /// A single name subtree constraint
+    public struct GeneralSubtree: Sendable {
+        /// The base name constraint
+        public let base: GeneralName
+
+        /// Minimum distance (default 0)
+        public let minimum: Int
+
+        /// Maximum distance (nil = unbounded)
+        public let maximum: Int?
+    }
+
+    /// General name types for name constraints
+    public enum GeneralName: Sendable, Equatable {
+        /// DNS name (tag 2) - e.g., ".example.com" permits example.com and subdomains
+        case dnsName(String)
+
+        /// RFC 822 email address (tag 1)
+        case rfc822Name(String)
+
+        /// URI (tag 6)
+        case uri(String)
+
+        /// IP address with subnet mask (tag 7) - e.g., 192.168.0.0/16
+        case ipAddress(address: Data, mask: Data)
+
+        /// Directory name (tag 4) - X.500 distinguished name
+        case directoryName(Data)
+
+        /// Unknown or unsupported type
+        case unknown(tag: Int, content: Data)
+    }
+
+    public static func parse(from data: Data) throws -> NameConstraints {
+        let value = try ASN1Parser.parseOne(from: data)
+
+        guard value.tag.isSequence else {
+            throw X509Error.invalidExtension(oid: "nameConstraints", reason: "Must be SEQUENCE")
+        }
+
+        var permittedSubtrees: [GeneralSubtree] = []
+        var excludedSubtrees: [GeneralSubtree] = []
+
+        for child in value.children {
+            guard child.tag.tagClass == .contextSpecific else { continue }
+
+            switch child.tag.tagNumber {
+            case 0: // permittedSubtrees
+                permittedSubtrees = try parseGeneralSubtrees(from: child)
+            case 1: // excludedSubtrees
+                excludedSubtrees = try parseGeneralSubtrees(from: child)
+            default:
+                break
+            }
+        }
+
+        return NameConstraints(
+            permittedSubtrees: permittedSubtrees,
+            excludedSubtrees: excludedSubtrees
+        )
+    }
+
+    private static func parseGeneralSubtrees(from value: ASN1Value) throws -> [GeneralSubtree] {
+        var subtrees: [GeneralSubtree] = []
+
+        // GeneralSubtrees is a SEQUENCE of GeneralSubtree
+        for subtreeValue in value.children {
+            guard subtreeValue.tag.isSequence else { continue }
+
+            // GeneralSubtree: base GeneralName, optional minimum/maximum
+            guard !subtreeValue.children.isEmpty else { continue }
+
+            let baseName = try parseGeneralName(from: subtreeValue.children[0])
+            var minimum = 0
+            var maximum: Int? = nil
+
+            // Parse optional minimum [0] and maximum [1]
+            for i in 1..<subtreeValue.children.count {
+                let child = subtreeValue.children[i]
+                if child.tag.tagClass == .contextSpecific {
+                    if child.tag.tagNumber == 0 {
+                        minimum = try parseInt(from: child.content)
+                    } else if child.tag.tagNumber == 1 {
+                        maximum = try parseInt(from: child.content)
+                    }
+                }
+            }
+
+            subtrees.append(GeneralSubtree(base: baseName, minimum: minimum, maximum: maximum))
+        }
+
+        return subtrees
+    }
+
+    private static func parseGeneralName(from value: ASN1Value) throws -> GeneralName {
+        guard value.tag.tagClass == .contextSpecific else {
+            return .unknown(tag: Int(value.tag.tagNumber), content: value.content)
+        }
+
+        switch value.tag.tagNumber {
+        case 1: // rfc822Name
+            if let str = String(data: value.content, encoding: .ascii) {
+                return .rfc822Name(str)
+            }
+            return .unknown(tag: 1, content: value.content)
+
+        case 2: // dNSName
+            if let str = String(data: value.content, encoding: .ascii) {
+                return .dnsName(str)
+            }
+            return .unknown(tag: 2, content: value.content)
+
+        case 4: // directoryName
+            return .directoryName(value.content)
+
+        case 6: // uniformResourceIdentifier
+            if let str = String(data: value.content, encoding: .ascii) {
+                return .uri(str)
+            }
+            return .unknown(tag: 6, content: value.content)
+
+        case 7: // iPAddress
+            // For name constraints, IP address includes the subnet mask
+            // IPv4: 8 bytes (4 address + 4 mask), IPv6: 32 bytes (16 + 16)
+            let content = value.content
+            if content.count == 8 {
+                // IPv4
+                return .ipAddress(
+                    address: content.prefix(4),
+                    mask: content.suffix(4)
+                )
+            } else if content.count == 32 {
+                // IPv6
+                return .ipAddress(
+                    address: content.prefix(16),
+                    mask: content.suffix(16)
+                )
+            }
+            return .unknown(tag: 7, content: content)
+
+        default:
+            return .unknown(tag: Int(value.tag.tagNumber), content: value.content)
+        }
+    }
+
+    private static func parseInt(from data: Data) throws -> Int {
+        var result = 0
+        for byte in data {
+            result = (result << 8) | Int(byte)
+        }
+        return result
+    }
+
+    /// Whether this constraint is empty (no restrictions)
+    public var isEmpty: Bool {
+        permittedSubtrees.isEmpty && excludedSubtrees.isEmpty
     }
 }

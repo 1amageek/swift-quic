@@ -294,6 +294,7 @@ extension PacketHeader {
         case insufficientData
         case invalidHeader
         case unsupportedVersion(UInt32)
+        case validationFailed(HeaderValidationError)
     }
 
     /// Determines if a packet has a long header by checking the first byte
@@ -301,14 +302,27 @@ extension PacketHeader {
         (firstByte & 0x80) != 0
     }
 
-    /// Parses a packet header from data
+    /// Parses a packet header from data with optional validation
+    ///
     /// - Parameters:
     ///   - data: The packet data
     ///   - dcidLength: For short headers, the expected DCID length (from connection state)
+    ///   - validate: Whether to validate the header after parsing (default: true)
+    ///   - strictValidation: Whether to check reserved bits (default: false)
     /// - Returns: The parsed header and the number of bytes consumed
+    /// - Throws: ParseError if parsing or validation fails
+    ///
+    /// When `validate` is true (the default), the header is checked for:
+    /// - Fixed bit must be set to 1 (RFC 9000)
+    /// - Retry packets must have integrity tag (RFC 9001)
+    ///
+    /// When `strictValidation` is also true:
+    /// - Reserved bits must be zero
     public static func parse(
         from data: Data,
-        dcidLength: Int = 0
+        dcidLength: Int = 0,
+        validate: Bool = true,
+        strictValidation: Bool = false
     ) throws -> (header: PacketHeader, headerLength: Int) {
         var reader = DataReader(data)
 
@@ -318,6 +332,16 @@ extension PacketHeader {
 
         if isLongHeader(firstByte: firstByte) {
             let (header, length) = try parseLongHeader(firstByte: firstByte, reader: &reader)
+
+            // Validate if requested
+            if validate {
+                do {
+                    try header.validate(strict: strictValidation)
+                } catch let error as HeaderValidationError {
+                    throw ParseError.validationFailed(error)
+                }
+            }
+
             return (.long(header), length)
         } else {
             let (header, length) = try parseShortHeader(
@@ -325,6 +349,16 @@ extension PacketHeader {
                 reader: &reader,
                 dcidLength: dcidLength
             )
+
+            // Validate if requested
+            if validate {
+                do {
+                    try header.validate(strict: strictValidation)
+                } catch let error as HeaderValidationError {
+                    throw ParseError.validationFailed(error)
+                }
+            }
+
             return (.short(header), length)
         }
     }
@@ -369,10 +403,11 @@ extension PacketHeader {
         switch packetType {
         case 0x00:  // Initial
             // Read token length and token
-            let tokenLength = try reader.readVarint()
-            if tokenLength.value > 0 {
+            // Use readVarintValue() directly to avoid Varint object creation
+            let tokenLengthValue = try reader.readVarintValue()
+            if tokenLengthValue > 0 {
                 let safeTokenLength = try SafeConversions.toInt(
-                    tokenLength.value,
+                    tokenLengthValue,
                     maxAllowed: ProtocolLimits.maxInitialTokenLength,
                     context: "Initial packet token length"
                 )
@@ -382,18 +417,15 @@ extension PacketHeader {
                 token = tokenData
             }
             // Read Length field (packet number + payload length)
-            let lengthVarint = try reader.readVarint()
-            length = lengthVarint.value
+            length = try reader.readVarintValue()
 
         case 0x01:  // 0-RTT
             // Read Length field
-            let lengthVarint = try reader.readVarint()
-            length = lengthVarint.value
+            length = try reader.readVarintValue()
 
         case 0x02:  // Handshake
             // Read Length field
-            let lengthVarint = try reader.readVarint()
-            length = lengthVarint.value
+            length = try reader.readVarintValue()
 
         case 0x03:  // Retry
             // Retry packets have no packet number or length field

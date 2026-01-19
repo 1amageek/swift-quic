@@ -83,7 +83,7 @@ struct DataStreamTests {
 
     @Test("Receive single frame")
     func receiveSingleFrame() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -105,7 +105,7 @@ struct DataStreamTests {
 
     @Test("Receive and read data")
     func receiveAndReadData() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -128,7 +128,7 @@ struct DataStreamTests {
 
     @Test("Receive out-of-order frames")
     func receiveOutOfOrderFrames() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -153,7 +153,7 @@ struct DataStreamTests {
 
     @Test("Receive with FIN")
     func receiveWithFin() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -176,7 +176,7 @@ struct DataStreamTests {
 
     @Test("Receive flow control violation throws")
     func receiveFlowControlViolation() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -197,7 +197,7 @@ struct DataStreamTests {
 
     @Test("Cannot receive on send-only unidirectional stream")
     func cannotReceiveOnSendOnlyStream() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 2,  // Client-initiated uni
             isClient: true,  // We are the initiator
             initialSendMaxData: 1000,
@@ -215,7 +215,7 @@ struct DataStreamTests {
 
     @Test("Write data to stream")
     func writeData() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -231,7 +231,7 @@ struct DataStreamTests {
 
     @Test("Generate stream frames")
     func generateStreamFrames() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -251,7 +251,7 @@ struct DataStreamTests {
 
     @Test("Generate frames with FIN")
     func generateFramesWithFin() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -271,7 +271,7 @@ struct DataStreamTests {
 
     @Test("Generate FIN-only frame")
     func generateFinOnlyFrame() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -289,7 +289,7 @@ struct DataStreamTests {
 
     @Test("Flow control limits send")
     func flowControlLimitsSend() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 5,  // Small limit
@@ -307,7 +307,7 @@ struct DataStreamTests {
 
     @Test("Cannot send on receive-only unidirectional stream")
     func cannotSendOnReceiveOnlyStream() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 2,  // Client-initiated uni
             isClient: false,  // We are NOT the initiator
             initialSendMaxData: 1000,
@@ -323,7 +323,7 @@ struct DataStreamTests {
 
     @Test("Update send max data")
     func updateSendMaxData() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 5,
@@ -375,7 +375,7 @@ struct DataStreamTests {
 
     @Test("Write after STOP_SENDING throws")
     func writeAfterStopSendingThrows() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -393,7 +393,7 @@ struct DataStreamTests {
 
     @Test("Handle RESET_STREAM from peer")
     func handleResetStream() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -412,7 +412,7 @@ struct DataStreamTests {
 
     @Test("Generate RESET_STREAM")
     func generateResetStream() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -451,7 +451,7 @@ struct DataStreamTests {
 
     @Test("Full receive state transition")
     func fullReceiveStateTransition() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -474,7 +474,7 @@ struct DataStreamTests {
 
     @Test("Full send state transition")
     func fullSendStateTransition() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -506,7 +506,7 @@ struct DataStreamTests {
     /// if a sender violates the advertised connection or stream data limits"
     @Test("RFC 9000 4.5: RESET_STREAM with final size exceeding flow control limit throws error")
     func resetStreamExceedsFlowControlLimit() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -515,7 +515,8 @@ struct DataStreamTests {
 
         // RESET_STREAM with finalSize > recvMaxData should throw
         #expect(throws: StreamError.self) {
-            try stream.handleResetStream(errorCode: 0, finalSize: 150)
+            var mutableStream = stream
+            try mutableStream.handleResetStream(errorCode: 0, finalSize: 150)
         }
     }
 
@@ -523,7 +524,7 @@ struct DataStreamTests {
     /// "Once a final size for a stream is known, it cannot change"
     @Test("RFC 9000 4.5: RESET_STREAM with conflicting final size throws error")
     func resetStreamConflictingFinalSize() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -550,7 +551,7 @@ struct DataStreamTests {
     /// "The final size is the amount of flow control credit that is consumed by a stream"
     @Test("RFC 9000 4.5: RESET_STREAM with matching final size succeeds")
     func resetStreamMatchingFinalSize() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -564,11 +565,12 @@ struct DataStreamTests {
             data: Data(repeating: 0, count: 50),
             fin: true
         )
-        try stream.receive(finFrame)
+        let mutableStream = stream
+        try mutableStream.receive(finFrame)
 
         // RESET_STREAM with same final size should succeed
-        try stream.handleResetStream(errorCode: 42, finalSize: 50)
-        #expect(stream.state.recvState == .resetRecvd)
+        try mutableStream.handleResetStream(errorCode: 42, finalSize: 50)
+        #expect(mutableStream.state.recvState == .resetRecvd)
     }
 
     /// RFC 9000 Section 4.5:
@@ -576,7 +578,7 @@ struct DataStreamTests {
     /// MUST terminate the connection with error STREAM_STATE_ERROR"
     @Test("RFC 9000 4.5: Final size from RESET_STREAM must not exceed stream limit")
     func resetStreamFinalSizeAtExactLimit() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -584,16 +586,17 @@ struct DataStreamTests {
         )
 
         // RESET_STREAM with finalSize exactly at limit should succeed
-        try stream.handleResetStream(errorCode: 0, finalSize: 100)
-        #expect(stream.state.finalSize == 100)
-        #expect(stream.state.recvState == .resetRecvd)
+        let mutableStream = stream
+        try mutableStream.handleResetStream(errorCode: 0, finalSize: 100)
+        #expect(mutableStream.state.finalSize == 100)
+        #expect(mutableStream.state.recvState == .resetRecvd)
     }
 
     /// RFC 9000 Section 4.5:
     /// "Endpoints MUST NOT send data on a stream at or beyond the final size"
     @Test("RFC 9000 4.5: Data received beyond final size from FIN is rejected")
     func dataReceivedBeyondFinalSize() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
@@ -607,7 +610,8 @@ struct DataStreamTests {
             data: Data(repeating: 0, count: 50),
             fin: true
         )
-        try stream.receive(finFrame)
+        let mutableStream = stream
+        try mutableStream.receive(finFrame)
 
         // Then: Data at offset 40 with length 20 (ends at 60 > 50) should throw
         let badFrame = StreamFrame(
@@ -617,7 +621,7 @@ struct DataStreamTests {
             fin: false
         )
         #expect(throws: StreamError.self) {
-            try stream.receive(badFrame)
+            try mutableStream.receive(badFrame)
         }
     }
 
@@ -625,48 +629,50 @@ struct DataStreamTests {
 
     @Test("Bidirectional stream closed")
     func bidirectionalStreamClosed() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 0,
             isClient: true,
             initialSendMaxData: 1000,
             initialRecvMaxData: 1000
         )
 
-        #expect(!stream.isClosed)
+        let mutableStream = stream
+        #expect(!mutableStream.isClosed)
 
         // Close send side
-        try stream.write(Data([1, 2, 3]))
-        try stream.finish()
-        _ = stream.generateFrames(maxBytes: 1000)
-        stream.acknowledgeData(upTo: 3)
+        try mutableStream.write(Data([1, 2, 3]))
+        try mutableStream.finish()
+        _ = mutableStream.generateFrames(maxBytes: 1000)
+        mutableStream.acknowledgeData(upTo: 3)
 
-        #expect(!stream.isClosed)  // Recv side still open
+        #expect(!mutableStream.isClosed)  // Recv side still open
 
         // Close receive side
         let frame = StreamFrame(streamID: 0, offset: 0, data: Data([4, 5, 6]), fin: true)
-        try stream.receive(frame)
-        _ = stream.read()
+        try mutableStream.receive(frame)
+        _ = mutableStream.read()
 
-        #expect(stream.isClosed)
+        #expect(mutableStream.isClosed)
     }
 
     @Test("Unidirectional send-only stream closed")
     func unidirectionalSendOnlyStreamClosed() throws {
-        var stream = DataStream(
+        let stream = DataStream(
             id: 2,  // Client-initiated uni
             isClient: true,
             initialSendMaxData: 1000,
             initialRecvMaxData: 1000
         )
 
-        #expect(!stream.isClosed)
+        let mutableStream = stream
+        #expect(!mutableStream.isClosed)
 
-        try stream.write(Data([1, 2, 3]))
-        try stream.finish()
-        _ = stream.generateFrames(maxBytes: 1000)
-        stream.acknowledgeData(upTo: 3)
+        try mutableStream.write(Data([1, 2, 3]))
+        try mutableStream.finish()
+        _ = mutableStream.generateFrames(maxBytes: 1000)
+        mutableStream.acknowledgeData(upTo: 3)
 
-        #expect(stream.isClosed)
+        #expect(mutableStream.isClosed)
     }
 
     // MARK: - Stream ID Mismatch Tests (Issue C)

@@ -96,13 +96,11 @@ public struct TranscriptHash: Sendable {
     public func currentHash() -> Data {
         switch hasher {
         case .sha256(let h):
-            var hasherCopy = h
-            let digest = hasherCopy.finalize()
-            return Data(digest)
+            let copy = h
+            return Data(copy.finalize())
         case .sha384(let h):
-            var hasherCopy = h
-            let digest = hasherCopy.finalize()
-            return Data(digest)
+            let copy = h
+            return Data(copy.finalize())
         }
     }
 
@@ -166,9 +164,8 @@ public struct TranscriptHashSHA384: Sendable {
     }
 
     public func currentHash() -> Data {
-        var copy = hasher
-        let digest = copy.finalize()
-        return Data(digest)
+        let copy = hasher
+        return Data(copy.finalize())
     }
 
     public static var hashLength: Int { 48 }

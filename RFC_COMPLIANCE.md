@@ -768,15 +768,52 @@ private func detectLostPacketsInternal(
 
 ## Security Hardening
 
+### Safe Integer Conversions
+
+**Implementation:** `Sources/QUICCore/SafeConversions.swift`
+
+All UInt64 → Int conversions from network data use centralized validation:
+
+```swift
+public enum SafeConversions {
+    /// Safe UInt64 to Int conversion with overflow check
+    public static func toInt(_ value: UInt64) throws -> Int
+
+    /// Safe conversion with protocol limit enforcement
+    public static func toInt(_ value: UInt64, maxAllowed: Int, context: String) throws -> Int
+
+    /// Safe subtraction with underflow check
+    public static func subtract(_ a: Int, _ b: Int) throws -> Int
+}
+```
+
+### Protocol Limits
+
+**Implementation:** `Sources/QUICCore/ProtocolLimits.swift`
+
+RFC-compliant limits enforced throughout the codebase:
+
+| Limit | Value | RFC Reference |
+|-------|-------|---------------|
+| Max Connection ID Length | 20 bytes | RFC 9000 Section 17.2 |
+| Max Initial Token Length | 1200 bytes | UDP MTU constraint |
+| Max Frame Payload Length | 65535 bytes | Single packet constraint |
+| Max ACK Ranges | 256 | Memory exhaustion prevention |
+| Stateless Reset Token Length | 16 bytes | RFC 9000 Section 10.3 |
+
 ### Integer Overflow Protection
 
 All arithmetic operations that could overflow use saturating arithmetic:
 
 | Component | Protection |
 |-----------|------------|
+| SafeConversions | `toInt()` validates UInt64 <= Int.max |
+| SafeConversions | `subtract()` validates a >= b |
 | AntiAmplificationLimiter | `multipliedReportingOverflow`, `addingReportingOverflow` |
 | FlowController | Overflow checks before credit operations |
 | LossDetector | ACK range validation before subtraction |
+| FrameCodec | All length fields use SafeConversions |
+| PacketCodec | Payload length calculations use SafeConversions |
 
 ### ACK Range Validation
 
@@ -800,8 +837,20 @@ for (index, range) in ackFrame.ackRanges.enumerated() {
 
 ### Connection ID Validation
 
-**Implementation:** `Sources/QUIC/PacketProcessor.swift`
-- DCID length clamped to 0-20 bytes per RFC 9000 Section 17.2
+**Implementation:** `Sources/QUICCore/Packet/ConnectionID.swift`
+
+```swift
+public init(bytes: Data) throws {
+    guard bytes.count <= Self.maxLength else {
+        throw ConnectionIDError.tooLong(length: bytes.count, maxAllowed: Self.maxLength)
+    }
+    self.bytes = bytes
+}
+```
+
+- DCID length enforced to 0-20 bytes per RFC 9000 Section 17.2
+- Throwing initializer prevents invalid ConnectionID construction
+- `random(length:)` returns nil for invalid lengths
 - Prevents buffer over-read attacks
 
 ### Race Condition Prevention

@@ -58,13 +58,17 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     // MARK: - Encoding
 
     public func encode(_ frame: Frame) throws -> Data {
-        var writer = DataWriter()
+        // Pre-calculate frame size and allocate exact capacity to avoid reallocations
+        let frameSize = FrameSize.frame(frame)
+        var writer = DataWriter(capacity: frameSize)
         try encodeFrame(frame, to: &writer)
         return writer.toData()
     }
 
     public func encodeFrames(_ frames: [Frame]) throws -> Data {
-        var writer = DataWriter()
+        // Pre-calculate total size for all frames to avoid reallocations
+        let totalSize = frames.reduce(0) { $0 + FrameSize.frame($1) }
+        var writer = DataWriter(capacity: totalSize)
         for frame in frames {
             try encodeFrame(frame, to: &writer)
         }
@@ -75,8 +79,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         switch frame {
         case .padding(let count):
             // PADDING frames are just 0x00 bytes
-            // Use batch append for efficiency instead of byte-by-byte loop
-            writer.writeBytes(Data(repeating: 0x00, count: count))
+            // Use optimized zero-byte writer which uses Data(count:) internally
+            // (faster than Data(repeating: 0x00, count:) for large counts)
+            writer.writeZeroBytes(count)
 
         case .ping:
             // PING frame: just type byte
@@ -208,9 +213,13 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         }
 
         // Additional ACK Ranges (Gap + Range pairs)
-        for range in ack.ackRanges.dropFirst() {
-            writer.writeVarint(range.gap)
-            writer.writeVarint(range.rangeLength)
+        // Use index-based iteration to avoid ArraySlice overhead from dropFirst()
+        let ranges = ack.ackRanges
+        if ranges.count > 1 {
+            for i in 1..<ranges.count {
+                writer.writeVarint(ranges[i].gap)
+                writer.writeVarint(ranges[i].rangeLength)
+            }
         }
 
         // ECN Counts (if present)

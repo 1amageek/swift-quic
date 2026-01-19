@@ -622,7 +622,7 @@ struct StreamManagerTests {
 
         // Write and receive data
         try manager.write(streamID: id1, data: Data([1, 2, 3]))
-        let frame = StreamFrame(streamID: id2, offset: 0, data: Data([4, 5, 6]), fin: true)
+        _ = StreamFrame(streamID: id2, offset: 0, data: Data([4, 5, 6]), fin: true)
         try manager.receive(frame: StreamFrame(streamID: id1, offset: 0, data: Data([7, 8, 9]), fin: false))
 
         // Close first stream

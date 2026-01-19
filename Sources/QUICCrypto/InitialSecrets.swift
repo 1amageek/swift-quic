@@ -211,14 +211,103 @@ public struct KeyMaterial: Sendable {
 ///
 /// For TLS 1.3, prefix is "tls13 " (RFC 8446 Section 7.1)
 /// For QUIC packet keys, prefix is "quic " (RFC 9001 Section 5.1 - but labels are passed complete)
-/// Pre-computed label bytes for common QUIC labels (avoids repeated string concatenation)
+/// Pre-computed HKDF label structures for QUIC key derivation
+///
+/// QUIC uses fixed labels with empty context, so we can pre-compute the entire
+/// HkdfLabel structure (length + label + context) to avoid runtime allocation.
+///
+/// HkdfLabel format (RFC 8446 Section 7.1):
+/// - uint16 length
+/// - opaque label<7..255> = len(1) + "tls13 " + label
+/// - opaque context<0..255> = len(1) + context (empty for QUIC)
 private enum HKDFLabels {
-    // "tls13 " prefix + label
+    // "tls13 " prefix + label (used for slow path)
     static let clientIn = Data("tls13 client in".utf8)
     static let serverIn = Data("tls13 server in".utf8)
     static let quicKey = Data("tls13 quic key".utf8)
     static let quicIV = Data("tls13 quic iv".utf8)
     static let quicHP = Data("tls13 quic hp".utf8)
+    static let quicKU = Data("tls13 quic ku".utf8)
+
+    // Pre-computed complete HkdfLabel structures for QUIC key derivation
+    // Format: [length_hi, length_lo, label_len, label_bytes..., context_len(0)]
+
+    /// "client in" with output length 32 (initial secret derivation)
+    static let hkdfLabelClientIn32: Data = {
+        var data = Data(capacity: 20)
+        data.append(0x00); data.append(0x20)  // length = 32
+        data.append(UInt8(clientIn.count))    // label length = 15
+        data.append(clientIn)
+        data.append(0x00)                     // context length = 0
+        return data
+    }()
+
+    /// "server in" with output length 32 (initial secret derivation)
+    static let hkdfLabelServerIn32: Data = {
+        var data = Data(capacity: 20)
+        data.append(0x00); data.append(0x20)  // length = 32
+        data.append(UInt8(serverIn.count))    // label length = 15
+        data.append(serverIn)
+        data.append(0x00)                     // context length = 0
+        return data
+    }()
+
+    /// "quic key" with output length 16 (AES-128-GCM key)
+    static let hkdfLabelQuicKey16: Data = {
+        var data = Data(capacity: 19)
+        data.append(0x00); data.append(0x10)  // length = 16
+        data.append(UInt8(quicKey.count))     // label length = 14
+        data.append(quicKey)
+        data.append(0x00)                     // context length = 0
+        return data
+    }()
+
+    /// "quic iv" with output length 12
+    static let hkdfLabelQuicIV12: Data = {
+        var data = Data(capacity: 18)
+        data.append(0x00); data.append(0x0C)  // length = 12
+        data.append(UInt8(quicIV.count))      // label length = 13
+        data.append(quicIV)
+        data.append(0x00)                     // context length = 0
+        return data
+    }()
+
+    /// "quic hp" with output length 16 (header protection key)
+    static let hkdfLabelQuicHP16: Data = {
+        var data = Data(capacity: 18)
+        data.append(0x00); data.append(0x10)  // length = 16
+        data.append(UInt8(quicHP.count))      // label length = 13
+        data.append(quicHP)
+        data.append(0x00)                     // context length = 0
+        return data
+    }()
+
+    /// "quic ku" with output length 32 (key update secret)
+    static let hkdfLabelQuicKU32: Data = {
+        var data = Data(capacity: 18)
+        data.append(0x00); data.append(0x20)  // length = 32
+        data.append(UInt8(quicKU.count))      // label length = 13
+        data.append(quicKU)
+        data.append(0x00)                     // context length = 0
+        return data
+    }()
+
+    /// Returns pre-computed HkdfLabel if available, otherwise nil
+    @inline(__always)
+    static func precomputedHkdfLabel(label: String, length: Int, context: Data) -> Data? {
+        // Only use pre-computed labels for empty context
+        guard context.isEmpty else { return nil }
+
+        switch (label, length) {
+        case ("client in", 32): return hkdfLabelClientIn32
+        case ("server in", 32): return hkdfLabelServerIn32
+        case ("quic key", 16): return hkdfLabelQuicKey16
+        case ("quic iv", 12): return hkdfLabelQuicIV12
+        case ("quic hp", 16): return hkdfLabelQuicHP16
+        case ("quic ku", 32): return hkdfLabelQuicKU32
+        default: return nil
+        }
+    }
 
     /// Returns cached label bytes if available, otherwise computes them
     @inline(__always)
@@ -246,7 +335,18 @@ func hkdfExpandLabel(
     length: Int,
     labelPrefix: String = "tls13 "
 ) throws -> Data {
-    // Get label bytes (cached for common labels)
+    // Fast path: use pre-computed HkdfLabel for common QUIC operations
+    if labelPrefix == "tls13 ",
+       let precomputed = HKDFLabels.precomputedHkdfLabel(label: label, length: length, context: context) {
+        let output = HKDF<SHA256>.expand(
+            pseudoRandomKey: secret,
+            info: precomputed,
+            outputByteCount: length
+        )
+        return output.withUnsafeBytes { Data($0) }
+    }
+
+    // Slow path: construct HkdfLabel dynamically
     let labelBytes = HKDFLabels.labelBytes(for: label, prefix: labelPrefix)
 
     // Pre-allocate hkdfLabel with exact capacity: 2 + 1 + labelBytes.count + 1 + context.count

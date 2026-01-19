@@ -28,6 +28,9 @@ public struct X509ValidationOptions: Sendable {
     /// Whether to validate SAN format (DNS names, IP addresses)
     public var validateSANFormat: Bool
 
+    /// Whether to check Name Constraints from CA certificates
+    public var checkNameConstraints: Bool
+
     /// Hostname to verify against SubjectAltName/CN
     public var hostname: String?
 
@@ -48,6 +51,7 @@ public struct X509ValidationOptions: Sendable {
         checkExtendedKeyUsage: Bool = true,
         requiredEKU: RequiredEKU? = nil,
         validateSANFormat: Bool = true,
+        checkNameConstraints: Bool = true,
         hostname: String? = nil,
         validationTime: Date = Date(),
         allowSelfSigned: Bool = false,
@@ -59,6 +63,7 @@ public struct X509ValidationOptions: Sendable {
         self.checkExtendedKeyUsage = checkExtendedKeyUsage
         self.requiredEKU = requiredEKU
         self.validateSANFormat = validateSANFormat
+        self.checkNameConstraints = checkNameConstraints
         self.hostname = hostname
         self.validationTime = validationTime
         self.allowSelfSigned = allowSelfSigned
@@ -137,6 +142,11 @@ public struct X509Validator: Sendable {
 
         // Verify signatures in the chain
         try verifyChainSignatures(chain)
+
+        // Verify Name Constraints from CA certificates (RFC 5280 Section 4.2.1.10)
+        if options.checkNameConstraints {
+            try verifyNameConstraints(chain)
+        }
 
         // Verify the root is trusted
         try verifyTrust(chain: chain)
@@ -338,6 +348,260 @@ public struct X509Validator: Sendable {
             throw error
         } catch {
             throw X509Error.signatureVerificationFailed(error.localizedDescription)
+        }
+    }
+
+    // MARK: - Name Constraints Verification (RFC 5280 Section 4.2.1.10)
+
+    /// Verifies Name Constraints from CA certificates in the chain
+    ///
+    /// For each CA with Name Constraints:
+    /// - All certificates issued by that CA (and subsequent CAs) must have
+    ///   names that satisfy the constraints
+    /// - Names in permittedSubtrees are the only allowed names (if present)
+    /// - Names in excludedSubtrees are forbidden
+    private func verifyNameConstraints(_ chain: [X509Certificate]) throws {
+        // Collect all name constraints from CA certificates (index > 0)
+        // We apply each CA's constraints to all certificates below it in the chain
+        for caIndex in 1..<chain.count {
+            let ca = chain[caIndex]
+
+            guard let constraints = ca.extensions.nameConstraints else {
+                continue  // No constraints from this CA
+            }
+
+            if constraints.isEmpty {
+                continue  // Empty constraints = no restrictions
+            }
+
+            // Apply these constraints to all certificates below this CA
+            for certIndex in 0..<caIndex {
+                let cert = chain[certIndex]
+                try verifyNameAgainstConstraints(cert, constraints: constraints)
+            }
+        }
+    }
+
+    /// Verifies a certificate's names against Name Constraints
+    private func verifyNameAgainstConstraints(
+        _ certificate: X509Certificate,
+        constraints: NameConstraints
+    ) throws {
+        // Collect all names from the certificate
+        var dnsNames: [String] = []
+        var emailAddresses: [String] = []
+        var uris: [String] = []
+
+        // Get names from SAN
+        if let san = certificate.extensions.subjectAltName {
+            dnsNames.append(contentsOf: san.dnsNames)
+            emailAddresses.append(contentsOf: san.emailAddresses)
+            uris.append(contentsOf: san.uris)
+        }
+
+        // Get Common Name from subject (treated as DNS name if no SAN DNS names)
+        if let cn = certificate.subject.commonName, dnsNames.isEmpty {
+            dnsNames.append(cn)
+        }
+
+        // Check DNS names
+        for dnsName in dnsNames {
+            try checkNameAgainstConstraints(
+                name: .dnsName(dnsName),
+                permitted: constraints.permittedSubtrees,
+                excluded: constraints.excludedSubtrees
+            )
+        }
+
+        // Check email addresses
+        for email in emailAddresses {
+            try checkNameAgainstConstraints(
+                name: .rfc822Name(email),
+                permitted: constraints.permittedSubtrees,
+                excluded: constraints.excludedSubtrees
+            )
+        }
+
+        // Check URIs
+        for uri in uris {
+            try checkNameAgainstConstraints(
+                name: .uri(uri),
+                permitted: constraints.permittedSubtrees,
+                excluded: constraints.excludedSubtrees
+            )
+        }
+    }
+
+    /// Checks a single name against permitted and excluded subtrees
+    private func checkNameAgainstConstraints(
+        name: NameConstraints.GeneralName,
+        permitted: [NameConstraints.GeneralSubtree],
+        excluded: [NameConstraints.GeneralSubtree]
+    ) throws {
+        // First check excluded - if matched, reject
+        for subtree in excluded {
+            if nameMatches(name, subtree: subtree) {
+                throw X509Error.nameConstraintsViolation(
+                    name: nameDescription(name),
+                    reason: "excluded by Name Constraints"
+                )
+            }
+        }
+
+        // If there are permitted subtrees for this name type, at least one must match
+        let relevantPermitted = permitted.filter { sameNameType($0.base, as: name) }
+        if !relevantPermitted.isEmpty {
+            let matchesAny = relevantPermitted.contains { nameMatches(name, subtree: $0) }
+            if !matchesAny {
+                throw X509Error.nameConstraintsViolation(
+                    name: nameDescription(name),
+                    reason: "not within permitted Name Constraints"
+                )
+            }
+        }
+    }
+
+    /// Checks if two GeneralNames are the same type
+    private func sameNameType(_ a: NameConstraints.GeneralName, as b: NameConstraints.GeneralName) -> Bool {
+        switch (a, b) {
+        case (.dnsName, .dnsName): return true
+        case (.rfc822Name, .rfc822Name): return true
+        case (.uri, .uri): return true
+        case (.ipAddress, .ipAddress): return true
+        case (.directoryName, .directoryName): return true
+        default: return false
+        }
+    }
+
+    /// Checks if a name matches a subtree constraint
+    private func nameMatches(_ name: NameConstraints.GeneralName, subtree: NameConstraints.GeneralSubtree) -> Bool {
+        // minimum/maximum are rarely used in practice, we handle minimum=0 only
+        guard subtree.minimum == 0 else { return false }
+
+        switch (name, subtree.base) {
+        case let (.dnsName(certName), .dnsName(constraintName)):
+            return dnsNameMatches(certName, constraint: constraintName)
+
+        case let (.rfc822Name(certEmail), .rfc822Name(constraintEmail)):
+            return emailMatches(certEmail, constraint: constraintEmail)
+
+        case let (.uri(certUri), .uri(constraintUri)):
+            return uriMatches(certUri, constraint: constraintUri)
+
+        case let (.ipAddress(certAddr, certMask), .ipAddress(constraintAddr, constraintMask)):
+            return ipAddressMatches(
+                address: certAddr,
+                mask: certMask,
+                constraintAddress: constraintAddr,
+                constraintMask: constraintMask
+            )
+
+        default:
+            return false
+        }
+    }
+
+    /// DNS name matching for Name Constraints
+    ///
+    /// RFC 5280: A constraint ".example.com" matches "foo.example.com" and "example.com"
+    /// but not "notexample.com"
+    private func dnsNameMatches(_ name: String, constraint: String) -> Bool {
+        let nameLower = name.lowercased()
+        let constraintLower = constraint.lowercased()
+
+        // Exact match
+        if nameLower == constraintLower {
+            return true
+        }
+
+        // If constraint starts with ".", it's a subdomain constraint
+        if constraintLower.hasPrefix(".") {
+            // name must end with the constraint
+            if nameLower.hasSuffix(constraintLower) {
+                return true
+            }
+            // or be exactly the domain without the leading dot
+            let domain = String(constraintLower.dropFirst())
+            if nameLower == domain {
+                return true
+            }
+        } else {
+            // Constraint without leading dot - name must be subdomain or exact match
+            if nameLower.hasSuffix("." + constraintLower) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /// Email address matching for Name Constraints
+    ///
+    /// RFC 5280: "@example.com" matches any email at example.com
+    /// "example.com" matches any email at example.com or subdomains
+    private func emailMatches(_ email: String, constraint: String) -> Bool {
+        let emailLower = email.lowercased()
+        let constraintLower = constraint.lowercased()
+
+        // If constraint contains @, it must be exact local part match
+        if constraintLower.contains("@") {
+            return emailLower == constraintLower
+        }
+
+        // Otherwise constraint is a domain
+        guard let atIndex = emailLower.firstIndex(of: "@") else {
+            return false
+        }
+
+        let emailDomain = String(emailLower[emailLower.index(after: atIndex)...])
+        return dnsNameMatches(emailDomain, constraint: constraintLower)
+    }
+
+    /// URI matching for Name Constraints
+    private func uriMatches(_ uri: String, constraint: String) -> Bool {
+        guard let uriURL = URL(string: uri),
+              let host = uriURL.host else {
+            return false
+        }
+
+        return dnsNameMatches(host, constraint: constraint)
+    }
+
+    /// IP address matching for Name Constraints
+    ///
+    /// Checks if the certificate's IP is within the constraint's subnet
+    private func ipAddressMatches(
+        address: Data,
+        mask: Data,
+        constraintAddress: Data,
+        constraintMask: Data
+    ) -> Bool {
+        // Must be same address family
+        guard address.count == constraintAddress.count else { return false }
+        guard mask.count == constraintMask.count else { return false }
+        guard address.count == mask.count else { return false }
+
+        // Apply constraint mask and compare
+        for i in 0..<address.count {
+            let maskedAddr = address[address.startIndex.advanced(by: i)] & constraintMask[constraintMask.startIndex.advanced(by: i)]
+            let maskedConstraint = constraintAddress[constraintAddress.startIndex.advanced(by: i)] & constraintMask[constraintMask.startIndex.advanced(by: i)]
+            if maskedAddr != maskedConstraint {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    /// Returns a human-readable description of a GeneralName
+    private func nameDescription(_ name: NameConstraints.GeneralName) -> String {
+        switch name {
+        case .dnsName(let dns): return "DNS:\(dns)"
+        case .rfc822Name(let email): return "email:\(email)"
+        case .uri(let uri): return "URI:\(uri)"
+        case .ipAddress(let addr, _): return "IP:\(addr.map { String(format: "%d", $0) }.joined(separator: "."))"
+        case .directoryName: return "directoryName"
+        case .unknown(let tag, _): return "unknown(\(tag))"
         }
     }
 

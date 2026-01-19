@@ -127,8 +127,20 @@ public final class LossDetector: Sendable {
         )
     }
 
-    /// Processes ACK ranges directly without building intermediate array
-    /// Optimized to skip packet numbers below smallestUnacked
+    /// Pre-computed ACK range interval for efficient lookup
+    private struct AckInterval {
+        let start: UInt64  // Inclusive
+        let end: UInt64    // Inclusive
+    }
+
+    /// Processes ACK ranges using bounded iteration over sentPackets
+    ///
+    /// SECURITY: This method iterates over sentPackets.keys (bounded by our own sent packets)
+    /// instead of iterating over ACK ranges (which could be attacker-controlled).
+    /// This prevents CPU DoS attacks via malicious ACK frames with huge ranges.
+    ///
+    /// OPTIMIZATION: Pre-computes ACK ranges as intervals once, then uses binary search
+    /// for O(packets × log(ranges)) instead of O(packets × ranges).
     @inline(__always)
     private func processAckedRanges(
         ackFrame: AckFrame,
@@ -138,57 +150,117 @@ public final class LossDetector: Sendable {
         ackReceivedTime: ContinuousClock.Instant
     ) {
         let largestAcked = ackFrame.largestAcknowledged
-        let smallestUnacked = state.smallestUnacked ?? 0
+
+        // Pre-compute ACK ranges as intervals (sorted by start descending)
+        // This is done once per ACK frame, not per packet
+        let intervals = computeAckIntervals(ranges: ackFrame.ackRanges, largestAcked: largestAcked)
+        guard !intervals.isEmpty else { return }
+
+        // Build a sorted list of packet numbers to check
+        // This is bounded by the number of packets we've sent, not by ACK range sizes
+        var packetsToRemove: [UInt64] = []
+        packetsToRemove.reserveCapacity(min(state.sentPackets.count, 64))
+
+        for pn in state.sentPackets.keys {
+            // Skip packets that can't possibly be acknowledged
+            // (packet numbers greater than largest acknowledged)
+            guard pn <= largestAcked else { continue }
+
+            // Check if this packet number falls within any ACK range using binary search
+            if isPacketInIntervals(pn, intervals: intervals) {
+                packetsToRemove.append(pn)
+            }
+        }
+
+        // Process acknowledged packets
+        for pn in packetsToRemove {
+            if let packet = state.sentPackets.removeValue(forKey: pn) {
+                ackedPackets.append(packet)
+                if packet.inFlight {
+                    state.bytesInFlight -= packet.sentBytes
+                }
+                if packet.ackEliciting {
+                    state.ackElicitingInFlight -= 1
+                }
+
+                // RTT sample from largest newly acked ack-eliciting packet
+                if pn == largestAcked && packet.ackEliciting {
+                    rttSample = ackReceivedTime - packet.timeSent
+                }
+            }
+        }
+    }
+
+    /// Computes ACK intervals from ACK ranges
+    ///
+    /// ACK ranges are structured as (RFC 9000 Section 19.3.1):
+    /// - First range: [largestAcked - firstRange.rangeLength, largestAcked]
+    /// - Subsequent ranges: gap indicates unacked packets below (smallest_prev - 1)
+    ///
+    /// Returns intervals sorted by start (descending order).
+    @inline(__always)
+    private func computeAckIntervals(ranges: [AckRange], largestAcked: UInt64) -> [AckInterval] {
+        var intervals: [AckInterval] = []
+        intervals.reserveCapacity(ranges.count)
+
         var current = largestAcked
 
-        for (index, range) in ackFrame.ackRanges.enumerated() {
+        for (index, range) in ranges.enumerated() {
+            let rangeEnd: UInt64
             let rangeStart: UInt64
+
             if index == 0 {
-                // Validate: rangeLength must not exceed current to prevent underflow
-                guard range.rangeLength <= current else {
-                    // Invalid ACK range - skip this range
-                    continue
-                }
+                rangeEnd = current
+                guard range.rangeLength <= current else { break }
                 rangeStart = current - range.rangeLength
             } else {
-                // Validate: gap + 2 must not exceed current to prevent underflow
-                let gapOffset = range.gap + 2
-                guard gapOffset <= current else {
-                    // Invalid ACK gap - stop processing
-                    break
-                }
+                let gapOffset = range.gap + 1
+                guard gapOffset <= current else { break }
                 current = current - gapOffset
-                // Validate: rangeLength must not exceed current
-                guard range.rangeLength <= current else {
-                    continue
-                }
+                rangeEnd = current
+                guard range.rangeLength <= current else { break }
                 rangeStart = current - range.rangeLength
             }
 
-            // Skip packet numbers below smallestUnacked (they can't be in sentPackets)
-            let checkStart = max(rangeStart, smallestUnacked)
-
-            // Process only packets that might exist in sentPackets
-            if checkStart <= current {
-                for pn in checkStart...current {
-                    if let packet = state.sentPackets.removeValue(forKey: pn) {
-                        ackedPackets.append(packet)
-                        if packet.inFlight {
-                            state.bytesInFlight -= packet.sentBytes
-                        }
-                        if packet.ackEliciting {
-                            state.ackElicitingInFlight -= 1
-                        }
-
-                        // RTT sample from largest newly acked ack-eliciting packet
-                        if pn == largestAcked && packet.ackEliciting {
-                            rttSample = ackReceivedTime - packet.timeSent
-                        }
-                    }
-                }
-            }
+            intervals.append(AckInterval(start: rangeStart, end: rangeEnd))
             current = rangeStart
         }
+
+        return intervals
+    }
+
+    /// Checks if a packet number falls within any of the pre-computed intervals
+    /// using binary search for O(log n) lookup.
+    ///
+    /// Intervals are sorted by start (descending) and non-overlapping.
+    /// Binary search finds the first interval where end >= pn, then we check if start <= pn.
+    @inline(__always)
+    private func isPacketInIntervals(_ pn: UInt64, intervals: [AckInterval]) -> Bool {
+        // Binary search to find the first interval where end >= pn
+        // Since intervals are sorted descending (by both start and end),
+        // we find the first interval that could contain pn
+        var lo = 0
+        var hi = intervals.count
+
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            if intervals[mid].end < pn {
+                // This interval's end is below pn, look in earlier (larger) intervals
+                hi = mid
+            } else {
+                // This interval's end >= pn, might contain pn or answer is further right
+                lo = mid + 1
+            }
+        }
+
+        // lo points to one past the last interval where end >= pn
+        // Check if the interval at lo-1 contains pn
+        if lo > 0 {
+            let interval = intervals[lo - 1]
+            return pn >= interval.start && pn <= interval.end
+        }
+
+        return false
     }
 
     /// Internal loss detection algorithm (RFC 9002 Section 4.3)

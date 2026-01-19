@@ -263,6 +263,7 @@ public struct QUICConfiguration: Sendable {
         return config
     }
 
+    #if DEBUG
     /// Creates a testing configuration with MockTLSProvider.
     ///
     /// - Warning: **Never use in production.** This mode disables TLS encryption
@@ -276,12 +277,15 @@ public struct QUICConfiguration: Sendable {
     /// // Only in unit tests
     /// let config = QUICConfiguration.testing()
     /// ```
+    ///
+    /// - Note: This method is only available in DEBUG builds.
     @available(*, message: "Testing mode disables TLS encryption. Never use in production.")
     public static func testing() -> QUICConfiguration {
         var config = QUICConfiguration()
         config.securityMode = .testing
         return config
     }
+    #endif
 }
 
 // MARK: - Transport Parameters Extension

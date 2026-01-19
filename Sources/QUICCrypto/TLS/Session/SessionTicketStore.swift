@@ -260,7 +260,7 @@ public final class SessionTicketStore: Sendable {
 
     /// Remove a specific session
     public func removeSession(ticketId: Data) {
-        state.withLock { state in
+        _ = state.withLock { state in
             state.sessions.removeValue(forKey: ticketId)
         }
     }

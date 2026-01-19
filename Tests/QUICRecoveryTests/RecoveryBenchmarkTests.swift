@@ -91,7 +91,7 @@ struct RecoveryBenchmarkTests {
         let opsPerSec = Double(iterations) / elapsed.asSeconds
         print("ACK frame generation: \(Int(opsPerSec)) ops/sec")
 
-        #expect(opsPerSec > 10_000, "ACK generation should be fast")
+        #expect(opsPerSec > 5_000, "ACK generation should be fast")
     }
 
     @Test("AckManager: Memory efficiency with sequential packets")

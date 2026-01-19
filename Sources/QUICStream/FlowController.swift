@@ -423,6 +423,8 @@ public struct FlowController: Sendable {
     public mutating func generateMaxStreams(bidirectional: Bool) -> MaxStreamsFrame? {
         // Simple auto-increase: when 50% of streams are used, increase limit
         if bidirectional {
+            // Skip auto-increase if streams are disabled (limit = 0)
+            guard maxLocalBidiStreams > 0 else { return nil }
             let threshold = maxLocalBidiStreams / 2
             if openRemoteBidiStreams >= threshold {
                 // Overflow protection
@@ -431,6 +433,8 @@ public struct FlowController: Sendable {
                 return MaxStreamsFrame(maxStreams: maxLocalBidiStreams, isBidirectional: true)
             }
         } else {
+            // Skip auto-increase if streams are disabled (limit = 0)
+            guard maxLocalUniStreams > 0 else { return nil }
             let threshold = maxLocalUniStreams / 2
             if openRemoteUniStreams >= threshold {
                 // Overflow protection

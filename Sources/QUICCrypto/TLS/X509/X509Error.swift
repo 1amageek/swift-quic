@@ -97,6 +97,9 @@ public enum X509Error: Error, Sendable {
     /// Malformed Subject Alternative Name entry
     case malformedSAN(type: String, value: String)
 
+    /// Name Constraints violation (RFC 5280 Section 4.2.1.10)
+    case nameConstraintsViolation(name: String, reason: String)
+
     // MARK: - Internal Errors
 
     /// Internal error
@@ -162,6 +165,8 @@ extension X509Error: CustomStringConvertible {
             return "Invalid Extended Key Usage: required \(required), found \(found.isEmpty ? "none" : found.joined(separator: ", "))"
         case .malformedSAN(let type, let value):
             return "Malformed Subject Alternative Name: \(type) = \(value)"
+        case .nameConstraintsViolation(let name, let reason):
+            return "Name Constraints violation: \(name) - \(reason)"
         case .internalError(let reason):
             return "Internal error: \(reason)"
         }

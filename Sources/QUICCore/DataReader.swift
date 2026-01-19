@@ -94,10 +94,11 @@ public struct DataReader: Sendable {
 
     /// Peeks at the specified number of bytes without advancing the position
     /// - Parameter count: Number of bytes to peek
-    /// - Returns: The bytes, or nil if insufficient bytes remaining
+    /// - Returns: The bytes as a slice (no copy), or nil if insufficient bytes remaining
+    @inlinable
     public func peekBytes(_ count: Int) -> Data? {
         guard remainingCount >= count else { return nil }
-        return Data(data[position..<(position + count)])
+        return data[position..<(position + count)]
     }
 
     /// Reads a UInt8 (1 byte)
@@ -132,9 +133,14 @@ public struct DataReader: Sendable {
     }
 
     /// Reads a QUIC variable-length integer
+    ///
+    /// This method uses an optimized internal path that avoids Data slice creation.
+    /// Performance is equivalent to `readVarintValue()`.
     @inlinable
     public mutating func readVarint() throws -> Varint {
-        try Varint.decode(from: &self)
+        // Use the fast path: readVarintValue() operates directly on data[position]
+        // without creating an intermediate Data slice via remainingData
+        return Varint(try readVarintValue())
     }
 
     /// Reads a QUIC variable-length integer value directly (faster than readVarint())
@@ -200,9 +206,55 @@ public struct DataReader: Sendable {
     }
 
     /// Peeks at the next varint without advancing the position
-    /// - Returns: The varint value and its encoded length, or nil if insufficient data
-    public func peekVarint() throws -> (Varint, Int) {
-        try Varint.decode(from: remainingData)
+    /// - Returns: The varint value and its encoded length
+    /// - Throws: `Varint.DecodeError` if insufficient data
+    ///
+    /// This method uses an optimized path that avoids Data slice creation.
+    @inlinable
+    public func peekVarint() throws -> (value: UInt64, length: Int) {
+        guard hasRemaining else {
+            throw Varint.DecodeError.insufficientData
+        }
+
+        let firstByte = data[position]
+        let prefix = firstByte >> 6
+
+        let length: Int
+        switch prefix {
+        case 0b00: length = 1
+        case 0b01: length = 2
+        case 0b10: length = 4
+        default:   length = 8  // 0b11
+        }
+
+        guard remainingCount >= length else {
+            throw Varint.DecodeError.insufficientData
+        }
+
+        let value: UInt64
+        switch length {
+        case 1:
+            value = UInt64(firstByte & 0x3F)
+        case 2:
+            value = UInt64(firstByte & 0x3F) << 8
+                | UInt64(data[position + 1])
+        case 4:
+            value = UInt64(firstByte & 0x3F) << 24
+                | UInt64(data[position + 1]) << 16
+                | UInt64(data[position + 2]) << 8
+                | UInt64(data[position + 3])
+        default: // 8
+            value = UInt64(firstByte & 0x3F) << 56
+                | UInt64(data[position + 1]) << 48
+                | UInt64(data[position + 2]) << 40
+                | UInt64(data[position + 3]) << 32
+                | UInt64(data[position + 4]) << 24
+                | UInt64(data[position + 5]) << 16
+                | UInt64(data[position + 6]) << 8
+                | UInt64(data[position + 7])
+        }
+
+        return (value, length)
     }
 }
 
@@ -284,6 +336,15 @@ public struct DataWriter: Sendable {
     @inlinable
     public mutating func writeVarint(_ value: UInt64) {
         Varint(value).encode(to: &data)
+    }
+
+    /// Writes zero bytes (0x00) efficiently
+    ///
+    /// Uses `Data(count:)` which is zero-initialized and faster than
+    /// `Data(repeating: 0x00, count:)` for large counts.
+    @inlinable
+    public mutating func writeZeroBytes(_ count: Int) {
+        data.append(Data(count: count))
     }
 
     /// Reserves space for later filling, returns the offset

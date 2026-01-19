@@ -891,7 +891,7 @@ public final class QUICConnectionHandler: Sendable {
     public func discardLevel(_ level: EncryptionLevel) {
         pnSpaceManager.discardLevel(level)
         cryptoStreamManager.discardLevel(level)
-        cryptoContexts.withLock { $0.removeValue(forKey: level) }
+        _ = cryptoContexts.withLock { $0.removeValue(forKey: level) }
         keySchedule.withLock { $0.discardKeys(for: level) }
     }
 }

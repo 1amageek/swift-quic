@@ -18,7 +18,8 @@ struct MockPacketSealer: PacketSealerProtocol {
         packetNumberBytes: Data
     ) throws -> (UInt8, Data) {
         // Simple XOR with first byte of sample
-        let mask = sample[0]
+        // Use sample.first to handle Data slices with non-zero startIndex
+        let mask = sample[sample.startIndex]
         let protectedFirstByte = firstByte ^ (mask & 0x0F)  // Mask lower 4 bits for long header
         let protectedPN = Data(packetNumberBytes.map { $0 ^ mask })
         return (protectedFirstByte, protectedPN)
@@ -47,7 +48,8 @@ struct MockPacketOpener: PacketOpenerProtocol {
         packetNumberBytes: Data
     ) throws -> (UInt8, Data) {
         // Simple XOR with first byte of sample (same as apply, XOR is symmetric)
-        let mask = sample[0]
+        // Use sample.startIndex to handle Data slices with non-zero startIndex
+        let mask = sample[sample.startIndex]
         let unprotectedFirstByte = firstByte ^ (mask & 0x0F)
         let unprotectedPN = Data(packetNumberBytes.map { $0 ^ mask })
         return (unprotectedFirstByte, unprotectedPN)

@@ -634,20 +634,32 @@ public final class ServerStateMachine: Sendable {
 
                 // Check if client offered early_data and session allows it
                 if clientHello.earlyData && session.maxEarlyDataSize > 0 {
-                    // Accept early data
-                    state.context.earlyDataState.attemptingEarlyData = true
-                    state.context.earlyDataState.earlyDataAccepted = true
-                    state.context.earlyDataState.maxEarlyDataSize = session.maxEarlyDataSize
-
-                    // Derive client early traffic secret (RFC 8446 Section 7.1)
-                    let earlyTranscript = state.context.transcriptHash.currentHash()
-                    if let earlyTrafficSecret = try? state.context.keySchedule.deriveClientEarlyTrafficSecret(
-                        transcriptHash: earlyTranscript
-                    ) {
-                        state.context.clientEarlyTrafficSecret = earlyTrafficSecret
-                        let secretData = earlyTrafficSecret.withUnsafeBytes { Data($0) }
-                        state.context.earlyDataState.clientEarlyTrafficSecret = secretData
+                    // Check replay protection if configured (RFC 8446 Section 8)
+                    // 0-RTT data can be replayed, so servers should track ticket usage
+                    var acceptEarlyData = true
+                    if let replayProtection = configuration.replayProtection {
+                        // Create ticket identifier from ticket nonce (unique per ticket)
+                        let ticketIdentifier = ReplayProtection.createIdentifier(from: session.ticketNonce)
+                        acceptEarlyData = replayProtection.shouldAcceptEarlyData(ticketIdentifier: ticketIdentifier)
                     }
+
+                    if acceptEarlyData {
+                        // Accept early data
+                        state.context.earlyDataState.attemptingEarlyData = true
+                        state.context.earlyDataState.earlyDataAccepted = true
+                        state.context.earlyDataState.maxEarlyDataSize = session.maxEarlyDataSize
+
+                        // Derive client early traffic secret (RFC 8446 Section 7.1)
+                        let earlyTranscript = state.context.transcriptHash.currentHash()
+                        if let earlyTrafficSecret = try? state.context.keySchedule.deriveClientEarlyTrafficSecret(
+                            transcriptHash: earlyTranscript
+                        ) {
+                            state.context.clientEarlyTrafficSecret = earlyTrafficSecret
+                            let secretData = earlyTrafficSecret.withUnsafeBytes { Data($0) }
+                            state.context.earlyDataState.clientEarlyTrafficSecret = secretData
+                        }
+                    }
+                    // If replay detected, early data is rejected but handshake continues with 1-RTT
                 }
             } else {
                 // No PSK - derive early secret with nil PSK

@@ -158,6 +158,16 @@ public struct TLSConfiguration: Sendable {
     /// Used by server to select key share group or send HelloRetryRequest
     public var supportedGroups: [NamedGroup]
 
+    /// Replay protection for 0-RTT early data (server only)
+    ///
+    /// When set, the server will check incoming 0-RTT tickets against this
+    /// replay protection instance. If a ticket has been seen before, the
+    /// 0-RTT data is rejected but the handshake continues with 1-RTT.
+    ///
+    /// - Important: For production deployments, always set this to prevent
+    ///   replay attacks on 0-RTT data.
+    public var replayProtection: ReplayProtection?
+
     /// Creates a default configuration
     public init() {
         self.alpnProtocols = ["h3"]
@@ -174,6 +184,7 @@ public struct TLSConfiguration: Sendable {
         self.sessionTicket = nil
         self.maxEarlyDataSize = 0
         self.supportedGroups = [.x25519, .secp256r1]
+        self.replayProtection = nil
     }
 
     /// Creates a client configuration

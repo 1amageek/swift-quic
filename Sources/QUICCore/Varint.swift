@@ -156,11 +156,15 @@ extension Varint {
     }
 
     /// Decodes a varint from a DataReader, advancing the reader position
+    ///
+    /// - Note: This method is deprecated. Use `DataReader.readVarint()` or
+    ///   `DataReader.readVarintValue()` instead for better performance.
+    ///   Those methods avoid creating intermediate Data slices.
+    @available(*, deprecated, message: "Use DataReader.readVarint() or readVarintValue() for better performance")
     @inlinable
     public static func decode(from reader: inout DataReader) throws -> Varint {
-        let (varint, bytesConsumed) = try decode(from: reader.remainingData)
-        reader.advance(by: bytesConsumed)
-        return varint
+        // Forward to the optimized path
+        return try reader.readVarint()
     }
 
     /// Returns the encoded length for the first varint in the data without fully decoding
@@ -198,5 +202,28 @@ extension Varint: CustomStringConvertible {
 extension Varint: Comparable {
     public static func < (lhs: Varint, rhs: Varint) -> Bool {
         lhs.value < rhs.value
+    }
+}
+
+// MARK: - Static Utilities
+
+extension Varint {
+    /// Returns the encoded length for a given value without creating a Varint instance
+    ///
+    /// This is useful for calculating frame sizes without allocating.
+    ///
+    /// - Parameter value: The value to check
+    /// - Returns: The number of bytes needed to encode this value (1, 2, 4, or 8)
+    @inlinable
+    public static func encodedLength(for value: UInt64) -> Int {
+        if value <= 63 {
+            return 1
+        } else if value <= 16383 {
+            return 2
+        } else if value <= 1_073_741_823 {
+            return 4
+        } else {
+            return 8
+        }
     }
 }

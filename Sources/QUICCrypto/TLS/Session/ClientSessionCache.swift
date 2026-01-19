@@ -247,7 +247,7 @@ public final class ClientSessionCache: Sendable {
     /// Removes all sessions for a server
     /// - Parameter serverIdentity: The server identity
     public func remove(for serverIdentity: String) {
-        state.withLock { s in
+        _ = state.withLock { s in
             s.sessions.removeValue(forKey: serverIdentity)
         }
     }
