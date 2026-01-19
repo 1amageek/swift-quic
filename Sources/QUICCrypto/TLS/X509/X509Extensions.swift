@@ -141,3 +141,95 @@ extension X509.NameConstraints {
         forbiddenURIDomains.isEmpty
     }
 }
+
+// MARK: - Extension Value Access
+
+extension X509Certificate {
+    /// Represents a raw X.509 extension with OID and value
+    public struct RawExtension: Sendable {
+        /// The extension OID
+        public let oid: ASN1ObjectIdentifier
+
+        /// Whether this extension is critical
+        public let critical: Bool
+
+        /// The raw extension value (DER-encoded OCTET STRING contents)
+        public let value: Data
+
+        public init(oid: ASN1ObjectIdentifier, critical: Bool, value: Data) {
+            self.oid = oid
+            self.critical = critical
+            self.value = value
+        }
+    }
+
+    /// Gets the raw value of an extension by OID
+    ///
+    /// - Parameter oid: The OID to search for (e.g., "1.3.6.1.4.1.53594.1.1" for libp2p)
+    /// - Returns: The raw extension value if found, nil otherwise
+    public func extensionValue(for oid: String) -> Data? {
+        guard let targetOID = try? ASN1ObjectIdentifier(dotRepresentation: oid) else {
+            return nil
+        }
+        return extensionValue(for: targetOID)
+    }
+
+    /// Gets the raw value of an extension by OID
+    ///
+    /// - Parameter oid: The OID to search for
+    /// - Returns: The raw extension value if found, nil otherwise
+    public func extensionValue(for oid: ASN1ObjectIdentifier) -> Data? {
+        // Iterate through all extensions
+        for ext in certificate.extensions {
+            if ext.oid == oid {
+                // Return the raw value bytes
+                var serializer = DER.Serializer()
+                do {
+                    try ext.value.serialize(into: &serializer)
+                    return Data(serializer.serializedBytes)
+                } catch {
+                    return nil
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Gets a raw extension by OID including criticality
+    ///
+    /// - Parameter oid: The OID to search for
+    /// - Returns: The raw extension if found, nil otherwise
+    public func rawExtension(for oid: String) -> RawExtension? {
+        guard let targetOID = try? ASN1ObjectIdentifier(dotRepresentation: oid) else {
+            return nil
+        }
+
+        for ext in certificate.extensions {
+            if ext.oid == targetOID {
+                var serializer = DER.Serializer()
+                do {
+                    try ext.value.serialize(into: &serializer)
+                    return RawExtension(
+                        oid: ext.oid,
+                        critical: ext.critical,
+                        value: Data(serializer.serializedBytes)
+                    )
+                } catch {
+                    return nil
+                }
+            }
+        }
+        return nil
+    }
+
+    /// The libp2p extension OID
+    public static let libp2pExtensionOID = "1.3.6.1.4.1.53594.1.1"
+
+    /// Gets the libp2p extension value if present
+    ///
+    /// The libp2p extension contains a SignedKey structure with the peer's
+    /// public key and a signature over the TLS certificate's SPKI.
+    public var libp2pExtensionValue: Data? {
+        extensionValue(for: Self.libp2pExtensionOID)
+    }
+}

@@ -60,6 +60,20 @@ public struct X509Certificate: Sendable {
         certificate.publicKey
     }
 
+    /// Subject Public Key Info (SPKI) DER-encoded bytes
+    ///
+    /// This is the DER encoding of the SubjectPublicKeyInfo structure,
+    /// which includes the algorithm identifier and the public key bits.
+    public var subjectPublicKeyInfoDER: Data {
+        var serializer = DER.Serializer()
+        do {
+            try certificate.publicKey.serialize(into: &serializer)
+            return Data(serializer.serializedBytes)
+        } catch {
+            return Data()
+        }
+    }
+
     /// Extensions (v3 only)
     public var extensions: X509CertificateBase.Extensions {
         certificate.extensions
