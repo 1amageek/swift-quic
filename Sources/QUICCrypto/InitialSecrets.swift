@@ -132,6 +132,14 @@ public struct KeyMaterial: Sendable {
     ///   - secret: The secret to derive from
     ///   - cipherSuite: The cipher suite to use
     /// - Returns: The derived key material
+    ///
+    /// RFC 9001 Section 5.1 specifies QUIC packet protection keys:
+    /// - quic key = HKDF-Expand-Label(Secret, "quic key", "", key_len)
+    /// - quic iv = HKDF-Expand-Label(Secret, "quic iv", "", 12)
+    /// - quic hp = HKDF-Expand-Label(Secret, "quic hp", "", key_len)
+    ///
+    /// The HkdfLabel uses "tls13 " prefix per RFC 8446, so final labels are:
+    /// "tls13 quic key", "tls13 quic iv", "tls13 quic hp"
     public static func derive(
         from secret: SymmetricKey,
         cipherSuite: QUICCipherSuite
@@ -141,6 +149,7 @@ public struct KeyMaterial: Sendable {
         let ivLength = cipherSuite.ivLength
         let hpLength = cipherSuite.hpKeyLength
 
+        // Labels per RFC 9001 Section 5.1 - "tls13 " prefix is added by hkdfExpandLabel
         let key = try hkdfExpandLabel(
             secret: secret,
             label: "quic key",
@@ -196,20 +205,52 @@ public struct KeyMaterial: Sendable {
 /// Where HkdfLabel is:
 ///     struct {
 ///         uint16 length = Length;
-///         opaque label<7..255> = "tls13 " + Label;
+///         opaque label<7..255> = prefix + Label;
 ///         opaque context<0..255> = Context;
 ///     } HkdfLabel;
+///
+/// For TLS 1.3, prefix is "tls13 " (RFC 8446 Section 7.1)
+/// For QUIC packet keys, prefix is "quic " (RFC 9001 Section 5.1 - but labels are passed complete)
+/// Pre-computed label bytes for common QUIC labels (avoids repeated string concatenation)
+private enum HKDFLabels {
+    // "tls13 " prefix + label
+    static let clientIn = Data("tls13 client in".utf8)
+    static let serverIn = Data("tls13 server in".utf8)
+    static let quicKey = Data("tls13 quic key".utf8)
+    static let quicIV = Data("tls13 quic iv".utf8)
+    static let quicHP = Data("tls13 quic hp".utf8)
+
+    /// Returns cached label bytes if available, otherwise computes them
+    @inline(__always)
+    static func labelBytes(for label: String, prefix: String) -> Data {
+        // Fast path for common labels
+        if prefix == "tls13 " {
+            switch label {
+            case "client in": return clientIn
+            case "server in": return serverIn
+            case "quic key": return quicKey
+            case "quic iv": return quicIV
+            case "quic hp": return quicHP
+            default: break
+            }
+        }
+        // Slow path for uncommon labels
+        return Data((prefix + label).utf8)
+    }
+}
+
 func hkdfExpandLabel(
     secret: SymmetricKey,
     label: String,
     context: Data,
-    length: Int
+    length: Int,
+    labelPrefix: String = "tls13 "
 ) throws -> Data {
-    // Build HkdfLabel structure
-    let fullLabel = "tls13 " + label
-    let labelBytes = Data(fullLabel.utf8)
+    // Get label bytes (cached for common labels)
+    let labelBytes = HKDFLabels.labelBytes(for: label, prefix: labelPrefix)
 
-    var hkdfLabel = Data()
+    // Pre-allocate hkdfLabel with exact capacity: 2 + 1 + labelBytes.count + 1 + context.count
+    var hkdfLabel = Data(capacity: 4 + labelBytes.count + context.count)
 
     // uint16 length
     hkdfLabel.append(UInt8(length >> 8))

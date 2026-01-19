@@ -23,7 +23,9 @@ public struct CoalescedPacketBuilder: Sendable {
     /// - Parameter maxDatagramSize: Maximum size of the UDP datagram (default: 1200)
     public init(maxDatagramSize: Int = 1200) {
         self.maxDatagramSize = maxDatagramSize
+        // Pre-allocate for typical case of 2-3 coalesced packets
         self.packets = []
+        self.packets.reserveCapacity(3)
         self.currentSize = 0
     }
 
@@ -108,7 +110,9 @@ public struct CoalescedPacketParser: Sendable {
             throw ParseError.emptyDatagram
         }
 
+        // Pre-allocate for typical case of 2-3 coalesced packets
         var packets: [PacketInfo] = []
+        packets.reserveCapacity(3)
         var offset = datagram.startIndex
 
         while offset < datagram.endIndex {
@@ -138,9 +142,11 @@ public struct CoalescedPacketParser: Sendable {
                 throw ParseError.packetLengthExceedsDatagram
             }
 
+            // Use slice directly without copying - Data slices share the underlying storage
+            // via copy-on-write semantics, avoiding unnecessary allocations
             let packetData = datagram[packetStart..<(packetStart + packetLength)]
             packets.append(PacketInfo(
-                data: Data(packetData),
+                data: packetData,  // Slice, not copy
                 isLongHeader: isLongHeader,
                 offset: packetStart - datagram.startIndex
             ))
@@ -157,13 +163,16 @@ public struct CoalescedPacketParser: Sendable {
     }
 
     /// Parses the length of a long header packet
+    ///
+    /// Optimized to create DataReader directly from slice (avoids advance overhead),
+    /// use `readVarintValue()` instead of `readVarint()` for performance.
     private static func parseLongHeaderPacketLength(
         datagram: Data,
         startOffset: Data.Index
     ) throws -> Int {
-        var reader = DataReader(datagram)
-        // Skip to the start offset
-        reader.advance(by: startOffset - datagram.startIndex)
+        // Create reader directly from slice at startOffset - avoids advance() overhead
+        let packetSlice = datagram[startOffset...]
+        var reader = DataReader(packetSlice)
 
         guard let firstByte = reader.readByte() else {
             throw ParseError.insufficientData
@@ -183,88 +192,92 @@ public struct CoalescedPacketParser: Sendable {
             guard let dcidLen = reader.readByte() else {
                 throw ParseError.insufficientData
             }
-            guard reader.readBytes(Int(dcidLen)) != nil else {
+            guard reader.remainingCount >= Int(dcidLen) else {
                 throw ParseError.insufficientData
             }
+            reader.advance(by: Int(dcidLen))  // Skip DCID bytes without allocating
+
             guard let scidLen = reader.readByte() else {
                 throw ParseError.insufficientData
             }
-            guard reader.readBytes(Int(scidLen)) != nil else {
+            guard reader.remainingCount >= Int(scidLen) else {
                 throw ParseError.insufficientData
             }
+            reader.advance(by: Int(scidLen))  // Skip SCID bytes without allocating
             // Version Negotiation consumes the rest
-            return datagram.endIndex - startOffset
+            return packetSlice.count
         }
 
-        // Read DCID
+        // Read DCID length and skip DCID
         guard let dcidLen = reader.readByte() else {
             throw ParseError.insufficientData
         }
-        guard reader.readBytes(Int(dcidLen)) != nil else {
+        guard reader.remainingCount >= Int(dcidLen) else {
             throw ParseError.insufficientData
         }
+        reader.advance(by: Int(dcidLen))  // Skip DCID bytes without allocating
 
-        // Read SCID
+        // Read SCID length and skip SCID
         guard let scidLen = reader.readByte() else {
             throw ParseError.insufficientData
         }
-        guard reader.readBytes(Int(scidLen)) != nil else {
+        guard reader.remainingCount >= Int(scidLen) else {
             throw ParseError.insufficientData
         }
+        reader.advance(by: Int(scidLen))  // Skip SCID bytes without allocating
 
         // Determine packet type
         let packetType = (firstByte >> 4) & 0x03
 
         switch packetType {
         case 0x00:  // Initial
-            // Read token length
-            let tokenLength = try reader.readVarint()
+            // Read token length and skip token
+            let tokenLength = try reader.readVarintValue()
             let safeTokenLength = try SafeConversions.toInt(
-                tokenLength.value,
+                tokenLength,
                 maxAllowed: ProtocolLimits.maxInitialTokenLength,
                 context: "Initial packet token length (coalesced)"
             )
-            guard reader.readBytes(safeTokenLength) != nil else {
+            guard reader.remainingCount >= safeTokenLength else {
                 throw ParseError.insufficientData
             }
+            reader.advance(by: safeTokenLength)  // Skip token bytes without allocating
+
             // Read Length field
-            let length = try reader.readVarint()
-            // Total length: header so far + packet number + payload
-            let headerLength = reader.currentPosition - (startOffset - datagram.startIndex)
+            let length = try reader.readVarintValue()
+            // Total length: header bytes read + payload length (currentPosition is relative to slice)
             let safeLength = try SafeConversions.toInt(
-                length.value,
+                length,
                 maxAllowed: ProtocolLimits.maxLongHeaderLength,
                 context: "Initial packet length field"
             )
-            return try SafeConversions.add(headerLength, safeLength)
+            return try SafeConversions.add(reader.currentPosition, safeLength)
 
         case 0x01:  // 0-RTT
             // Read Length field
-            let length = try reader.readVarint()
-            let headerLength = reader.currentPosition - (startOffset - datagram.startIndex)
+            let length = try reader.readVarintValue()
             let safeLength = try SafeConversions.toInt(
-                length.value,
+                length,
                 maxAllowed: ProtocolLimits.maxLongHeaderLength,
                 context: "0-RTT packet length field"
             )
-            return try SafeConversions.add(headerLength, safeLength)
+            return try SafeConversions.add(reader.currentPosition, safeLength)
 
         case 0x02:  // Handshake
             // Read Length field
-            let length = try reader.readVarint()
-            let headerLength = reader.currentPosition - (startOffset - datagram.startIndex)
+            let length = try reader.readVarintValue()
             let safeLength = try SafeConversions.toInt(
-                length.value,
+                length,
                 maxAllowed: ProtocolLimits.maxLongHeaderLength,
                 context: "Handshake packet length field"
             )
-            return try SafeConversions.add(headerLength, safeLength)
+            return try SafeConversions.add(reader.currentPosition, safeLength)
 
         case 0x03:  // Retry
             // Retry packets have no Length field
             // They end at the integrity tag (16 bytes at the end)
             // Retry consumes the rest of the datagram
-            return datagram.endIndex - startOffset
+            return packetSlice.count
 
         default:
             throw ParseError.invalidPacketHeader

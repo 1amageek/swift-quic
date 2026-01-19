@@ -263,10 +263,10 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 | Operation | Performance |
 |-----------|-------------|
 | Short header parsing | 6.3M ops/sec |
-| Long header parsing | 228K ops/sec |
+| Long header parsing | 1.8M ops/sec |
 | DCID extraction (short) | 835K ops/sec |
 | DCID extraction (long) | 923K ops/sec |
-| ConnectionRouter lookup | 428K ops/sec |
+| ConnectionRouter lookup | 6.6M ops/sec |
 | Packet type extraction | 7.8M ops/sec |
 
 ### Core Operations
@@ -297,7 +297,7 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 
 | Operation | Performance |
 |-----------|-------------|
-| Initial key derivation | 13.1K ops/sec |
+| Initial key derivation | 21K ops/sec |
 | KeyMaterial derivation | 49.6K ops/sec |
 | AES-GCM Sealer creation | 12.0M ops/sec |
 
@@ -308,7 +308,7 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 | Packet number encoding | 4.8M ops/sec |
 | Packet number decoding | 10.2M ops/sec |
 | Coalesced packet building | 823K ops/sec |
-| Coalesced packet parsing | 133K ops/sec |
+| Coalesced packet parsing | 677K ops/sec |
 
 ### Recovery Performance
 

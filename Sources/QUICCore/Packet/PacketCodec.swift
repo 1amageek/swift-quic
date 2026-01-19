@@ -409,11 +409,11 @@ public struct PacketDecoder: Sendable {
         let sample = data[(data.startIndex + sampleOffset)..<(data.startIndex + sampleOffset + 16)]
         let protectedFirstByte = data[data.startIndex]
 
-        // Remove header protection
+        // Remove header protection (slices are already Data, no copy needed)
         let (unprotectedFirstByte, unprotectedPNBytes) = try opener.removeHeaderProtection(
-            sample: Data(sample),
+            sample: sample,
             firstByte: protectedFirstByte,
-            packetNumberBytes: Data(protectedPNBytes)
+            packetNumberBytes: protectedPNBytes
         )
 
         // NOW we can get the actual packet number length from unprotected first byte
@@ -524,11 +524,11 @@ public struct PacketDecoder: Sendable {
         let sample = data[(data.startIndex + sampleOffset)..<(data.startIndex + sampleOffset + 16)]
         let protectedFirstByte = data[data.startIndex]
 
-        // Remove header protection
+        // Remove header protection (slices are already Data, no copy needed)
         let (unprotectedFirstByte, unprotectedPNBytes) = try opener.removeHeaderProtection(
-            sample: Data(sample),
+            sample: sample,
             firstByte: protectedFirstByte,
-            packetNumberBytes: Data(protectedPNBytes)
+            packetNumberBytes: protectedPNBytes
         )
 
         // NOW we can get the actual packet number length from unprotected first byte
@@ -548,7 +548,7 @@ public struct PacketDecoder: Sendable {
         // Extract DCID
         let dcidStart = data.startIndex + 1
         let dcidBytes = data[dcidStart..<(dcidStart + dcidLength)]
-        let dcid = try ConnectionID(bytes: Data(dcidBytes))
+        let dcid = try ConnectionID(bytes: dcidBytes)  // Slice is already Data
 
         // Build AAD
         var aad = Data()

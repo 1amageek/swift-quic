@@ -120,11 +120,15 @@ public actor QUICEndpoint {
             case .development(let factory):
                 return factory()
             case .testing:
+                #if DEBUG
                 logger.warning(
                     "Using MockTLSProvider in testing mode - NOT FOR PRODUCTION USE",
                     metadata: ["isClient": "\(isClient)"]
                 )
                 return MockTLSProvider(configuration: TLSConfiguration())
+                #else
+                fatalError("Testing mode is not available in release builds. Configure a real TLS provider using QUICConfiguration.production() or QUICConfiguration.development().")
+                #endif
             }
         }
 
@@ -162,6 +166,7 @@ public actor QUICEndpoint {
             case .development(let factory):
                 return factory()
             case .testing:
+                #if DEBUG
                 logger.warning(
                     "Using MockTLSProvider in testing mode - NOT FOR PRODUCTION USE",
                     metadata: ["isClient": "\(isClient)"]
@@ -172,6 +177,9 @@ public actor QUICEndpoint {
                     tlsConfig.maxEarlyDataSize = maxSize
                 }
                 return MockTLSProvider(configuration: tlsConfig)
+                #else
+                fatalError("Testing mode is not available in release builds. Configure a real TLS provider using QUICConfiguration.production() or QUICConfiguration.development().")
+                #endif
             }
         }
 
@@ -547,7 +555,7 @@ public actor QUICEndpoint {
         guard dcidLength <= ConnectionID.maxLength else { return }
         guard data.count >= 6 + dcidLength else { return }
         let dcidBytes = data[6..<(6 + dcidLength)]
-        let vnDCID = try ConnectionID(bytes: Data(dcidBytes))
+        let vnDCID = try ConnectionID(bytes: dcidBytes)  // Slice is already Data
 
         // Try to find a connection with this SCID
         guard let connection = router.connection(for: vnDCID) else {
@@ -751,8 +759,8 @@ public actor QUICEndpoint {
                     try await socket.send(response, to: packet.remoteAddress)
                 }
             } catch {
-                // Log error but continue processing
-                // In production, would use swift-log here
+                // Log error for debugging
+                print("[QUICEndpoint] Error processing packet from \(remoteAddress): \(error)")
             }
         }
     }

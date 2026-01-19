@@ -275,7 +275,7 @@ public final class ConnectionRouter: Sendable {
 
         // SCID
         let scidBytes = data[offset..<(offset + scidLen)]
-        return try ConnectionID(bytes: Data(scidBytes))
+        return try ConnectionID(bytes: scidBytes)  // Slice is already Data
     }
 }
 
