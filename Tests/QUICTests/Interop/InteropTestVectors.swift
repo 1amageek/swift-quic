@@ -140,12 +140,12 @@ public struct VersionNegotiationTestData {
     public static let serverVersions: [QUICVersion] = [.v1, .v2]
 
     /// Sample destination CID for VN packet
-    public static let destinationCID = ConnectionID(Data([
+    public static let destinationCID = try! ConnectionID(Data([
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
     ]))
 
     /// Sample source CID for VN packet
-    public static let sourceCID = ConnectionID(Data([
+    public static let sourceCID = try! ConnectionID(Data([
         0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18
     ]))
 }

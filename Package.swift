@@ -144,5 +144,17 @@ let package = Package(
             dependencies: ["QUIC", "QUICRecovery", "QUICTransport"],
             path: "Tests/QUICTests"
         ),
+
+        // MARK: - Benchmarks (run separately with: swift test --filter QUICBenchmarks)
+
+        .testTarget(
+            name: "QUICBenchmarks",
+            dependencies: [
+                "QUIC",
+                "QUICCore",
+                "QUICCrypto",
+            ],
+            path: "Tests/QUICBenchmarks"
+        ),
     ]
 )

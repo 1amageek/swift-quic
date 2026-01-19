@@ -20,87 +20,102 @@ struct ConnectionIDTests {
     }
 
     @Test("Create from bytes")
-    func createFromBytes() {
+    func createFromBytes() throws {
         let bytes = Data([0x01, 0x02, 0x03, 0x04])
-        let cid = ConnectionID(bytes: bytes)
+        let cid = try ConnectionID(bytes: bytes)
         #expect(cid.length == 4)
         #expect(cid.bytes == bytes)
         #expect(cid.isEmpty == false)
     }
 
     @Test("Create from sequence")
-    func createFromSequence() {
-        let cid = ConnectionID([0xAA, 0xBB, 0xCC])
+    func createFromSequence() throws {
+        let cid = try ConnectionID([0xAA, 0xBB, 0xCC])
         #expect(cid.length == 3)
         #expect(cid.bytes == Data([0xAA, 0xBB, 0xCC]))
+    }
+
+    @Test("Create from bytes fails for oversized input")
+    func createFromBytesFailsForOversized() {
+        let oversizedBytes = Data(repeating: 0xAA, count: 21)
+        #expect(throws: ConnectionID.ConnectionIDError.self) {
+            _ = try ConnectionID(bytes: oversizedBytes)
+        }
     }
 
     // MARK: - Random Generation Tests (Memory Safety)
 
     @Test("Random with length 0")
-    func randomLength0() {
-        let cid = ConnectionID.random(length: 0)
+    func randomLength0() throws {
+        let cid = try #require(ConnectionID.random(length: 0))
         #expect(cid.isEmpty == true)
         #expect(cid.length == 0)
     }
 
     @Test("Random with length 1 (edge case < 8)")
-    func randomLength1() {
+    func randomLength1() throws {
         // This was the bug: length < 8 caused buffer overflow with unsafe pointer
-        let cid = ConnectionID.random(length: 1)
+        let cid = try #require(ConnectionID.random(length: 1))
         #expect(cid.length == 1)
         #expect(cid.bytes.count == 1)
     }
 
     @Test("Random with length 7 (edge case < 8)")
-    func randomLength7() {
+    func randomLength7() throws {
         // Another edge case: 7 bytes, less than one UInt64
-        let cid = ConnectionID.random(length: 7)
+        let cid = try #require(ConnectionID.random(length: 7))
         #expect(cid.length == 7)
         #expect(cid.bytes.count == 7)
     }
 
     @Test("Random with default length 8")
-    func randomLength8() {
-        let cid = ConnectionID.random()
+    func randomLength8() throws {
+        let cid = try #require(ConnectionID.random())
         #expect(cid.length == 8)
         #expect(cid.bytes.count == 8)
     }
 
     @Test("Random with length 9 (1 full + partial)")
-    func randomLength9() {
-        let cid = ConnectionID.random(length: 9)
+    func randomLength9() throws {
+        let cid = try #require(ConnectionID.random(length: 9))
         #expect(cid.length == 9)
         #expect(cid.bytes.count == 9)
     }
 
     @Test("Random with length 16 (2 full UInt64)")
-    func randomLength16() {
-        let cid = ConnectionID.random(length: 16)
+    func randomLength16() throws {
+        let cid = try #require(ConnectionID.random(length: 16))
         #expect(cid.length == 16)
         #expect(cid.bytes.count == 16)
     }
 
     @Test("Random with max length 20")
-    func randomLength20() {
-        let cid = ConnectionID.random(length: 20)
+    func randomLength20() throws {
+        let cid = try #require(ConnectionID.random(length: 20))
         #expect(cid.length == 20)
         #expect(cid.bytes.count == 20)
     }
 
+    @Test("Random with invalid length returns nil")
+    func randomInvalidLength() {
+        #expect(ConnectionID.random(length: -1) == nil)
+        #expect(ConnectionID.random(length: 21) == nil)
+        #expect(ConnectionID.random(length: 100) == nil)
+    }
+
     @Test("Random generates different values")
-    func randomGeneratesDifferentValues() {
-        let cid1 = ConnectionID.random(length: 8)
-        let cid2 = ConnectionID.random(length: 8)
+    func randomGeneratesDifferentValues() throws {
+        let cid1 = try #require(ConnectionID.random(length: 8))
+        let cid2 = try #require(ConnectionID.random(length: 8))
         // Very unlikely to generate same random bytes
         #expect(cid1 != cid2)
     }
 
     @Test("Random all lengths from 1 to 20")
-    func randomAllLengths() {
+    func randomAllLengths() throws {
         // Comprehensive test for all valid lengths
         for length in 1...20 {
-            let cid = ConnectionID.random(length: length)
+            let cid = try #require(ConnectionID.random(length: length))
             #expect(cid.length == length, "Random failed for length \(length)")
             #expect(cid.bytes.count == length, "Bytes count mismatch for length \(length)")
         }
@@ -109,8 +124,8 @@ struct ConnectionIDTests {
     // MARK: - Encoding/Decoding Tests
 
     @Test("Encode with length prefix")
-    func encodeWithLengthPrefix() {
-        let cid = ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
+    func encodeWithLengthPrefix() throws {
+        let cid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
         let encoded = cid.encode()
 
         #expect(encoded.count == 4)  // 1 length byte + 3 data bytes
@@ -187,24 +202,24 @@ struct ConnectionIDTests {
     // MARK: - Equality Tests
 
     @Test("Equal connection IDs")
-    func equalConnectionIDs() {
-        let cid1 = ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
-        let cid2 = ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
+    func equalConnectionIDs() throws {
+        let cid1 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
+        let cid2 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
         #expect(cid1 == cid2)
     }
 
     @Test("Unequal connection IDs")
-    func unequalConnectionIDs() {
-        let cid1 = ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
-        let cid2 = ConnectionID(bytes: Data([0x01, 0x02, 0x04]))
+    func unequalConnectionIDs() throws {
+        let cid1 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
+        let cid2 = try ConnectionID(bytes: Data([0x01, 0x02, 0x04]))
         #expect(cid1 != cid2)
     }
 
     @Test("Hashable conformance")
-    func hashableConformance() {
-        let cid1 = ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
-        let cid2 = ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
-        let cid3 = ConnectionID(bytes: Data([0x04, 0x05, 0x06]))
+    func hashableConformance() throws {
+        let cid1 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
+        let cid2 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
+        let cid3 = try ConnectionID(bytes: Data([0x04, 0x05, 0x06]))
 
         var set = Set<ConnectionID>()
         set.insert(cid1)
@@ -223,8 +238,8 @@ struct ConnectionIDTests {
     }
 
     @Test("Description for non-empty")
-    func descriptionNonEmpty() {
-        let cid = ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
+    func descriptionNonEmpty() throws {
+        let cid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03]))
         #expect(cid.description == "ConnectionID(010203)")
     }
 }

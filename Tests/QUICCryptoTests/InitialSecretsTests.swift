@@ -10,7 +10,7 @@ struct InitialSecretsTests {
     func deriveInitialSecrets() throws {
         // Test vector from RFC 9001 Appendix A
         // Client DCID: 0x8394c8f03e515708
-        let dcid = ConnectionID(bytes: Data([0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]))
+        let dcid = try ConnectionID(bytes: Data([0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]))
 
         let secrets = try InitialSecrets.derive(connectionID: dcid, version: .v1)
 
@@ -22,7 +22,7 @@ struct InitialSecretsTests {
 
     @Test("Derive key material from secret")
     func deriveKeyMaterial() throws {
-        let dcid = ConnectionID(bytes: Data([0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]))
+        let dcid = try ConnectionID(bytes: Data([0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]))
         let secrets = try InitialSecrets.derive(connectionID: dcid, version: .v1)
 
         let clientKeys = try KeyMaterial.derive(from: secrets.clientSecret)
@@ -37,7 +37,7 @@ struct InitialSecretsTests {
 
     @Test("Version 2 uses different salt")
     func version2Salt() throws {
-        let dcid = ConnectionID.random(length: 8)
+        let dcid = try #require(ConnectionID.random(length: 8))
 
         let v1Secrets = try InitialSecrets.derive(connectionID: dcid, version: .v1)
         let v2Secrets = try InitialSecrets.derive(connectionID: dcid, version: .v2)

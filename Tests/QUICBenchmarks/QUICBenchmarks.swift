@@ -1,6 +1,10 @@
 /// Performance Benchmarks for QUIC module
 ///
-/// Run with: swift test --filter QUICBenchmark
+/// Run with: swift test --filter QUICBenchmarks
+///
+/// These benchmarks are separated from regular tests to avoid
+/// running them during normal CI builds. Run them explicitly
+/// when investigating performance bottlenecks.
 
 import Testing
 import Foundation
@@ -10,7 +14,7 @@ import Crypto
 @testable import QUICCrypto
 
 @Suite("QUIC Performance Benchmarks")
-struct QUICBenchmarkTests {
+struct QUICBenchmarks {
 
     // MARK: - ConnectionRouter Benchmarks
 
@@ -24,8 +28,8 @@ struct QUICBenchmarkTests {
 
         // Create test packet data (Initial packet format)
         let testPacket = createInitialPacketData(
-            dcid: ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])),
-            scid: ConnectionID(bytes: Data([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]))
+            dcid: try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])),
+            scid: try ConnectionID(bytes: Data([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]))
         )
 
         let remoteAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
@@ -70,8 +74,8 @@ struct QUICBenchmarkTests {
         let processor = PacketProcessor(dcidLength: 8)
 
         let longHeaderPacket = createInitialPacketData(
-            dcid: ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])),
-            scid: ConnectionID(bytes: Data([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]))
+            dcid: try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])),
+            scid: try ConnectionID(bytes: Data([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]))
         )
 
         let iterations = 100_000
@@ -91,7 +95,7 @@ struct QUICBenchmarkTests {
 
     @Test("PacketProcessor initial key derivation performance")
     func initialKeyDerivationPerformance() throws {
-        let connectionID = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
+        let connectionID = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
         let iterations = 1_000
 
         let start = CFAbsoluteTimeGetCurrent()
@@ -116,8 +120,8 @@ struct QUICBenchmarkTests {
 
         let packets = [
             createInitialPacketData(
-                dcid: ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])),
-                scid: ConnectionID(bytes: Data([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]))
+                dcid: try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])),
+                scid: try ConnectionID(bytes: Data([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]))
             ),
             Data([0x40, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00])  // Short header
         ]
@@ -184,7 +188,7 @@ struct QUICBenchmarkTests {
 
         let start = CFAbsoluteTimeGetCurrent()
         for _ in 0..<iterations {
-            _ = ConnectionID.random(length: 8)
+            _ = ConnectionID.random(length: 8)!
         }
         let elapsed = CFAbsoluteTimeGetCurrent() - start
 
@@ -195,8 +199,8 @@ struct QUICBenchmarkTests {
 
     @Test("ConnectionID hash performance")
     func connectionIDHashPerformance() throws {
-        let cids = (0..<100).map { i in
-            ConnectionID(bytes: Data([UInt8(i), 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]))
+        let cids = try (0..<100).map { i in
+            try ConnectionID(bytes: Data([UInt8(i), 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]))
         }
         let iterations = 100_000
 
@@ -218,8 +222,8 @@ struct QUICBenchmarkTests {
     func connectionIDDictionaryLookupPerformance() throws {
         // Simulate ConnectionRouter's internal lookup
         var dict: [ConnectionID: Int] = [:]
-        let cids = (0..<1000).map { i in
-            ConnectionID(bytes: Data([
+        let cids = try (0..<1000).map { i in
+            try ConnectionID(bytes: Data([
                 UInt8((i >> 8) & 0xFF),
                 UInt8(i & 0xFF),
                 0x02, 0x03, 0x04, 0x05, 0x06, 0x07

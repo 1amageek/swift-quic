@@ -416,20 +416,29 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
 
         // Validate rangeCount against remaining data
         // Each ACK range requires at least 2 bytes (minimum size of 2 varints)
-        // Also apply a hard upper limit to prevent memory exhaustion attacks
-        let maxReasonableRangeCount = min(UInt64(reader.remainingCount / 2), 10_000)
+        // Also apply protocol limit to prevent memory exhaustion attacks
+        let maxReasonableRangeCount = min(
+            UInt64(reader.remainingCount / 2),
+            ProtocolLimits.maxAckRanges
+        )
         guard rangeCount <= maxReasonableRangeCount else {
             throw FrameCodecError.invalidFrameFormat(
-                "ACK range count \(rangeCount) exceeds maximum reasonable value \(maxReasonableRangeCount)"
+                "ACK range count \(rangeCount) exceeds maximum allowed value \(maxReasonableRangeCount)"
             )
         }
 
         // Pre-allocate array capacity for performance
+        // Safe conversion: rangeCount is validated above to be <= maxAckRanges (256)
+        let safeRangeCount = try SafeConversions.toInt(
+            rangeCount,
+            maxAllowed: Int(ProtocolLimits.maxAckRanges),
+            context: "ACK range count"
+        )
         var ranges: [AckRange] = []
-        ranges.reserveCapacity(Int(rangeCount) + 1)
+        ranges.reserveCapacity(safeRangeCount + 1)
         ranges.append(AckRange(gap: 0, rangeLength: firstRangeLength))
 
-        for _ in 0..<rangeCount {
+        for _ in 0..<safeRangeCount {
             let gap = try reader.readVarintValue()
             let rangeLength = try reader.readVarintValue()
             ranges.append(AckRange(gap: gap, rangeLength: rangeLength))
@@ -474,7 +483,12 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     private func decodeCryptoFrame(from reader: inout DataReader) throws -> Frame {
         let offset = try reader.readVarintValue()
         let length = try reader.readVarintValue()
-        guard let data = reader.readBytes(Int(length)) else {
+        let safeLength = try SafeConversions.toInt(
+            length,
+            maxAllowed: ProtocolLimits.maxCryptoDataLength,
+            context: "CRYPTO frame data length"
+        )
+        guard let data = reader.readBytes(safeLength) else {
             throw FrameCodecError.insufficientData
         }
         return .crypto(CryptoFrame(offset: offset, data: data))
@@ -482,7 +496,12 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
 
     private func decodeNewTokenFrame(from reader: inout DataReader) throws -> Frame {
         let length = try reader.readVarintValue()
-        guard let token = reader.readBytes(Int(length)) else {
+        let safeLength = try SafeConversions.toInt(
+            length,
+            maxAllowed: ProtocolLimits.maxNewTokenLength,
+            context: "NEW_TOKEN frame token length"
+        )
+        guard let token = reader.readBytes(safeLength) else {
             throw FrameCodecError.insufficientData
         }
         return .newToken(token)
@@ -505,7 +524,12 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         let data: Data
         if hasLength {
             let length = try reader.readVarintValue()
-            guard let bytes = reader.readBytes(Int(length)) else {
+            let safeLength = try SafeConversions.toInt(
+                length,
+                maxAllowed: ProtocolLimits.maxStreamDataLength,
+                context: "STREAM frame data length"
+            )
+            guard let bytes = reader.readBytes(safeLength) else {
                 throw FrameCodecError.insufficientData
             }
             data = bytes
@@ -578,10 +602,10 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             throw FrameCodecError.insufficientData
         }
 
-        return .newConnectionID(NewConnectionIDFrame(
+        return .newConnectionID(try NewConnectionIDFrame(
             sequenceNumber: seqNum,
             retirePriorTo: retirePriorTo,
-            connectionID: ConnectionID(bytes: cidBytes),
+            connectionID: try ConnectionID(bytes: cidBytes),
             statelessResetToken: resetToken
         ))
     }
@@ -597,7 +621,12 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         let reasonLength = try reader.readVarintValue()
         let reasonPhrase: String
         if reasonLength > 0 {
-            guard let reasonBytes = reader.readBytes(Int(reasonLength)) else {
+            let safeLength = try SafeConversions.toInt(
+                reasonLength,
+                maxAllowed: ProtocolLimits.maxReasonPhraseLength,
+                context: "CONNECTION_CLOSE reason phrase length"
+            )
+            guard let reasonBytes = reader.readBytes(safeLength) else {
                 throw FrameCodecError.insufficientData
             }
             reasonPhrase = String(decoding: reasonBytes, as: UTF8.self)
@@ -617,7 +646,12 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         let data: Data
         if hasLength {
             let length = try reader.readVarintValue()
-            guard let bytes = reader.readBytes(Int(length)) else {
+            let safeLength = try SafeConversions.toInt(
+                length,
+                maxAllowed: ProtocolLimits.maxDatagramLength,
+                context: "DATAGRAM frame data length"
+            )
+            guard let bytes = reader.readBytes(safeLength) else {
                 throw FrameCodecError.insufficientData
             }
             data = bytes

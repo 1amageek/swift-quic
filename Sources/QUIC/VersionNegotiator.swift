@@ -215,8 +215,8 @@ public struct VersionNegotiator: Sendable {
 
         // RFC 9000 Section 6.2: The Destination Connection ID field MUST
         // match the Source Connection ID field from the Initial packet sent by the client
-        let receivedDCID = ConnectionID(bytes: dcidBytes)
-        let receivedSCID = ConnectionID(bytes: scidBytes)
+        let receivedDCID = try ConnectionID(bytes: dcidBytes)
+        let receivedSCID = try ConnectionID(bytes: scidBytes)
 
         guard receivedDCID == originalSCID else {
             throw QUICVersionError.invalidPacketFormat(

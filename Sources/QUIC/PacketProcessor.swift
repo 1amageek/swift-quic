@@ -361,7 +361,7 @@ public final class PacketProcessor: Sendable {
                 throw PacketCodecError.insufficientData
             }
             let dcidBytes = data[(data.startIndex + 1)..<(data.startIndex + 1 + dcid)]
-            return ConnectionID(bytes: Data(dcidBytes))
+            return try ConnectionID(bytes: Data(dcidBytes))
         }
     }
 
@@ -392,7 +392,7 @@ public final class PacketProcessor: Sendable {
         }
 
         let dcidBytes = data[(startIndex + 6)..<(startIndex + 6 + dcidLen)]
-        return ConnectionID(bytes: Data(dcidBytes))
+        return try ConnectionID(bytes: Data(dcidBytes))
     }
 
     /// Extracts packet type from a packet without decryption
@@ -470,7 +470,7 @@ public final class PacketProcessor: Sendable {
             }
             let dcidBytes = data[(startIndex + 1)..<(startIndex + 1 + dcidLen)]
             return HeaderInfo(
-                dcid: ConnectionID(bytes: Data(dcidBytes)),
+                dcid: try ConnectionID(bytes: Data(dcidBytes)),
                 packetType: .oneRTT,
                 scid: nil
             )
@@ -526,7 +526,7 @@ public final class PacketProcessor: Sendable {
         }
 
         let dcidBytes = data[offset..<(offset + dcidLen)]
-        let dcid = ConnectionID(bytes: Data(dcidBytes))
+        let dcid = try ConnectionID(bytes: Data(dcidBytes))
         offset += dcidLen
 
         // Extract SCID for Initial packets (needed for routing)
@@ -545,7 +545,7 @@ public final class PacketProcessor: Sendable {
                 throw PacketCodecError.insufficientData
             }
             let scidBytes = data[offset..<(offset + scidLen)]
-            scid = ConnectionID(bytes: Data(scidBytes))
+            scid = try ConnectionID(bytes: Data(scidBytes))
         }
 
         return HeaderInfo(dcid: dcid, packetType: packetType, scid: scid)

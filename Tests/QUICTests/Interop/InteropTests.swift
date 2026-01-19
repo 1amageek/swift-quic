@@ -35,7 +35,7 @@ struct RFC9001TestVectorTests {
 
     @Test("Initial secrets derivation matches RFC 9001 A.1")
     func initialSecretsDerivation() throws {
-        let dcid = ConnectionID(RFC9001TestVectors.clientDCID)
+        let dcid = try ConnectionID(RFC9001TestVectors.clientDCID)
 
         // Derive initial secrets
         let secrets = try InitialSecrets.derive(
@@ -58,7 +58,7 @@ struct RFC9001TestVectorTests {
 
     @Test("Client keys derivation matches RFC 9001 A.1")
     func clientKeysDerivation() throws {
-        let dcid = ConnectionID(RFC9001TestVectors.clientDCID)
+        let dcid = try ConnectionID(RFC9001TestVectors.clientDCID)
 
         // Derive keys
         let secrets = try InitialSecrets.derive(
@@ -89,7 +89,7 @@ struct RFC9001TestVectorTests {
 
     @Test("Server keys derivation matches RFC 9001 A.1")
     func serverKeysDerivation() throws {
-        let dcid = ConnectionID(RFC9001TestVectors.clientDCID)
+        let dcid = try ConnectionID(RFC9001TestVectors.clientDCID)
 
         // Derive keys
         let secrets = try InitialSecrets.derive(
@@ -126,9 +126,9 @@ struct RetryIntegrityTagTests {
 
     @Test("Retry Integrity Tag round-trip")
     func retryIntegrityTagRoundTrip() throws {
-        let originalDCID = ConnectionID(RFC9001TestVectors.clientDCID)
-        let destinationCID = ConnectionID(Data())
-        let sourceCID = ConnectionID(Data([
+        let originalDCID = try ConnectionID(RFC9001TestVectors.clientDCID)
+        let destinationCID = try ConnectionID(Data())
+        let sourceCID = try ConnectionID(Data([
             0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5
         ]))
         let retryToken = Data([0x74, 0x6f, 0x6b, 0x65, 0x6e]) // "token"
@@ -164,9 +164,9 @@ struct RetryIntegrityTagTests {
 
     @Test("Retry Integrity Tag verification works")
     func retryIntegrityTagVerification() throws {
-        let originalDCID = ConnectionID(RFC9001TestVectors.clientDCID)
-        let destinationCID = ConnectionID(Data())
-        let sourceCID = ConnectionID(Data([
+        let originalDCID = try ConnectionID(RFC9001TestVectors.clientDCID)
+        let destinationCID = try ConnectionID(Data())
+        let sourceCID = try ConnectionID(Data([
             0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5
         ]))
         let retryToken = Data([0x74, 0x6f, 0x6b, 0x65, 0x6e])
@@ -197,9 +197,9 @@ struct RetryIntegrityTagTests {
 
     @Test("Invalid Retry Integrity Tag is rejected")
     func invalidRetryIntegrityTagRejected() throws {
-        let originalDCID = ConnectionID(RFC9001TestVectors.clientDCID)
-        let destinationCID = ConnectionID(Data())
-        let sourceCID = ConnectionID(Data([
+        let originalDCID = try ConnectionID(RFC9001TestVectors.clientDCID)
+        let destinationCID = try ConnectionID(Data())
+        let sourceCID = try ConnectionID(Data([
             0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5
         ]))
         let retryToken = Data([0x74, 0x6f, 0x6b, 0x65, 0x6e])
@@ -231,9 +231,9 @@ struct RetryIntegrityTagTests {
 
     @Test("Retry packet is detected correctly")
     func retryPacketDetection() throws {
-        let originalDCID = ConnectionID.random(length: 8)
-        let destinationCID = ConnectionID.random(length: 8)
-        let sourceCID = ConnectionID.random(length: 8)
+        let originalDCID = try #require(ConnectionID.random(length: 8))
+        let destinationCID = try #require(ConnectionID.random(length: 8))
+        let sourceCID = try #require(ConnectionID.random(length: 8))
         let retryToken = Data([0x01, 0x02, 0x03, 0x04])
 
         let retryPacket = try RetryIntegrityTag.createRetryPacket(
@@ -350,8 +350,8 @@ struct WireFormatTests {
     @Test("Initial packet minimum size is 1200 bytes")
     func initialPacketMinimumSize() throws {
         let processor = PacketProcessor(dcidLength: 8)
-        let dcid = ConnectionID.random(length: 8)
-        let scid = ConnectionID.random(length: 8)
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let scid = try #require(ConnectionID.random(length: 8))
 
         let (_, _) = try processor.deriveAndInstallInitialKeys(
             connectionID: dcid,
@@ -383,8 +383,8 @@ struct WireFormatTests {
     @Test("Long header format is correct")
     func longHeaderFormat() throws {
         let processor = PacketProcessor(dcidLength: 8)
-        let dcid = ConnectionID.random(length: 8)
-        let scid = ConnectionID.random(length: 8)
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let scid = try #require(ConnectionID.random(length: 8))
 
         let (_, _) = try processor.deriveAndInstallInitialKeys(
             connectionID: dcid,
@@ -422,9 +422,9 @@ struct WireFormatTests {
     }
 
     @Test("Connection ID encoding is correct")
-    func connectionIDEncoding() {
+    func connectionIDEncoding() throws {
         let cidData = Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
-        let cid = ConnectionID(cidData)
+        let cid = try ConnectionID(cidData)
 
         #expect(cid.bytes == cidData)
         #expect(cid.length == 8)
@@ -468,8 +468,8 @@ struct PacketCoalescingTests {
     @Test("Multiple packets can be coalesced in one datagram")
     func multiplePacketsCoalesced() throws {
         // Create Initial + Handshake packets (simulating coalesced datagram)
-        let dcid = ConnectionID.random(length: 8)
-        let scid = ConnectionID.random(length: 8)
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let scid = try #require(ConnectionID.random(length: 8))
 
         let processor = PacketProcessor(dcidLength: 8)
         let (_, _) = try processor.deriveAndInstallInitialKeys(
@@ -507,8 +507,8 @@ struct PacketCoalescingTests {
     @Test("Coalesced packets are parsed correctly")
     func coalescedPacketsParsed() throws {
         // Create a simple test with Initial packet
-        let dcid = ConnectionID.random(length: 8)
-        let scid = ConnectionID.random(length: 8)
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let scid = try #require(ConnectionID.random(length: 8))
 
         let clientProcessor = PacketProcessor(dcidLength: 8)
         let (_, _) = try clientProcessor.deriveAndInstallInitialKeys(
@@ -612,9 +612,9 @@ struct AntiAmplificationTests {
 struct TransportParametersTests {
 
     @Test("Transport parameters creation from config")
-    func transportParametersCreation() {
+    func transportParametersCreation() throws {
         let config = QUICConfiguration()
-        let scid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
         let params = TransportParameters(from: config, sourceConnectionID: scid)
 
         // Key parameters should be set (check non-zero defaults)
@@ -624,9 +624,9 @@ struct TransportParametersTests {
     }
 
     @Test("Transport parameters source connection ID")
-    func transportParametersSourceCID() {
+    func transportParametersSourceCID() throws {
         let config = QUICConfiguration()
-        let scid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
         let params = TransportParameters(from: config, sourceConnectionID: scid)
 
         // Source CID should be set

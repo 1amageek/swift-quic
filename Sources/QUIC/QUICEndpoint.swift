@@ -165,8 +165,11 @@ public actor QUICEndpoint {
         }
 
         // Generate connection IDs
-        let sourceConnectionID = ConnectionID.random(length: 8)
-        let destinationConnectionID = ConnectionID.random(length: 8)
+        // Note: length 8 is always valid (0-20 allowed), so random() will never return nil
+        guard let sourceConnectionID = ConnectionID.random(length: 8),
+              let destinationConnectionID = ConnectionID.random(length: 8) else {
+            throw QUICError.internalError("Failed to generate connection IDs")
+        }
 
         // Create TLS provider (use factory if provided, otherwise MockTLSProvider)
         let tlsProvider: any TLS13Provider
@@ -275,8 +278,11 @@ public actor QUICEndpoint {
         sessionCache: ClientSessionCache
     ) async throws -> (connection: any QUICConnectionProtocol, earlyDataAccepted: Bool) {
         // Generate connection IDs
-        let sourceConnectionID = ConnectionID.random(length: 8)
-        let destinationConnectionID = ConnectionID.random(length: 8)
+        // Note: length 8 is always valid (0-20 allowed), so random() will never return nil
+        guard let sourceConnectionID = ConnectionID.random(length: 8),
+              let destinationConnectionID = ConnectionID.random(length: 8) else {
+            throw QUICError.internalError("Failed to generate connection IDs")
+        }
 
         // Create TLS provider with session ticket for resumption
         let tlsProvider: any TLS13Provider
@@ -387,7 +393,10 @@ public actor QUICEndpoint {
     /// Handles a new incoming connection (server mode)
     private func handleNewConnection(info: ConnectionRouter.IncomingConnectionInfo) async throws -> ManagedConnection {
         // Generate our source connection ID
-        let sourceConnectionID = ConnectionID.random(length: 8)
+        // Note: length 8 is always valid (0-20 allowed), so random() will never return nil
+        guard let sourceConnectionID = ConnectionID.random(length: 8) else {
+            throw QUICError.internalError("Failed to generate connection ID")
+        }
 
         // Create TLS provider (use factory if provided, otherwise MockTLSProvider)
         let tlsProvider: any TLS13Provider
@@ -456,9 +465,10 @@ public actor QUICEndpoint {
 
         // Extract DCID from VN packet (which should be our SCID)
         let dcidLength = Int(data[5])
+        guard dcidLength <= ConnectionID.maxLength else { return }
         guard data.count >= 6 + dcidLength else { return }
         let dcidBytes = data[6..<(6 + dcidLength)]
-        let vnDCID = ConnectionID(bytes: Data(dcidBytes))
+        let vnDCID = try ConnectionID(bytes: Data(dcidBytes))
 
         // Try to find a connection with this SCID
         guard let connection = router.connection(for: vnDCID) else {

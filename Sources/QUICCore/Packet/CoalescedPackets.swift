@@ -219,26 +219,46 @@ public struct CoalescedPacketParser: Sendable {
         case 0x00:  // Initial
             // Read token length
             let tokenLength = try reader.readVarint()
-            guard reader.readBytes(Int(tokenLength.value)) != nil else {
+            let safeTokenLength = try SafeConversions.toInt(
+                tokenLength.value,
+                maxAllowed: ProtocolLimits.maxInitialTokenLength,
+                context: "Initial packet token length (coalesced)"
+            )
+            guard reader.readBytes(safeTokenLength) != nil else {
                 throw ParseError.insufficientData
             }
             // Read Length field
             let length = try reader.readVarint()
             // Total length: header so far + packet number + payload
             let headerLength = reader.currentPosition - (startOffset - datagram.startIndex)
-            return headerLength + Int(length.value)
+            let safeLength = try SafeConversions.toInt(
+                length.value,
+                maxAllowed: ProtocolLimits.maxLongHeaderLength,
+                context: "Initial packet length field"
+            )
+            return try SafeConversions.add(headerLength, safeLength)
 
         case 0x01:  // 0-RTT
             // Read Length field
             let length = try reader.readVarint()
             let headerLength = reader.currentPosition - (startOffset - datagram.startIndex)
-            return headerLength + Int(length.value)
+            let safeLength = try SafeConversions.toInt(
+                length.value,
+                maxAllowed: ProtocolLimits.maxLongHeaderLength,
+                context: "0-RTT packet length field"
+            )
+            return try SafeConversions.add(headerLength, safeLength)
 
         case 0x02:  // Handshake
             // Read Length field
             let length = try reader.readVarint()
             let headerLength = reader.currentPosition - (startOffset - datagram.startIndex)
-            return headerLength + Int(length.value)
+            let safeLength = try SafeConversions.toInt(
+                length.value,
+                maxAllowed: ProtocolLimits.maxLongHeaderLength,
+                context: "Handshake packet length field"
+            )
+            return try SafeConversions.add(headerLength, safeLength)
 
         case 0x03:  // Retry
             // Retry packets have no Length field

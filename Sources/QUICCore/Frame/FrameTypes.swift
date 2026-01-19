@@ -264,18 +264,54 @@ public struct NewConnectionIDFrame: Sendable, Hashable {
     /// Stateless reset token (16 bytes)
     public let statelessResetToken: Data
 
+    /// Creates a NEW_CONNECTION_ID frame with validation
+    ///
+    /// - Parameters:
+    ///   - sequenceNumber: Sequence number for this connection ID
+    ///   - retirePriorTo: Sequence number of the connection ID being retired
+    ///   - connectionID: The new connection ID
+    ///   - statelessResetToken: Stateless reset token (must be exactly 16 bytes)
+    /// - Throws: `FrameError.invalidStatelessResetTokenLength` if token is not 16 bytes
     public init(
         sequenceNumber: UInt64,
         retirePriorTo: UInt64,
         connectionID: ConnectionID,
         statelessResetToken: Data
-    ) {
-        precondition(statelessResetToken.count == 16, "Stateless reset token must be 16 bytes")
+    ) throws {
+        guard statelessResetToken.count == ProtocolLimits.statelessResetTokenLength else {
+            throw FrameError.invalidStatelessResetTokenLength(
+                actual: statelessResetToken.count,
+                expected: ProtocolLimits.statelessResetTokenLength
+            )
+        }
         self.sequenceNumber = sequenceNumber
         self.retirePriorTo = retirePriorTo
         self.connectionID = connectionID
         self.statelessResetToken = statelessResetToken
     }
+
+    /// Creates a NEW_CONNECTION_ID frame without validation (internal use)
+    ///
+    /// Use this only when the token is known to be valid (e.g., locally generated).
+    internal init(
+        unchecked sequenceNumber: UInt64,
+        retirePriorTo: UInt64,
+        connectionID: ConnectionID,
+        statelessResetToken: Data
+    ) {
+        assert(statelessResetToken.count == ProtocolLimits.statelessResetTokenLength,
+               "Stateless reset token must be \(ProtocolLimits.statelessResetTokenLength) bytes")
+        self.sequenceNumber = sequenceNumber
+        self.retirePriorTo = retirePriorTo
+        self.connectionID = connectionID
+        self.statelessResetToken = statelessResetToken
+    }
+}
+
+/// Errors that can occur when creating frames
+public enum FrameError: Error, Sendable, Equatable {
+    /// Stateless reset token has invalid length
+    case invalidStatelessResetTokenLength(actual: Int, expected: Int)
 }
 
 // MARK: - CONNECTION_CLOSE Frame

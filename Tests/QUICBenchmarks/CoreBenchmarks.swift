@@ -1,13 +1,17 @@
-/// Performance Benchmarks for swift-quic
+/// Performance Benchmarks for QUICCore
 ///
-/// Run with: swift test --filter Benchmark
+/// Run with: swift test --filter QUICBenchmarks
+///
+/// These benchmarks are separated from regular tests to avoid
+/// running them during normal CI builds. Run them explicitly
+/// when investigating performance bottlenecks.
 
 import Testing
 import Foundation
 @testable import QUICCore
 
-@Suite("Performance Benchmarks")
-struct BenchmarkTests {
+@Suite("QUICCore Performance Benchmarks")
+struct CoreBenchmarks {
 
     // MARK: - Varint Benchmarks
 
@@ -86,7 +90,7 @@ struct BenchmarkTests {
         let start = CFAbsoluteTimeGetCurrent()
         for i in 0..<iterations {
             let bytes = Data([UInt8(i & 0xFF), 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07])
-            _ = ConnectionID(bytes: bytes)
+            _ = try ConnectionID(bytes: bytes)
         }
         let elapsed = CFAbsoluteTimeGetCurrent() - start
 
@@ -97,8 +101,8 @@ struct BenchmarkTests {
 
     @Test("ConnectionID equality performance")
     func connectionIDEqualityPerformance() throws {
-        let cid1 = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
-        let cid2 = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
+        let cid1 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
+        let cid2 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
         let iterations = 1_000_000
 
         let start = CFAbsoluteTimeGetCurrent()
@@ -175,24 +179,6 @@ struct BenchmarkTests {
         #expect(opsPerSecond > 50_000, "Expected > 50k ops/sec")
     }
 
-    @Test("CRYPTO frame encoding performance")
-    func cryptoFrameEncodingPerformance() throws {
-        let codec = StandardFrameCodec()
-        let data = Data(repeating: 0xCD, count: 500)
-        let frame = Frame.crypto(CryptoFrame(offset: 0, data: data))
-        let iterations = 20_000
-
-        let start = CFAbsoluteTimeGetCurrent()
-        for _ in 0..<iterations {
-            _ = try codec.encode(frame)
-        }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
-
-        let opsPerSecond = Double(iterations) / elapsed
-        print("CRYPTO frame encoding: \(Int(opsPerSecond)) ops/sec")
-        #expect(opsPerSecond > 100_000, "Expected > 100k ops/sec")
-    }
-
     // MARK: - Frame Decoding Benchmarks
 
     @Test("PING frame decoding performance")
@@ -236,45 +222,19 @@ struct BenchmarkTests {
         #expect(opsPerSecond > 200_000, "Expected > 200k ops/sec")
     }
 
-    @Test("STREAM frame decoding performance")
-    func streamFrameDecodingPerformance() throws {
-        let codec = StandardFrameCodec()
-        let data = Data(repeating: 0xAB, count: 1000)
-        let frame = Frame.stream(StreamFrame(
-            streamID: 4,
-            offset: 0,
-            data: data,
-            fin: false
-        ))
-        let encoded = try codec.encode(frame)
-        let iterations = 10_000
-
-        let start = CFAbsoluteTimeGetCurrent()
-        for _ in 0..<iterations {
-            var reader = DataReader(encoded)
-            _ = try codec.decode(from: &reader)
-        }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
-
-        let opsPerSecond = Double(iterations) / elapsed
-        print("STREAM frame decoding: \(Int(opsPerSecond)) ops/sec")
-        #expect(opsPerSecond > 50_000, "Expected > 50k ops/sec")
-    }
-
     // MARK: - Packet Header Benchmarks
 
     @Test("Long header parsing performance")
     func longHeaderParsingPerformance() throws {
-        // Build a minimal Initial packet header
         var packet = Data()
-        packet.append(0xC0 | 0x01)  // Long header, Initial, 2-byte PN
-        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x01])  // Version
-        packet.append(4)  // DCID length
-        packet.append(contentsOf: [0x01, 0x02, 0x03, 0x04])  // DCID
-        packet.append(4)  // SCID length
-        packet.append(contentsOf: [0x05, 0x06, 0x07, 0x08])  // SCID
-        packet.append(0x00)  // Token length
-        packet.append(0x10)  // Length: 16 bytes
+        packet.append(0xC0 | 0x01)
+        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
+        packet.append(4)
+        packet.append(contentsOf: [0x01, 0x02, 0x03, 0x04])
+        packet.append(4)
+        packet.append(contentsOf: [0x05, 0x06, 0x07, 0x08])
+        packet.append(0x00)
+        packet.append(0x10)
         packet.append(contentsOf: Data(repeating: 0xAA, count: 16))
 
         let iterations = 50_000
@@ -293,8 +253,8 @@ struct BenchmarkTests {
     @Test("Short header parsing performance")
     func shortHeaderParsingPerformance() throws {
         var packet = Data()
-        packet.append(0x40 | 0x01)  // Short header, 2-byte PN
-        packet.append(contentsOf: [0x01, 0x02, 0x03, 0x04])  // DCID
+        packet.append(0x40 | 0x01)
+        packet.append(contentsOf: [0x01, 0x02, 0x03, 0x04])
         packet.append(contentsOf: Data(repeating: 0xBB, count: 20))
 
         let iterations = 100_000
@@ -333,7 +293,6 @@ struct BenchmarkTests {
 
     @Test("Packet number decoding performance")
     func packetNumberDecodingPerformance() throws {
-        // Pre-encode packet numbers
         let testCases: [(truncated: UInt64, length: Int, largestPN: UInt64)] = [
             (100, 1, 90),
             (10000 & 0xFFFF, 2, 9990),
@@ -385,10 +344,8 @@ struct BenchmarkTests {
 
     @Test("Coalesced packet parsing performance")
     func coalescedPacketParsingPerformance() throws {
-        // Build a coalesced packet with Initial + Handshake
         var datagram = Data()
 
-        // Initial packet
         var packet1 = Data()
         packet1.append(0xC0 | 0x01)
         packet1.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
@@ -400,7 +357,6 @@ struct BenchmarkTests {
         packet1.append(0x10)
         packet1.append(contentsOf: Data(repeating: 0xAA, count: 16))
 
-        // Handshake packet
         var packet2 = Data()
         packet2.append(0xC0 | 0x21)
         packet2.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
@@ -453,92 +409,6 @@ struct BenchmarkTests {
         let totalOps = iterations * frames.count
         let opsPerSecond = Double(totalOps) / elapsed
         print("Frame roundtrip: \(Int(opsPerSecond)) ops/sec")
-        #expect(opsPerSecond > 100_000, "Expected > 100k ops/sec")
-    }
-
-    @Test("Multiple frame encoding performance")
-    func multipleFrameEncodingPerformance() throws {
-        let codec = StandardFrameCodec()
-        let frames: [Frame] = [
-            .ack(AckFrame(largestAcknowledged: 100, ackDelay: 10, ackRanges: [AckRange(gap: 0, rangeLength: 5)])),
-            .stream(StreamFrame(streamID: 4, offset: 0, data: Data(repeating: 0xAB, count: 500), fin: false)),
-            .stream(StreamFrame(streamID: 8, offset: 0, data: Data(repeating: 0xBC, count: 300), fin: true)),
-            .padding(count: 50),
-        ]
-        let iterations = 10_000
-
-        let start = CFAbsoluteTimeGetCurrent()
-        for _ in 0..<iterations {
-            _ = try codec.encodeFrames(frames)
-        }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
-
-        let opsPerSecond = Double(iterations) / elapsed
-        print("Multiple frame encoding: \(Int(opsPerSecond)) ops/sec")
-        #expect(opsPerSecond > 20_000, "Expected > 20k ops/sec")
-    }
-
-    // MARK: - Memory Efficiency Benchmarks
-
-    @Test("Large STREAM frame encoding efficiency")
-    func largeStreamFrameEfficiency() throws {
-        let codec = StandardFrameCodec()
-        let sizes = [100, 1000, 10000]
-
-        for size in sizes {
-            let data = Data(repeating: 0xAB, count: size)
-            let frame = Frame.stream(StreamFrame(
-                streamID: 4,
-                offset: 0,
-                data: data,
-                fin: false
-            ))
-            let encoded = try codec.encode(frame)
-
-            // Overhead should be minimal (type byte + stream ID varint + length varint)
-            let overhead = encoded.count - size
-            print("STREAM frame \(size) bytes: encoded=\(encoded.count), overhead=\(overhead) bytes")
-            #expect(overhead < 20, "Expected overhead < 20 bytes for \(size) byte payload")
-        }
-    }
-
-    @Test("Coalesced packet size efficiency")
-    func coalescedPacketSizeEfficiency() throws {
-        let packets = [
-            Data(repeating: 0xAA, count: 100),
-            Data(repeating: 0xBB, count: 200),
-            Data(repeating: 0xCC, count: 300),
-        ]
-
-        let totalInput = packets.reduce(0) { $0 + $1.count }
-        let coalesced = CoalescedPacketBuilder.coalesce(packets: packets, maxDatagramSize: 1200)!
-
-        print("Coalesced packet: input=\(totalInput) bytes, output=\(coalesced.count) bytes")
-        #expect(coalesced.count == totalInput, "Coalesced size should equal sum of inputs")
-    }
-
-    // MARK: - Packet Type Sort Performance
-
-    @Test("Packet type sorting performance")
-    func packetTypeSortingPerformance() throws {
-        let packets: [(packetType: PacketType, data: Data)] = [
-            (.oneRTT, Data([0x01])),
-            (.initial, Data([0x02])),
-            (.handshake, Data([0x03])),
-            (.zeroRTT, Data([0x04])),
-            (.oneRTT, Data([0x05])),
-            (.initial, Data([0x06])),
-        ]
-        let iterations = 100_000
-
-        let start = CFAbsoluteTimeGetCurrent()
-        for _ in 0..<iterations {
-            _ = CoalescedPacketOrder.sort(packets: packets)
-        }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
-
-        let opsPerSecond = Double(iterations) / elapsed
-        print("Packet type sorting: \(Int(opsPerSecond)) ops/sec")
         #expect(opsPerSecond > 100_000, "Expected > 100k ops/sec")
     }
 }

@@ -263,11 +263,14 @@ public final class ConnectionIDManager: Sendable {
     // MARK: - Issuing Connection IDs
 
     /// Issues a new connection ID
-    /// - Parameter length: Length of the CID (0-20 bytes)
+    /// - Parameter length: Length of the CID (0-20 bytes, default 8)
     /// - Returns: NEW_CONNECTION_ID frame to send
-    public func issueNewConnectionID(length: Int = 8) -> NewConnectionIDFrame {
-        return state.withLock { s in
-            let cid = ConnectionID.random(length: length)
+    /// - Throws: If the length is invalid or frame creation fails
+    public func issueNewConnectionID(length: Int = 8) throws -> NewConnectionIDFrame {
+        return try state.withLock { s in
+            guard let cid = ConnectionID.random(length: length) else {
+                throw ConnectionIDError.invalidLength(length)
+            }
             let token = generateStatelessResetToken()
             let seq = s.nextSequenceNumber
             s.nextSequenceNumber += 1
@@ -281,13 +284,18 @@ public final class ConnectionIDManager: Sendable {
             )
             s.issuedCIDs[seq] = issued
 
-            return NewConnectionIDFrame(
+            return try NewConnectionIDFrame(
                 sequenceNumber: seq,
                 retirePriorTo: 0,
                 connectionID: cid,
                 statelessResetToken: token
             )
         }
+    }
+
+    /// Errors related to connection ID operations
+    public enum ConnectionIDError: Error, Sendable {
+        case invalidLength(Int)
     }
 
     /// Gets all active (non-retired) issued CIDs

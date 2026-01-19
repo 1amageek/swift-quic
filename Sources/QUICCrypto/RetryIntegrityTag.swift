@@ -272,8 +272,8 @@ public struct RetryIntegrityTag: Sendable {
 
         return (
             version: version,
-            destinationCID: ConnectionID(bytes: dcidBytes),
-            sourceCID: ConnectionID(bytes: scidBytes),
+            destinationCID: try ConnectionID(bytes: dcidBytes),
+            sourceCID: try ConnectionID(bytes: scidBytes),
             retryToken: retryToken,
             integrityTag: tag
         )

@@ -843,8 +843,9 @@ public final class QUICConnectionHandler: Sendable {
     /// Issues a new connection ID to the peer
     /// - Parameter length: Length of the connection ID (default 8)
     /// - Returns: NEW_CONNECTION_ID frame to send
-    public func issueNewConnectionID(length: Int = 8) -> NewConnectionIDFrame {
-        connectionIDManager.issueNewConnectionID(length: length)
+    /// - Throws: If the length is invalid or frame creation fails
+    public func issueNewConnectionID(length: Int = 8) throws -> NewConnectionIDFrame {
+        try connectionIDManager.issueNewConnectionID(length: length)
     }
 
     /// Gets the current active peer connection ID for sending

@@ -371,7 +371,12 @@ extension PacketHeader {
             // Read token length and token
             let tokenLength = try reader.readVarint()
             if tokenLength.value > 0 {
-                guard let tokenData = reader.readBytes(Int(tokenLength.value)) else {
+                let safeTokenLength = try SafeConversions.toInt(
+                    tokenLength.value,
+                    maxAllowed: ProtocolLimits.maxInitialTokenLength,
+                    context: "Initial packet token length"
+                )
+                guard let tokenData = reader.readBytes(safeTokenLength) else {
                     throw ParseError.insufficientData
                 }
                 token = tokenData
@@ -396,12 +401,13 @@ extension PacketHeader {
             // RFC 9001 Section 5.8: Retry Token + 16-byte Retry Integrity Tag
             // The remaining data after SCID contains both
             let remainingCount = reader.remainingCount
-            if remainingCount >= 16 {
-                let retryTokenLength = remainingCount - 16
+            if remainingCount >= ProtocolLimits.retryIntegrityTagLength {
+                // Safe subtraction: remainingCount >= 16 is verified above
+                let retryTokenLength = remainingCount - ProtocolLimits.retryIntegrityTagLength
                 if retryTokenLength > 0 {
                     token = reader.readBytes(retryTokenLength)
                 }
-                retryIntegrityTag = reader.readBytes(16)
+                retryIntegrityTag = reader.readBytes(ProtocolLimits.retryIntegrityTagLength)
             }
             // Note: If remainingCount < 16, the packet is malformed,
             // but we allow parsing to complete and let validation catch it

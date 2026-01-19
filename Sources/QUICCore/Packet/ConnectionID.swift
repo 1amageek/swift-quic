@@ -14,19 +14,51 @@ public struct ConnectionID: Hashable, Sendable {
     public static let maxLength = 20
 
     /// An empty connection ID (zero length)
-    public static let empty = ConnectionID(bytes: Data())
+    public static let empty = ConnectionID(uncheckedBytes: Data())
 
-    /// Creates a connection ID from raw bytes
+    /// Creates a connection ID from raw bytes with validation
+    ///
     /// - Parameter bytes: The connection ID bytes (must be 0-20 bytes)
-    /// - Precondition: bytes.count <= 20
-    public init(bytes: Data) {
-        precondition(bytes.count <= Self.maxLength, "Connection ID cannot exceed 20 bytes")
+    /// - Throws: `ConnectionIDError.tooLong` if bytes exceed 20 bytes
+    ///
+    /// Use this initializer when creating a ConnectionID from untrusted input
+    /// (e.g., network data, user input).
+    public init(bytes: Data) throws {
+        guard bytes.count <= Self.maxLength else {
+            throw ConnectionIDError.tooLong(
+                length: bytes.count,
+                maxAllowed: Self.maxLength
+            )
+        }
         self.bytes = bytes
     }
 
-    /// Creates a connection ID from a byte sequence
-    public init<S: Sequence>(_ bytes: S) where S.Element == UInt8 {
-        self.init(bytes: Data(bytes))
+    /// Creates a connection ID from raw bytes without validation
+    ///
+    /// - Parameter bytes: The connection ID bytes (must be 0-20 bytes)
+    /// - Precondition: bytes.count <= maxLength (debug builds only)
+    ///
+    /// Use this initializer only when the bytes are known to be valid
+    /// (e.g., locally generated, already validated).
+    /// In debug builds, an assertion failure will occur if bytes exceed maxLength.
+    /// In release builds, the ConnectionID will be created regardless.
+    internal init(uncheckedBytes bytes: Data) {
+        assert(bytes.count <= Self.maxLength,
+               "ConnectionID unchecked init called with \(bytes.count) bytes (max: \(Self.maxLength))")
+        self.bytes = bytes
+    }
+
+    /// Creates a connection ID from a byte sequence with validation
+    ///
+    /// - Throws: `ConnectionIDError.tooLong` if bytes exceed 20 bytes
+    public init<S: Sequence>(_ bytes: S) throws where S.Element == UInt8 {
+        try self.init(bytes: Data(bytes))
+    }
+
+    /// Errors that can occur when creating a ConnectionID
+    public enum ConnectionIDError: Error, Sendable, Equatable {
+        /// The provided bytes exceed the maximum allowed length
+        case tooLong(length: Int, maxAllowed: Int)
     }
 
     /// The length of this connection ID in bytes
@@ -40,14 +72,17 @@ public struct ConnectionID: Hashable, Sendable {
     }
 
     /// Generates a random connection ID of the specified length
+    ///
     /// - Parameter length: The desired length (default: 8 bytes, must be 0-20)
-    /// - Returns: A new random connection ID
+    /// - Returns: A new random connection ID, or nil if length is invalid
     ///
     /// This implementation uses safe byte-level operations to avoid
     /// alignment issues and buffer overflows that can occur with
     /// `bindMemory(to: UInt64.self)` on unaligned or undersized buffers.
-    public static func random(length: Int = 8) -> ConnectionID {
-        precondition(length >= 0 && length <= maxLength)
+    public static func random(length: Int = 8) -> ConnectionID? {
+        guard length >= 0 && length <= maxLength else {
+            return nil
+        }
         guard length > 0 else { return .empty }
 
         var bytes = Data(capacity: length)
@@ -71,7 +106,8 @@ public struct ConnectionID: Hashable, Sendable {
             }
         }
 
-        return ConnectionID(bytes: bytes)
+        // Length is validated above, so unchecked init is safe
+        return ConnectionID(uncheckedBytes: bytes)
     }
 }
 
@@ -100,7 +136,7 @@ extension ConnectionID {
     /// Decodes a connection ID from data (reads length byte + data)
     /// - Parameter reader: The data reader
     /// - Returns: The decoded connection ID
-    /// - Throws: Error if insufficient data
+    /// - Throws: Error if insufficient data or invalid length
     public static func decode(from reader: inout DataReader) throws -> ConnectionID {
         guard let length = reader.readUInt8() else {
             throw DecodeError.insufficientData
@@ -111,7 +147,8 @@ extension ConnectionID {
         guard let bytes = reader.readBytes(Int(length)) else {
             throw DecodeError.insufficientData
         }
-        return ConnectionID(bytes: bytes)
+        // Length is validated above, so unchecked init is safe
+        return ConnectionID(uncheckedBytes: bytes)
     }
 
     /// Decodes connection ID bytes (without length prefix) given a known length
@@ -119,6 +156,7 @@ extension ConnectionID {
     ///   - reader: The data reader
     ///   - length: The length of the connection ID
     /// - Returns: The decoded connection ID
+    /// - Throws: Error if insufficient data or invalid length
     public static func decodeBytes(from reader: inout DataReader, length: Int) throws -> ConnectionID {
         guard length <= maxLength else {
             throw DecodeError.invalidLength(length)
@@ -127,7 +165,8 @@ extension ConnectionID {
             guard let bytes = reader.readBytes(length) else {
                 throw DecodeError.insufficientData
             }
-            return ConnectionID(bytes: bytes)
+            // Length is validated above, so unchecked init is safe
+            return ConnectionID(uncheckedBytes: bytes)
         }
         return .empty
     }

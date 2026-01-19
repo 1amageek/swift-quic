@@ -76,8 +76,8 @@ struct TLSIntegrationTests {
 
     @Test("Client generates Initial packet with TLS13Handler")
     func clientGeneratesInitialPacket() async throws {
-        let clientSCID = ConnectionID.random(length: 8)
-        let serverDCID = ConnectionID.random(length: 8)
+        let clientSCID = ConnectionID.random(length: 8)!
+        let serverDCID = ConnectionID.random(length: 8)!
 
         let client = createClientConnection(dcid: serverDCID, scid: clientSCID)
 
@@ -101,10 +101,10 @@ struct TLSIntegrationTests {
     @Test("Full client-server handshake with TLS13Handler", .timeLimit(.minutes(1)))
     func fullClientServerHandshake() async throws {
         // Connection IDs
-        let clientSCID = ConnectionID.random(length: 8)
-        let serverSCID = ConnectionID.random(length: 8)
+        let clientSCID = ConnectionID.random(length: 8)!
+        let serverSCID = ConnectionID.random(length: 8)!
         // Client's initial DCID (becomes original DCID for Initial key derivation)
-        let originalDCID = ConnectionID.random(length: 8)
+        let originalDCID = ConnectionID.random(length: 8)!
 
         // Create connections
         // Client uses originalDCID as its destination (server's ID)
@@ -172,9 +172,9 @@ struct TLSIntegrationTests {
 
     @Test("Handshake produces correct encryption levels", .timeLimit(.minutes(1)))
     func handshakeEncryptionLevels() async throws {
-        let clientSCID = ConnectionID.random(length: 8)
-        let serverSCID = ConnectionID.random(length: 8)
-        let originalDCID = ConnectionID.random(length: 8)
+        let clientSCID = ConnectionID.random(length: 8)!
+        let serverSCID = ConnectionID.random(length: 8)!
+        let originalDCID = ConnectionID.random(length: 8)!
 
         let client = createClientConnection(dcid: originalDCID, scid: clientSCID)
         let server = createServerConnection(
@@ -227,9 +227,9 @@ struct TLSIntegrationTests {
 
     @Test("ALPN negotiation works", .timeLimit(.minutes(1)))
     func alpnNegotiation() async throws {
-        let clientSCID = ConnectionID.random(length: 8)
-        let serverSCID = ConnectionID.random(length: 8)
-        let originalDCID = ConnectionID.random(length: 8)
+        let clientSCID = ConnectionID.random(length: 8)!
+        let serverSCID = ConnectionID.random(length: 8)!
+        let originalDCID = ConnectionID.random(length: 8)!
 
         // Create client with h3 ALPN
         let clientConfig = TLSConfiguration.client(
@@ -308,9 +308,9 @@ struct TLSIntegrationTests {
 
     @Test("Can open stream after handshake", .timeLimit(.minutes(1)))
     func openStreamAfterHandshake() async throws {
-        let clientSCID = ConnectionID.random(length: 8)
-        let serverSCID = ConnectionID.random(length: 8)
-        let originalDCID = ConnectionID.random(length: 8)
+        let clientSCID = ConnectionID.random(length: 8)!
+        let serverSCID = ConnectionID.random(length: 8)!
+        let originalDCID = ConnectionID.random(length: 8)!
 
         let client = createClientConnection(dcid: originalDCID, scid: clientSCID)
         let server = createServerConnection(
@@ -364,8 +364,8 @@ struct TLSIntegrationTests {
 
     @Test("Client handles server not responding", .timeLimit(.minutes(1)))
     func clientHandlesNoResponse() async throws {
-        let clientSCID = ConnectionID.random(length: 8)
-        let serverDCID = ConnectionID.random(length: 8)
+        let clientSCID = ConnectionID.random(length: 8)!
+        let serverDCID = ConnectionID.random(length: 8)!
 
         let client = createClientConnection(dcid: serverDCID, scid: clientSCID)
 

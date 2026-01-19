@@ -25,9 +25,9 @@ struct QUICConfigurationTests {
     }
 
     @Test("Transport parameters from configuration")
-    func transportParameters() {
+    func transportParameters() throws {
         let config = QUICConfiguration()
-        let scid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
 
         let params = TransportParameters(from: config, sourceConnectionID: scid)
 

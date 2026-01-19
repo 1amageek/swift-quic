@@ -417,9 +417,9 @@ struct FrameCodecTests {
 
     @Test("Encode and decode NEW_CONNECTION_ID frame")
     func newConnectionIDFrame() throws {
-        let cid = ConnectionID.random(length: 8)
+        let cid = try #require(ConnectionID.random(length: 8))
         let resetToken = Data(repeating: 0xAB, count: 16)
-        let newCIDFrame = NewConnectionIDFrame(
+        let newCIDFrame = try NewConnectionIDFrame(
             sequenceNumber: 1,
             retirePriorTo: 0,
             connectionID: cid,
@@ -572,6 +572,15 @@ struct FrameCodecTests {
 
     @Test("Roundtrip encoding for all frame types")
     func roundtripAllFrameTypes() throws {
+        // Create NewConnectionIDFrame separately since it now throws
+        let newCID = try #require(ConnectionID.random(length: 8))
+        let newCIDFrame = try NewConnectionIDFrame(
+            sequenceNumber: 1,
+            retirePriorTo: 0,
+            connectionID: newCID,
+            statelessResetToken: Data(repeating: 0xFF, count: 16)
+        )
+
         let testFrames: [Frame] = [
             .padding(count: 10),
             .ping,
@@ -591,7 +600,7 @@ struct FrameCodecTests {
             .streamDataBlocked(StreamDataBlockedFrame(streamID: 4, streamDataLimit: 500_000)),
             .streamsBlocked(StreamsBlockedFrame(streamLimit: 100, isBidirectional: true)),
             .streamsBlocked(StreamsBlockedFrame(streamLimit: 50, isBidirectional: false)),
-            .newConnectionID(NewConnectionIDFrame(sequenceNumber: 1, retirePriorTo: 0, connectionID: ConnectionID.random(length: 8), statelessResetToken: Data(repeating: 0xFF, count: 16))),
+            .newConnectionID(newCIDFrame),
             .retireConnectionID(3),
             .pathChallenge(Data(repeating: 0x12, count: 8)),
             .pathResponse(Data(repeating: 0x34, count: 8)),

@@ -130,8 +130,8 @@ struct EndpointTests {
     @Test("PacketProcessor encrypts and decrypts packets")
     func packetProcessorRoundtrip() async throws {
         // Use same DCID for both client and server (this is the original DCID)
-        let dcid = ConnectionID.random(length: 8)
-        let scid = ConnectionID.random(length: 8)
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let scid = try #require(ConnectionID.random(length: 8))
 
         // Client encrypts with client sealer
         let clientProcessor = PacketProcessor(dcidLength: 8)
@@ -187,8 +187,8 @@ struct EndpointTests {
         let router = ConnectionRouter(isServer: true, dcidLength: 8)
 
         // Create a connection
-        let scid = ConnectionID.random(length: 8)
-        let dcid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
         let tlsProvider = MockTLSProvider()
@@ -220,8 +220,8 @@ struct EndpointTests {
         let timerManager = TimerManager(idleTimeout: .seconds(30))
 
         // Create a connection
-        let scid = ConnectionID.random(length: 8)
-        let dcid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
         let tlsProvider = MockTLSProvider()
@@ -256,8 +256,8 @@ struct EndpointTests {
 
     @Test("ManagedConnection creates Initial packet")
     func managedConnectionCreatesInitial() async throws {
-        let scid = ConnectionID.random(length: 8)
-        let dcid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
         let tlsProvider = MockTLSProvider()
@@ -294,8 +294,8 @@ struct EndpointTests {
     @Test("ManagedConnection handshake state transitions")
     func managedConnectionHandshakeStates() async throws {
         // Start with idle
-        let scid = ConnectionID.random(length: 8)
-        let dcid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
         let tlsProvider = MockTLSProvider()
@@ -322,8 +322,8 @@ struct EndpointTests {
 
     @Test("ManagedStream read/write operations")
     func managedStreamOperations() async throws {
-        let scid = ConnectionID.random(length: 8)
-        let dcid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
         let tlsProvider = MockTLSProvider()
@@ -361,8 +361,8 @@ struct EndpointTests {
     /// Creates a mock Initial packet for testing
     private func createMockInitialPacket() throws -> Data {
         let processor = PacketProcessor(dcidLength: 8)
-        let dcid = ConnectionID.random(length: 8)
-        let scid = ConnectionID.random(length: 8)
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let scid = try #require(ConnectionID.random(length: 8))
 
         // Derive keys
         let (_, _) = try processor.deriveAndInstallInitialKeys(
@@ -396,9 +396,9 @@ struct EndpointTests {
 @Suite("Shutdown Safety Tests")
 struct ShutdownSafetyTests {
     /// Creates a ManagedConnection for testing
-    private func createTestConnection() -> ManagedConnection {
-        let scid = ConnectionID.random(length: 8)
-        let dcid = ConnectionID.random(length: 8)
+    private func createTestConnection() throws -> ManagedConnection {
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
         let tlsProvider = MockTLSProvider()
@@ -417,7 +417,7 @@ struct ShutdownSafetyTests {
 
     @Test("acceptStream() after shutdown() does not hang", .timeLimit(.minutes(1)))
     func acceptStreamAfterShutdownDoesNotHang() async throws {
-        let connection = createTestConnection()
+        let connection = try createTestConnection()
         _ = try await connection.start()
 
         // Shutdown the connection
@@ -438,7 +438,7 @@ struct ShutdownSafetyTests {
 
     @Test("incomingStreams after shutdown() returns finished stream", .timeLimit(.minutes(1)))
     func incomingStreamsAfterShutdownReturnsFinished() async throws {
-        let connection = createTestConnection()
+        let connection = try createTestConnection()
         _ = try await connection.start()
 
         // Shutdown the connection
@@ -459,8 +459,8 @@ struct ShutdownSafetyTests {
         let tlsProvider = MockTLSProvider()
         tlsProvider.forceComplete()
 
-        let scid = ConnectionID.random(length: 8)
-        let dcid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
         let address = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
@@ -494,7 +494,7 @@ struct ShutdownSafetyTests {
 
     @Test("Multiple acceptStream() calls after shutdown() all complete", .timeLimit(.minutes(1)))
     func multipleAcceptStreamAfterShutdown() async throws {
-        let connection = createTestConnection()
+        let connection = try createTestConnection()
         _ = try await connection.start()
 
         // Shutdown the connection
@@ -518,8 +518,8 @@ struct ShutdownSafetyTests {
         let tlsProvider = MockTLSProvider()
         tlsProvider.forceComplete()
 
-        let scid = ConnectionID.random(length: 8)
-        let dcid = ConnectionID.random(length: 8)
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
         let address = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
@@ -564,7 +564,7 @@ struct ShutdownSafetyTests {
 
     @Test("shutdown() finishes existing incomingStreams iterator", .timeLimit(.minutes(1)))
     func shutdownFinishesExistingIterator() async throws {
-        let connection = createTestConnection()
+        let connection = try createTestConnection()
         _ = try await connection.start()
 
         // Get the stream BEFORE shutdown (creates iterator)
@@ -597,7 +597,7 @@ struct ShutdownSafetyTests {
         // Note: We can't easily simulate incoming streams in a unit test,
         // but we verify the structure handles the pattern correctly.
 
-        let connection = createTestConnection()
+        let connection = try createTestConnection()
         _ = try await connection.start()
 
         // Access incomingStreams (this creates the continuation)

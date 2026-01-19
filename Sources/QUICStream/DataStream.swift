@@ -400,7 +400,9 @@ public final class DataStream: Sendable {
                 let sendOffset = `internal`.state.sendOffset
                 let availableWindow = sendMaxData > sendOffset ? sendMaxData - sendOffset : 0
                 let dataInBuffer = UInt64(currentPending)
-                let maxDataToSend = min(availableWindow, dataInBuffer, UInt64(remainingBytes - minOverhead))
+                // Use saturating subtraction to prevent underflow if remainingBytes < minOverhead
+                let adjustedRemaining = SafeConversions.saturatingSubtract(remainingBytes, minOverhead)
+                let maxDataToSend = min(availableWindow, dataInBuffer, UInt64(adjustedRemaining))
 
                 let dataToSend: Data
                 let sendFin: Bool
@@ -440,7 +442,11 @@ public final class DataStream: Sendable {
                     `internal`.state.sendState = .dataSent
                 }
 
-                remainingBytes -= minOverhead + dataToSend.count
+                // Safely subtract to track remaining bytes (saturate at 0)
+                remainingBytes = SafeConversions.saturatingSubtract(
+                    remainingBytes,
+                    minOverhead + dataToSend.count
+                )
             }
 
             // Compact buffer when consumed portion exceeds half the total size

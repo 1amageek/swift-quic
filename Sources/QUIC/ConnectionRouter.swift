@@ -106,9 +106,11 @@ public final class ConnectionRouter: Sendable {
         // No existing connection found
         // For servers, Initial packets create new connections
         if isServer && packetType == .initial {
+            // Note: length 8 is always valid (0-20), so random() always succeeds
+            let scid = headerInfo.scid ?? ConnectionID.random(length: 8) ?? .empty
             return .newConnection(IncomingConnectionInfo(
                 destinationConnectionID: dcid,
-                sourceConnectionID: headerInfo.scid ?? ConnectionID.random(length: 8),
+                sourceConnectionID: scid,
                 packetType: packetType,
                 remoteAddress: remoteAddress,
                 data: data
@@ -273,7 +275,7 @@ public final class ConnectionRouter: Sendable {
 
         // SCID
         let scidBytes = data[offset..<(offset + scidLen)]
-        return ConnectionID(bytes: Data(scidBytes))
+        return try ConnectionID(bytes: Data(scidBytes))
     }
 }
 

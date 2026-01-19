@@ -77,8 +77,8 @@ struct PacketEncoderTests {
         let encoder = PacketEncoder()
         let sealer = MockPacketSealer(key: 0xAB)
 
-        let dcid = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
-        let scid = ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
+        let dcid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
+        let scid = try ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
 
         let header = LongHeader(
             packetType: .initial,
@@ -120,8 +120,8 @@ struct PacketEncoderTests {
         let encoder = PacketEncoder()
         let sealer = MockPacketSealer(key: 0xCD)
 
-        let dcid = ConnectionID(bytes: Data([0x11, 0x22, 0x33, 0x44]))
-        let scid = ConnectionID(bytes: Data([0x55, 0x66, 0x77, 0x88]))
+        let dcid = try ConnectionID(bytes: Data([0x11, 0x22, 0x33, 0x44]))
+        let scid = try ConnectionID(bytes: Data([0x55, 0x66, 0x77, 0x88]))
 
         let header = LongHeader(
             packetType: .handshake,
@@ -153,7 +153,7 @@ struct PacketEncoderTests {
         let encoder = PacketEncoder()
         let sealer = MockPacketSealer(key: 0xEF)
 
-        let dcid = ConnectionID(bytes: Data([0xDE, 0xAD, 0xBE, 0xEF]))
+        let dcid = try ConnectionID(bytes: Data([0xDE, 0xAD, 0xBE, 0xEF]))
 
         let header = ShortHeader(
             destinationConnectionID: dcid,
@@ -184,8 +184,8 @@ struct PacketEncoderTests {
         let encoder = PacketEncoder()
         let sealer = MockPacketSealer(key: 0x42)
 
-        let dcid = ConnectionID(bytes: Data([0x01, 0x02]))
-        let scid = ConnectionID(bytes: Data([0x03, 0x04]))
+        let dcid = try ConnectionID(bytes: Data([0x01, 0x02]))
+        let scid = try ConnectionID(bytes: Data([0x03, 0x04]))
 
         let header = LongHeader(
             packetType: .initial,
@@ -218,8 +218,8 @@ struct PacketEncoderTests {
         let encoder = PacketEncoder()
         let sealer = MockPacketSealer(key: 0x00)
 
-        let dcid = ConnectionID(bytes: Data([0x01]))
-        let scid = ConnectionID(bytes: Data([0x02]))
+        let dcid = try ConnectionID(bytes: Data([0x01]))
+        let scid = try ConnectionID(bytes: Data([0x02]))
 
         // Test with 4-byte packet number
         let header = LongHeader(
@@ -401,8 +401,8 @@ struct PacketRoundtripTests {
         let sealer = MockPacketSealer(key: key)
         let opener = MockPacketOpener(key: key)
 
-        let dcid = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
-        let scid = ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
+        let dcid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
+        let scid = try ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
 
         let header = LongHeader(
             packetType: .initial,
@@ -461,8 +461,8 @@ struct PacketRoundtripTests {
         let key: UInt8 = 0x42
         let sealer = MockPacketSealer(key: key)
 
-        let dcid = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
-        let scid = ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
+        let dcid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
+        let scid = try ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
 
         let header = LongHeader(
             packetType: .initial,
@@ -497,8 +497,8 @@ struct PacketRoundtripTests {
         let sealer = MockPacketSealer(key: key)
         let opener = MockPacketOpener(key: key)
 
-        let dcid = ConnectionID(bytes: Data([0xAA, 0xBB]))
-        let scid = ConnectionID(bytes: Data([0xCC, 0xDD]))
+        let dcid = try ConnectionID(bytes: Data([0xAA, 0xBB]))
+        let scid = try ConnectionID(bytes: Data([0xCC, 0xDD]))
 
         let header = LongHeader(
             packetType: .handshake,
@@ -551,7 +551,7 @@ struct PacketRoundtripTests {
         let sealer = MockPacketSealer(key: key)
         let opener = MockPacketOpener(key: key)
 
-        let dcid = ConnectionID(bytes: Data([0x12, 0x34, 0x56, 0x78]))
+        let dcid = try ConnectionID(bytes: Data([0x12, 0x34, 0x56, 0x78]))
 
         let header = ShortHeader(
             destinationConnectionID: dcid,
@@ -618,8 +618,8 @@ struct HeaderProtectionTests {
             let sealer = MockPacketSealer(key: key)
             let opener = MockPacketOpener(key: key)
 
-            let dcid = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
-            let scid = ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
+            let dcid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
+            let scid = try ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
 
             let header = LongHeader(
                 packetType: .initial,
@@ -673,7 +673,7 @@ struct HeaderProtectionTests {
             let sealer = MockPacketSealer(key: key)
             let opener = MockPacketOpener(key: key)
 
-            let dcid = ConnectionID(bytes: Data([0xAA, 0xBB, 0xCC, 0xDD]))
+            let dcid = try ConnectionID(bytes: Data([0xAA, 0xBB, 0xCC, 0xDD]))
 
             let header = ShortHeader(
                 destinationConnectionID: dcid,
@@ -716,8 +716,8 @@ struct HeaderProtectionTests {
         let sealer = MockPacketSealer(key: key)
         let opener = MockPacketOpener(key: key)
 
-        let dcid = ConnectionID(bytes: Data([0x01, 0x02]))
-        let scid = ConnectionID(bytes: Data([0x03, 0x04]))
+        let dcid = try ConnectionID(bytes: Data([0x01, 0x02]))
+        let scid = try ConnectionID(bytes: Data([0x03, 0x04]))
 
         let header = LongHeader(
             packetType: .handshake,
@@ -768,7 +768,7 @@ struct PacketCodecUtilityTests {
         let encoder = PacketEncoder()
         let sealer = MockPacketSealer(key: 0x00)
 
-        let dcid = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
+        let dcid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
 
         let header = ShortHeader(
             destinationConnectionID: dcid,
@@ -800,7 +800,7 @@ struct PacketCodecUtilityTests {
         let encoder = PacketEncoder()
         let sealer = MockPacketSealer(key: 0x00)
 
-        let dcid = ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
+        let dcid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
 
         let header = ShortHeader(
             destinationConnectionID: dcid,
@@ -835,8 +835,8 @@ struct PacketCodecUtilityTests {
         let encoder = PacketEncoder()
         let sealer = MockPacketSealer(key: 0x00)
 
-        let dcid = ConnectionID(bytes: Data([0x01, 0x02]))
-        let scid = ConnectionID(bytes: Data([0x03, 0x04]))
+        let dcid = try ConnectionID(bytes: Data([0x01, 0x02]))
+        let scid = try ConnectionID(bytes: Data([0x03, 0x04]))
 
         let header = LongHeader(
             packetType: .initial,

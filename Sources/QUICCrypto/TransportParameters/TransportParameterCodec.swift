@@ -160,7 +160,12 @@ public struct TransportParameterCodec: Sendable {
             }
             seenIDs.insert(id)
 
-            guard let value = reader.readBytes(Int(length)) else {
+            let safeLength = try SafeConversions.toInt(
+                length,
+                maxAllowed: ProtocolLimits.maxTransportParameterLength,
+                context: "Transport parameter value length"
+            )
+            guard let value = reader.readBytes(safeLength) else {
                 throw TransportParameterError.insufficientData
             }
 
@@ -247,7 +252,7 @@ public struct TransportParameterCodec: Sendable {
 
         switch paramID {
         case .originalDestinationConnectionID:
-            params.originalDestinationConnectionID = ConnectionID(bytes: value)
+            params.originalDestinationConnectionID = try ConnectionID(bytes: value)
 
         case .maxIdleTimeout:
             params.maxIdleTimeout = try decodeVarint(value)
@@ -332,10 +337,10 @@ public struct TransportParameterCodec: Sendable {
             params.activeConnectionIDLimit = limit
 
         case .initialSourceConnectionID:
-            params.initialSourceConnectionID = ConnectionID(bytes: value)
+            params.initialSourceConnectionID = try ConnectionID(bytes: value)
 
         case .retrySourceConnectionID:
-            params.retrySourceConnectionID = ConnectionID(bytes: value)
+            params.retrySourceConnectionID = try ConnectionID(bytes: value)
         }
     }
 
@@ -360,13 +365,20 @@ public struct TransportParameterCodec: Sendable {
         }
 
         // Connection ID
-        guard let cidLen = reader.readByte(),
-              let cidBytes = reader.readBytes(Int(cidLen)) else {
+        guard let cidLen = reader.readByte() else {
+            throw TransportParameterError.decodeError("Invalid preferred address CID length")
+        }
+        guard cidLen <= ConnectionID.maxLength else {
+            throw TransportParameterError.decodeError(
+                "Preferred address CID too long: \(cidLen) > \(ConnectionID.maxLength)"
+            )
+        }
+        guard let cidBytes = reader.readBytes(Int(cidLen)) else {
             throw TransportParameterError.decodeError("Invalid preferred address CID")
         }
 
         // Stateless Reset Token
-        guard let resetToken = reader.readBytes(16) else {
+        guard let resetToken = reader.readBytes(ProtocolLimits.statelessResetTokenLength) else {
             throw TransportParameterError.decodeError("Invalid preferred address reset token")
         }
 
@@ -378,7 +390,7 @@ public struct TransportParameterCodec: Sendable {
             ipv4Port: ipv4Port,
             ipv6Address: nil,  // IPv6 parsing simplified
             ipv6Port: ipv6Port,
-            connectionID: ConnectionID(bytes: cidBytes),
+            connectionID: try ConnectionID(bytes: cidBytes),
             statelessResetToken: resetToken
         )
     }

@@ -442,7 +442,13 @@ public struct PacketDecoder: Sendable {
         let ciphertextEnd: Data.Index
         if let lengthValue = longHeader.length {
             // Length field specifies: PN bytes + encrypted payload
-            let payloadLength = Int(lengthValue) - actualPNLength
+            // Safe conversion: validate lengthValue fits in Int and doesn't underflow
+            let safeLengthValue = try SafeConversions.toInt(
+                lengthValue,
+                maxAllowed: ProtocolLimits.maxLongHeaderLength,
+                context: "Long header length field"
+            )
+            let payloadLength = try SafeConversions.subtract(safeLengthValue, actualPNLength)
             ciphertextEnd = ciphertextStart + payloadLength
             guard ciphertextEnd <= data.endIndex else {
                 throw PacketCodecError.invalidPacketFormat(
@@ -542,7 +548,7 @@ public struct PacketDecoder: Sendable {
         // Extract DCID
         let dcidStart = data.startIndex + 1
         let dcidBytes = data[dcidStart..<(dcidStart + dcidLength)]
-        let dcid = ConnectionID(bytes: Data(dcidBytes))
+        let dcid = try ConnectionID(bytes: Data(dcidBytes))
 
         // Build AAD
         var aad = Data()
