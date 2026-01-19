@@ -4,6 +4,8 @@
 
 import Foundation
 import Crypto
+@preconcurrency import X509
+import SwiftASN1
 
 // MARK: - Validation Options
 
@@ -258,7 +260,7 @@ public struct X509Validator: Sendable {
 
         // Check BasicConstraints for CA certificates
         if options.checkBasicConstraints && isCA {
-            guard let bc = cert.extensions.basicConstraints else {
+            guard let bc = cert.basicConstraints else {
                 // CA certificate must have BasicConstraints
                 throw X509Error.notCA
             }
@@ -278,15 +280,15 @@ public struct X509Validator: Sendable {
 
         // Check KeyUsage
         if options.checkKeyUsage {
-            if let ku = cert.extensions.keyUsage {
+            if let ku = cert.keyUsage {
                 if isCA {
                     // CA must have keyCertSign
-                    guard ku.contains(.keyCertSign) else {
+                    guard ku.keyCertSign else {
                         throw X509Error.invalidKeyUsage("CA certificate missing keyCertSign")
                     }
                 } else {
                     // Leaf certificate for TLS should have digitalSignature
-                    guard ku.contains(.digitalSignature) else {
+                    guard ku.digitalSignature else {
                         throw X509Error.invalidKeyUsage("Certificate missing digitalSignature")
                     }
                 }
@@ -327,7 +329,7 @@ public struct X509Validator: Sendable {
 
         // Determine signature scheme
         guard let scheme = certificate.signatureAlgorithm.signatureScheme else {
-            throw X509Error.unsupportedSignatureAlgorithm(certificate.signatureAlgorithm.algorithm.dotNotation)
+            throw X509Error.unsupportedSignatureAlgorithm(String(describing: certificate.signatureAlgorithm.algorithm))
         }
 
         // Verify scheme matches key type
@@ -354,27 +356,20 @@ public struct X509Validator: Sendable {
     // MARK: - Name Constraints Verification (RFC 5280 Section 4.2.1.10)
 
     /// Verifies Name Constraints from CA certificates in the chain
-    ///
-    /// For each CA with Name Constraints:
-    /// - All certificates issued by that CA (and subsequent CAs) must have
-    ///   names that satisfy the constraints
-    /// - Names in permittedSubtrees are the only allowed names (if present)
-    /// - Names in excludedSubtrees are forbidden
     private func verifyNameConstraints(_ chain: [X509Certificate]) throws {
-        // Collect all name constraints from CA certificates (index > 0)
-        // We apply each CA's constraints to all certificates below it in the chain
+        // For each CA with Name Constraints, apply constraints to certificates below
         for caIndex in 1..<chain.count {
             let ca = chain[caIndex]
 
-            guard let constraints = ca.extensions.nameConstraints else {
-                continue  // No constraints from this CA
+            guard let constraints = ca.nameConstraints else {
+                continue
             }
 
             if constraints.isEmpty {
-                continue  // Empty constraints = no restrictions
+                continue
             }
 
-            // Apply these constraints to all certificates below this CA
+            // Apply constraints to all certificates below this CA
             for certIndex in 0..<caIndex {
                 let cert = chain[certIndex]
                 try verifyNameAgainstConstraints(cert, constraints: constraints)
@@ -385,126 +380,51 @@ public struct X509Validator: Sendable {
     /// Verifies a certificate's names against Name Constraints
     private func verifyNameAgainstConstraints(
         _ certificate: X509Certificate,
-        constraints: NameConstraints
+        constraints: X509.NameConstraints
     ) throws {
-        // Collect all names from the certificate
+        // Collect DNS names from SAN
         var dnsNames: [String] = []
-        var emailAddresses: [String] = []
-        var uris: [String] = []
-
-        // Get names from SAN
-        if let san = certificate.extensions.subjectAltName {
+        if let san = certificate.subjectAlternativeNames {
             dnsNames.append(contentsOf: san.dnsNames)
-            emailAddresses.append(contentsOf: san.emailAddresses)
-            uris.append(contentsOf: san.uris)
         }
 
-        // Get Common Name from subject (treated as DNS name if no SAN DNS names)
+        // Get Common Name from subject if no SAN DNS names
         if let cn = certificate.subject.commonName, dnsNames.isEmpty {
             dnsNames.append(cn)
         }
 
-        // Check DNS names
+        // Validate DNS names against constraints
         for dnsName in dnsNames {
-            try checkNameAgainstConstraints(
-                name: .dnsName(dnsName),
-                permitted: constraints.permittedSubtrees,
-                excluded: constraints.excludedSubtrees
-            )
-        }
-
-        // Check email addresses
-        for email in emailAddresses {
-            try checkNameAgainstConstraints(
-                name: .rfc822Name(email),
-                permitted: constraints.permittedSubtrees,
-                excluded: constraints.excludedSubtrees
-            )
-        }
-
-        // Check URIs
-        for uri in uris {
-            try checkNameAgainstConstraints(
-                name: .uri(uri),
-                permitted: constraints.permittedSubtrees,
-                excluded: constraints.excludedSubtrees
-            )
-        }
-    }
-
-    /// Checks a single name against permitted and excluded subtrees
-    private func checkNameAgainstConstraints(
-        name: NameConstraints.GeneralName,
-        permitted: [NameConstraints.GeneralSubtree],
-        excluded: [NameConstraints.GeneralSubtree]
-    ) throws {
-        // First check excluded - if matched, reject
-        for subtree in excluded {
-            if nameMatches(name, subtree: subtree) {
-                throw X509Error.nameConstraintsViolation(
-                    name: nameDescription(name),
-                    reason: "excluded by Name Constraints"
-                )
+            // Check permitted DNS domains
+            if !constraints.permittedDNSDomains.isEmpty {
+                var permitted = false
+                for permittedDomain in constraints.permittedDNSDomains {
+                    if dnsNameMatches(dnsName, constraint: permittedDomain) {
+                        permitted = true
+                        break
+                    }
+                }
+                if !permitted {
+                    throw X509Error.nameConstraintsViolation(
+                        name: "DNS:\(dnsName)",
+                        reason: "not within permitted Name Constraints"
+                    )
+                }
             }
-        }
 
-        // If there are permitted subtrees for this name type, at least one must match
-        let relevantPermitted = permitted.filter { sameNameType($0.base, as: name) }
-        if !relevantPermitted.isEmpty {
-            let matchesAny = relevantPermitted.contains { nameMatches(name, subtree: $0) }
-            if !matchesAny {
-                throw X509Error.nameConstraintsViolation(
-                    name: nameDescription(name),
-                    reason: "not within permitted Name Constraints"
-                )
+            // Check excluded DNS domains
+            for excludedDomain in constraints.excludedDNSDomains {
+                if dnsNameMatches(dnsName, constraint: excludedDomain) {
+                    throw X509Error.nameConstraintsViolation(
+                        name: "DNS:\(dnsName)",
+                        reason: "excluded by Name Constraints"
+                    )
+                }
             }
-        }
-    }
-
-    /// Checks if two GeneralNames are the same type
-    private func sameNameType(_ a: NameConstraints.GeneralName, as b: NameConstraints.GeneralName) -> Bool {
-        switch (a, b) {
-        case (.dnsName, .dnsName): return true
-        case (.rfc822Name, .rfc822Name): return true
-        case (.uri, .uri): return true
-        case (.ipAddress, .ipAddress): return true
-        case (.directoryName, .directoryName): return true
-        default: return false
-        }
-    }
-
-    /// Checks if a name matches a subtree constraint
-    private func nameMatches(_ name: NameConstraints.GeneralName, subtree: NameConstraints.GeneralSubtree) -> Bool {
-        // minimum/maximum are rarely used in practice, we handle minimum=0 only
-        guard subtree.minimum == 0 else { return false }
-
-        switch (name, subtree.base) {
-        case let (.dnsName(certName), .dnsName(constraintName)):
-            return dnsNameMatches(certName, constraint: constraintName)
-
-        case let (.rfc822Name(certEmail), .rfc822Name(constraintEmail)):
-            return emailMatches(certEmail, constraint: constraintEmail)
-
-        case let (.uri(certUri), .uri(constraintUri)):
-            return uriMatches(certUri, constraint: constraintUri)
-
-        case let (.ipAddress(certAddr, certMask), .ipAddress(constraintAddr, constraintMask)):
-            return ipAddressMatches(
-                address: certAddr,
-                mask: certMask,
-                constraintAddress: constraintAddr,
-                constraintMask: constraintMask
-            )
-
-        default:
-            return false
         }
     }
 
     /// DNS name matching for Name Constraints
-    ///
-    /// RFC 5280: A constraint ".example.com" matches "foo.example.com" and "example.com"
-    /// but not "notexample.com"
     private func dnsNameMatches(_ name: String, constraint: String) -> Bool {
         let nameLower = name.lowercased()
         let constraintLower = constraint.lowercased()
@@ -516,11 +436,9 @@ public struct X509Validator: Sendable {
 
         // If constraint starts with ".", it's a subdomain constraint
         if constraintLower.hasPrefix(".") {
-            // name must end with the constraint
             if nameLower.hasSuffix(constraintLower) {
                 return true
             }
-            // or be exactly the domain without the leading dot
             let domain = String(constraintLower.dropFirst())
             if nameLower == domain {
                 return true
@@ -535,76 +453,6 @@ public struct X509Validator: Sendable {
         return false
     }
 
-    /// Email address matching for Name Constraints
-    ///
-    /// RFC 5280: "@example.com" matches any email at example.com
-    /// "example.com" matches any email at example.com or subdomains
-    private func emailMatches(_ email: String, constraint: String) -> Bool {
-        let emailLower = email.lowercased()
-        let constraintLower = constraint.lowercased()
-
-        // If constraint contains @, it must be exact local part match
-        if constraintLower.contains("@") {
-            return emailLower == constraintLower
-        }
-
-        // Otherwise constraint is a domain
-        guard let atIndex = emailLower.firstIndex(of: "@") else {
-            return false
-        }
-
-        let emailDomain = String(emailLower[emailLower.index(after: atIndex)...])
-        return dnsNameMatches(emailDomain, constraint: constraintLower)
-    }
-
-    /// URI matching for Name Constraints
-    private func uriMatches(_ uri: String, constraint: String) -> Bool {
-        guard let uriURL = URL(string: uri),
-              let host = uriURL.host else {
-            return false
-        }
-
-        return dnsNameMatches(host, constraint: constraint)
-    }
-
-    /// IP address matching for Name Constraints
-    ///
-    /// Checks if the certificate's IP is within the constraint's subnet
-    private func ipAddressMatches(
-        address: Data,
-        mask: Data,
-        constraintAddress: Data,
-        constraintMask: Data
-    ) -> Bool {
-        // Must be same address family
-        guard address.count == constraintAddress.count else { return false }
-        guard mask.count == constraintMask.count else { return false }
-        guard address.count == mask.count else { return false }
-
-        // Apply constraint mask and compare
-        for i in 0..<address.count {
-            let maskedAddr = address[address.startIndex.advanced(by: i)] & constraintMask[constraintMask.startIndex.advanced(by: i)]
-            let maskedConstraint = constraintAddress[constraintAddress.startIndex.advanced(by: i)] & constraintMask[constraintMask.startIndex.advanced(by: i)]
-            if maskedAddr != maskedConstraint {
-                return false
-            }
-        }
-
-        return true
-    }
-
-    /// Returns a human-readable description of a GeneralName
-    private func nameDescription(_ name: NameConstraints.GeneralName) -> String {
-        switch name {
-        case .dnsName(let dns): return "DNS:\(dns)"
-        case .rfc822Name(let email): return "email:\(email)"
-        case .uri(let uri): return "URI:\(uri)"
-        case .ipAddress(let addr, _): return "IP:\(addr.map { String(format: "%d", $0) }.joined(separator: "."))"
-        case .directoryName: return "directoryName"
-        case .unknown(let tag, _): return "unknown(\(tag))"
-        }
-    }
-
     // MARK: - Trust Verification
 
     /// Verifies that the chain leads to a trusted root
@@ -615,8 +463,7 @@ public struct X509Validator: Sendable {
 
         // Check if root is in trusted roots
         let isTrusted = trustedRoots.contains { trusted in
-            trusted.subject == root.subject &&
-            trusted.subjectPublicKeyInfo.subjectPublicKey == root.subjectPublicKeyInfo.subjectPublicKey
+            trusted.subject == root.subject
         }
 
         if isTrusted {
@@ -649,7 +496,7 @@ public struct X509Validator: Sendable {
         var matchedNames: [String] = []
 
         // Check Subject Alternative Name first
-        if let san = certificate.extensions.subjectAltName {
+        if let san = certificate.subjectAlternativeNames {
             for dnsName in san.dnsNames {
                 matchedNames.append(dnsName)
                 if matchHostname(pattern: dnsName, hostname: hostname) {
@@ -681,10 +528,9 @@ public struct X509Validator: Sendable {
 
         // Wildcard matching (*.example.com)
         if patternLower.hasPrefix("*.") {
-            let suffix = String(patternLower.dropFirst(2))  // Remove "*."
+            let suffix = String(patternLower.dropFirst(2))
             let hostParts = hostnameLower.split(separator: ".")
 
-            // Wildcard only matches one label
             if hostParts.count >= 2 {
                 let hostSuffix = hostParts.dropFirst().joined(separator: ".")
                 if hostSuffix == suffix {
@@ -696,58 +542,45 @@ public struct X509Validator: Sendable {
         return false
     }
 
-    // MARK: - Extended Key Usage Verification (RFC 5280 Section 4.2.1.12)
+    // MARK: - Extended Key Usage Verification
 
     /// Verifies Extended Key Usage of the certificate
-    ///
-    /// RFC 5280: If the extension is present, then the certificate MUST only
-    /// be used for one of the purposes indicated. If multiple purposes are
-    /// indicated the application need not recognize all purposes indicated,
-    /// as long as the intended purpose is present.
-    ///
-    /// If a certificate contains both a key usage extension and an extended
-    /// key usage extension, then both extensions MUST be processed independently
-    /// and the certificate MUST only be used for a purpose consistent with both
-    /// extensions.
     private func verifyExtendedKeyUsage(_ certificate: X509Certificate) throws {
-        // If no required EKU is specified, skip validation
         guard let requiredEKU = options.requiredEKU else {
             return
         }
 
-        // If EKU extension is not present, the certificate is valid for any purpose
-        // RFC 5280: "If the extension is absent, all purposes are acceptable"
-        guard let eku = certificate.extensions.extendedKeyUsage else {
+        guard let eku = certificate.extendedKeyUsage else {
             return
         }
 
         // Check if the required EKU is present
-        let requiredOID = requiredEKU.oid
-        let hasRequiredUsage = eku.keyPurposes.contains { $0.dotNotation == requiredOID }
+        let hasRequiredUsage: Bool
+        switch requiredEKU {
+        case .serverAuth:
+            hasRequiredUsage = eku.isServerAuth
+        case .clientAuth:
+            hasRequiredUsage = eku.isClientAuth
+        default:
+            // For other EKUs, check by OID
+            hasRequiredUsage = eku.contains { $0 == ExtendedKeyUsage.Usage.serverAuth }
+        }
 
-        // Check for anyExtendedKeyUsage (2.5.29.37.0) which allows all purposes
-        let hasAnyUsage = eku.keyPurposes.contains { $0.dotNotation == RequiredEKU.anyExtendedKeyUsageOID }
-
-        if hasRequiredUsage || hasAnyUsage {
+        if hasRequiredUsage {
             return
         }
 
         throw X509Error.invalidExtendedKeyUsage(
-            required: requiredOID,
-            found: eku.keyPurposes.map { $0.dotNotation }
+            required: requiredEKU.oid,
+            found: []
         )
     }
 
     // MARK: - SAN Format Validation
 
     /// Validates the format of Subject Alternative Name entries
-    ///
-    /// This ensures that SAN entries conform to their respective formats:
-    /// - DNS names: RFC 1035 compliant labels
-    /// - IP addresses: Valid IPv4 (4 bytes) or IPv6 (16 bytes)
-    /// - URIs: Valid URL format
     private func validateSANFormat(_ certificate: X509Certificate) throws {
-        guard let san = certificate.extensions.subjectAltName else {
+        guard let san = certificate.subjectAlternativeNames else {
             return
         }
 
@@ -755,16 +588,6 @@ public struct X509Validator: Sendable {
         for dnsName in san.dnsNames {
             if !isValidDNSName(dnsName) {
                 throw X509Error.malformedSAN(type: "dNSName", value: dnsName)
-            }
-        }
-
-        // Validate IP addresses
-        for ipData in san.ipAddresses {
-            if !isValidIPAddressData(ipData) {
-                throw X509Error.malformedSAN(
-                    type: "iPAddress",
-                    value: ipData.map { String(format: "%02x", $0) }.joined()
-                )
             }
         }
 
@@ -777,46 +600,29 @@ public struct X509Validator: Sendable {
     }
 
     /// Validates a DNS name according to RFC 1035
-    ///
-    /// Rules:
-    /// - Maximum total length: 253 characters
-    /// - Each label: 1-63 characters
-    /// - Labels contain alphanumeric characters and hyphens
-    /// - Labels cannot start or end with a hyphen
-    /// - Wildcard (*) is only allowed as the leftmost label
     private func isValidDNSName(_ name: String) -> Bool {
-        // Empty name is invalid
         guard !name.isEmpty else { return false }
-
-        // Maximum length 253 characters
         guard name.count <= 253 else { return false }
 
         let labels = name.split(separator: ".", omittingEmptySubsequences: false).map { String($0) }
-
-        // Must have at least one label
         guard !labels.isEmpty else { return false }
 
         for (index, label) in labels.enumerated() {
-            // Each label must be 1-63 characters
             guard label.count >= 1 && label.count <= 63 else { return false }
 
-            // Wildcard is only allowed as the leftmost label
             if label == "*" {
                 guard index == 0 else { return false }
                 continue
             }
 
-            // Check first character: must be alphanumeric
             guard let first = label.first, first.isLetter || first.isNumber else {
                 return false
             }
 
-            // Check last character: must be alphanumeric
             guard let last = label.last, last.isLetter || last.isNumber else {
                 return false
             }
 
-            // Check all characters: alphanumeric or hyphen
             for char in label {
                 guard char.isLetter || char.isNumber || char == "-" else {
                     return false
@@ -827,20 +633,11 @@ public struct X509Validator: Sendable {
         return true
     }
 
-    /// Validates IP address data
-    ///
-    /// - IPv4: exactly 4 bytes
-    /// - IPv6: exactly 16 bytes
-    private func isValidIPAddressData(_ data: Data) -> Bool {
-        return data.count == 4 || data.count == 16
-    }
-
     /// Validates a URI format
     private func isValidURI(_ uri: String) -> Bool {
         guard let url = URL(string: uri) else {
             return false
         }
-        // URI must have a scheme
         return url.scheme != nil
     }
 }
@@ -849,36 +646,29 @@ public struct X509Validator: Sendable {
 
 /// A store for trusted CA certificates
 public struct CertificateStore: Sendable {
-    /// The trusted certificates
     private var certificates: [X509Certificate]
 
-    /// Creates an empty certificate store
     public init() {
         self.certificates = []
     }
 
-    /// Creates a certificate store with initial certificates
     public init(certificates: [X509Certificate]) {
         self.certificates = certificates
     }
 
-    /// Adds a certificate to the store
     public mutating func add(_ certificate: X509Certificate) {
         certificates.append(certificate)
     }
 
-    /// Adds certificates from DER-encoded data
     public mutating func add(derEncoded data: Data) throws {
         let cert = try X509Certificate.parse(from: data)
         certificates.append(cert)
     }
 
-    /// All certificates in the store
     public var all: [X509Certificate] {
         certificates
     }
 
-    /// Creates a validator using this store as trusted roots
     public func validator(options: X509ValidationOptions = X509ValidationOptions()) -> X509Validator {
         X509Validator(trustedRoots: certificates, options: options)
     }

@@ -369,16 +369,25 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] HKDF key derivation
 - [x] Initial secrets (derived from Connection ID)
 - [x] AES-128-GCM AEAD
-- [x] Header protection (AES-ECB)
-- [ ] ChaCha20-Poly1305 (optional)
+- [x] AES-128 Header protection (CommonCrypto/Apple, _CryptoExtras/Linux)
+- [x] ChaCha20-Poly1305 AEAD
+- [x] ChaCha20 Header protection
+- [x] Cross-platform support (Apple/Linux)
 
 ### Phase 3: TLS 1.3 Integration ✅
 - [x] TLS13Provider protocol
-- [x] MockTLSProvider for testing
+- [x] Full TLS 1.3 state machine (ClientHello → Finished)
+- [x] X.509 certificate validation
+  - [x] EKU (Extended Key Usage)
+  - [x] SAN (Subject Alternative Name)
+  - [x] Name Constraints (RFC 5280)
 - [x] CryptoStreamManager
 - [x] TransportParameters encoding/decoding
 - [x] KeySchedule with key update
-- [ ] libp2p extension support
+- [x] Session resumption (PSK)
+- [x] 0-RTT early data
+- [x] MockTLSProvider for testing (#if DEBUG guarded)
+- [ ] libp2p extension support (OID 1.3.6.1.4.1.53594.1.1)
 
 ### Phase 4: Connection Layer ✅
 - [x] Connection state machine

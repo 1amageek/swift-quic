@@ -9,13 +9,16 @@ swift-quic provides a modern, type-safe QUIC implementation designed for the swi
 ## Features
 
 - **RFC 9000/9001/9002 Compliant**: Full QUIC transport protocol implementation
-- **TLS 1.3 Integration**: Native TLS 1.3 handshake with certificate validation
+- **TLS 1.3 Integration**: Native TLS 1.3 handshake with certificate validation (via [swift-certificates](https://github.com/apple/swift-certificates))
 - **0-RTT Support**: Early data transmission with session resumption
 - **Connection Migration**: PATH_CHALLENGE/RESPONSE with address validation
 - **Type-Safe**: Leverages Swift's type system for compile-time safety
 - **Modern Concurrency**: Built with async/await, Sendable types, and structured concurrency
 - **Modular Design**: Clean separation between core types, crypto, and connection handling
-- **High Performance**: Optimized for 1Gbps+ throughput with low-latency packet processing
+- **High Performance**: Optimized for 1Gbps+ throughput
+  - Loss detection: 26K ops/sec
+  - Multi-range ACK: 4.8K ops/sec
+  - Full ACK cycle: 1.9M pkts/sec
 - **Memory Safe**: Validated encoding/decoding with bounds checking and overflow protection
 - **Graceful Shutdown**: Proper continuation management prevents hangs
 - **Security Hardened**: Integer overflow protection, ACK range validation, race condition prevention
@@ -34,6 +37,15 @@ dependencies: [
     .package(url: "https://github.com/1amageek/swift-quic.git", branch: "main")
 ]
 ```
+
+### Dependencies
+
+swift-quic uses the following Apple libraries:
+
+- [swift-crypto](https://github.com/apple/swift-crypto) - Cryptographic operations
+- [swift-certificates](https://github.com/apple/swift-certificates) - X.509 certificate handling
+- [swift-asn1](https://github.com/apple/swift-asn1) - ASN.1 encoding/decoding
+- [swift-log](https://github.com/apple/swift-log) - Logging
 
 ## Architecture
 
@@ -103,6 +115,8 @@ Cryptographic operations:
 - **SessionTicketStore**: Server-side session ticket management
 - **ClientSessionCache**: Client-side session resumption
 - **ReplayProtection**: 0-RTT replay attack prevention
+- **X509Certificate**: X.509 certificate handling (via [swift-certificates](https://github.com/apple/swift-certificates))
+- **X509Validator**: Certificate chain validation with EKU/SAN/NameConstraints
 
 ### QUICRecovery
 
@@ -110,7 +124,10 @@ Loss detection and congestion control (RFC 9002):
 
 - **RTTEstimator**: Smoothed RTT calculation with min RTT tracking
 - **AckManager**: Interval-based ACK frame generation with O(1) sequential packet tracking
-- **LossDetector**: Packet/time threshold loss detection with single-pass processing
+- **LossDetector**: Optimized packet/time threshold loss detection
+  - Sorted array storage for cache-efficient iteration
+  - Binary search for O(log n) range queries
+  - Bounded iteration (only processes relevant packets)
 - **PacketNumberSpaceManager**: Multi-level packet number space coordination
 - **SentPacket**: Sent packet metadata for loss tracking
 - **CongestionController**: Congestion control protocol with pacing support
@@ -262,64 +279,65 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 
 | Operation | Performance |
 |-----------|-------------|
-| Short header parsing | 6.3M ops/sec |
-| Long header parsing | 1.8M ops/sec |
-| DCID extraction (short) | 835K ops/sec |
-| DCID extraction (long) | 923K ops/sec |
-| ConnectionRouter lookup | 6.6M ops/sec |
-| Packet type extraction | 7.8M ops/sec |
+| Short header parsing | 4.7M ops/sec |
+| Long header parsing | 1.4M ops/sec |
+| DCID extraction (short) | 6.5M ops/sec |
+| DCID extraction (long) | 21.2M ops/sec |
+| ConnectionRouter lookup | 3.4M ops/sec |
+| Packet type extraction | 5.6M ops/sec |
 
 ### Core Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Varint encoding | 7.8M ops/sec |
-| Varint decoding | 450K ops/sec |
-| Varint fast path (1-byte) | 11.6M ops/sec |
-| ConnectionID creation | 678K ops/sec |
-| ConnectionID equality | 45.3M ops/sec |
-| ConnectionID hash | 16.1M ops/sec |
-| ConnectionID random | 809K ops/sec |
-| CID Dictionary lookup | 10.7M ops/sec |
+| Varint encoding | 3.4M ops/sec |
+| Varint decoding | 5.8M ops/sec |
+| Varint fast path (1-byte) | 12.5M ops/sec |
+| ConnectionID creation | 1.4M ops/sec |
+| ConnectionID equality | 42.3M ops/sec |
+| ConnectionID hash | 16.6M ops/sec |
+| ConnectionID random | 3.1M ops/sec |
+| CID Dictionary lookup | 10.5M ops/sec |
 
 ### Frame Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| PING frame encoding | 9.8M ops/sec |
-| PING frame decoding | 22.0M ops/sec |
-| ACK frame encoding | 610K ops/sec |
-| ACK frame decoding | 2.0M ops/sec |
-| STREAM frame encoding | 2.3M ops/sec |
-| Frame roundtrip | 986K ops/sec |
+| PING frame encoding | 24.5M ops/sec |
+| PING frame decoding | 22.2M ops/sec |
+| ACK frame encoding | 1.1M ops/sec |
+| ACK frame decoding | 1.9M ops/sec |
+| STREAM frame encoding | 2.1M ops/sec |
+| Frame roundtrip | 1.0M ops/sec |
 
 ### Crypto Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Initial key derivation | 21K ops/sec |
-| KeyMaterial derivation | 49.6K ops/sec |
-| AES-GCM Sealer creation | 12.0M ops/sec |
+| Initial key derivation | 23K ops/sec |
+| KeyMaterial derivation | 95.5K ops/sec |
+| AES-GCM Sealer creation | 4.1M ops/sec |
 
 ### Packet Operations
 
 | Operation | Performance |
 |-----------|-------------|
 | Packet number encoding | 4.8M ops/sec |
-| Packet number decoding | 10.2M ops/sec |
-| Coalesced packet building | 823K ops/sec |
-| Coalesced packet parsing | 677K ops/sec |
+| Packet number decoding | 5.5M ops/sec |
+| Coalesced packet building | 940K ops/sec |
+| Coalesced packet parsing | 572K ops/sec |
 
 ### Recovery Performance
 
 | Operation | Performance |
 |-----------|-------------|
-| Sequential packet recording | 11.0M ops/sec |
-| ACK frame generation | 34.9K ops/sec |
-| Packet send recording | 3.7M ops/sec |
-| Loss detection | 5.5K ops/sec |
-| Full ACK cycle | 503K pkts/sec |
-| Realistic QUIC stream | 45K pkts/sec |
+| Sequential packet recording | 9.7M ops/sec |
+| ACK frame generation | 139K ops/sec |
+| Packet send recording | 3.5M ops/sec |
+| **Loss detection** | **26.0K ops/sec** |
+| **Multi-range ACK (25 ranges)** | **4.8K ops/sec** |
+| Full ACK cycle | 1.9M pkts/sec |
+| Realistic QUIC stream | 219K pkts/sec |
 
 ### Memory Efficiency
 

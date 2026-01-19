@@ -30,6 +30,10 @@ let package = Package(
         // Cryptography
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
 
+        // X.509 Certificates and ASN.1
+        .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.0"),
+        .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.0"),
+
         // Logging
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
     ],
@@ -49,6 +53,8 @@ let package = Package(
             dependencies: [
                 "QUICCore",
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "X509", package: "swift-certificates"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
             ],
             path: "Sources/QUICCrypto",
             exclude: ["CONTEXT.md", "TLS/CONTEXT.md"]

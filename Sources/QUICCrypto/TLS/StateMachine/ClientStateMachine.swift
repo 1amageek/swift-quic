@@ -883,4 +883,14 @@ public final class ClientStateMachine: Sendable {
     public var resumptionMasterSecret: SymmetricKey? {
         state.withLock { $0.context.resumptionMasterSecret }
     }
+
+    /// Peer certificates (raw DER data, leaf certificate first)
+    public var peerCertificates: [Data]? {
+        state.withLock { $0.context.peerCertificates }
+    }
+
+    /// Parsed peer leaf certificate
+    public var peerCertificate: X509Certificate? {
+        state.withLock { $0.context.peerCertificate }
+    }
 }

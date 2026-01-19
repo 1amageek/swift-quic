@@ -390,6 +390,11 @@ public enum KnownOID: String, Sendable {
     case crlDistributionPoints = "2.5.29.31"
     case authorityInfoAccess = "1.3.6.1.5.5.7.1.1"
 
+    // libp2p extension
+    /// libp2p public key extension OID (1.3.6.1.4.1.53594.1.1)
+    /// Contains a SignedKey structure with the peer's public key
+    case libp2pPublicKey = "1.3.6.1.4.1.53594.1.1"
+
     // X.500 attribute types
     case commonName = "2.5.4.3"
     case surname = "2.5.4.4"
@@ -428,6 +433,7 @@ public enum KnownOID: String, Sendable {
         case .certificatePolicies: return "certificatePolicies"
         case .crlDistributionPoints: return "crlDistributionPoints"
         case .authorityInfoAccess: return "authorityInfoAccess"
+        case .libp2pPublicKey: return "libp2pPublicKey"
         case .commonName: return "commonName"
         case .surname: return "surname"
         case .serialNumber: return "serialNumber"

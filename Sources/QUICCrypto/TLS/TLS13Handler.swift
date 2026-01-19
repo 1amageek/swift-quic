@@ -178,6 +178,30 @@ public final class TLS13Handler: TLS13Provider, Sendable {
         state.withLock { $0.is0RTTAttempted }
     }
 
+    /// Peer certificates (raw DER data, leaf certificate first)
+    /// Available after receiving peer's Certificate message
+    public var peerCertificates: [Data]? {
+        state.withLock { state in
+            if state.isClientMode {
+                return state.clientStateMachine?.peerCertificates
+            } else {
+                return state.serverStateMachine?.peerCertificates
+            }
+        }
+    }
+
+    /// Parsed peer leaf certificate
+    /// Available after receiving peer's Certificate message
+    public var peerCertificate: X509Certificate? {
+        state.withLock { state in
+            if state.isClientMode {
+                return state.clientStateMachine?.peerCertificate
+            } else {
+                return state.serverStateMachine?.peerCertificate
+            }
+        }
+    }
+
     public func requestKeyUpdate() async throws -> [TLSOutput] {
         // Key update implementation (RFC 9001 Section 6 for QUIC)
         return try state.withLock { state in
@@ -1009,6 +1033,16 @@ public final class ServerStateMachine: Sendable {
     /// Resumption master secret (available after handshake completion)
     public var resumptionMasterSecret: SymmetricKey? {
         state.withLock { $0.context.resumptionMasterSecret }
+    }
+
+    /// Peer certificates (raw DER data, leaf certificate first)
+    public var peerCertificates: [Data]? {
+        state.withLock { $0.context.peerCertificates }
+    }
+
+    /// Parsed peer leaf certificate
+    public var peerCertificate: X509Certificate? {
+        state.withLock { $0.context.peerCertificate }
     }
 }
 
