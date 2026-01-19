@@ -613,7 +613,7 @@ struct FrameCodecTests {
         for originalFrame in testFrames {
             let encoded = try codec.encode(originalFrame)
             var reader = DataReader(encoded)
-            let decoded = try codec.decode(from: &reader)
+            _ = try codec.decode(from: &reader)
 
             // Verify reader consumed all data
             #expect(reader.remainingCount == 0, "Frame \(originalFrame.frameType) did not consume all data")
