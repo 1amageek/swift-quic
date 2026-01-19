@@ -573,6 +573,8 @@ public final class ClientStateMachine: Sendable {
                 var validationOptions = X509ValidationOptions()
                 validationOptions.hostname = state.configuration.serverName
                 validationOptions.allowSelfSigned = state.configuration.allowSelfSigned
+                // RFC 5280 Section 4.2.1.12: Server certificates MUST have serverAuth EKU
+                validationOptions.requiredEKU = .serverAuth
 
                 // Create validator with trusted roots
                 let validator = X509Validator(

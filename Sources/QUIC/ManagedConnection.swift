@@ -62,6 +62,12 @@ public final class ManagedConnection: Sendable {
     /// Servers must not send more than 3x bytes received until address is validated
     private let amplificationLimiter: AntiAmplificationLimiter
 
+    /// Path validation manager for connection migration (RFC 9000 Section 9.3)
+    private let pathValidationManager: PathValidationManager
+
+    /// Connection ID manager for connection migration (RFC 9000 Section 9.5)
+    private let connectionIDManager: ConnectionIDManager
+
     /// Internal state
     private let state: Mutex<ManagedConnectionState>
 
@@ -141,17 +147,23 @@ public final class ManagedConnection: Sendable {
         self.packetProcessor = PacketProcessor(dcidLength: sourceConnectionID.length)
         self.tlsProvider = tlsProvider
         self.amplificationLimiter = AntiAmplificationLimiter(isServer: role == .server)
+        self.pathValidationManager = PathValidationManager()
+        self.connectionIDManager = ConnectionIDManager(
+            activeConnectionIDLimit: transportParameters.activeConnectionIDLimit
+        )
         self.localAddress = localAddress
         self.remoteAddress = remoteAddress
         // For clients, original DCID is the initial destination CID
         // For servers, original DCID is the DCID from the client's Initial packet
         self.originalConnectionID = originalConnectionID ?? destinationConnectionID
         self.transportParameters = transportParameters
-        self.state = Mutex(ManagedConnectionState(
+        var initialState = ManagedConnectionState(
             role: role,
             sourceConnectionID: sourceConnectionID,
             destinationConnectionID: destinationConnectionID
-        ))
+        )
+        initialState.currentRemoteAddress = remoteAddress
+        self.state = Mutex(initialState)
         self.streamContinuationsState = Mutex(StreamContinuationsState())
         self.incomingStreamState = Mutex(IncomingStreamState())
         self.sessionTicketState = Mutex(SessionTicketState())
@@ -767,39 +779,17 @@ public final class ManagedConnection: Sendable {
 
     // MARK: - Transport Parameters
 
-    /// Encodes transport parameters to wire format
+    /// Encodes transport parameters to wire format using RFC 9000 compliant codec
     private func encodeTransportParameters(_ params: TransportParameters) -> Data {
-        // Simple encoding - in production use proper varint encoding
-        var data = Data()
-
-        // Encode key parameters as TLV
-        func appendParameter(id: UInt64, value: UInt64) {
-            var idData = Data()
-            Varint(id).encode(to: &idData)
-            var valData = Data()
-            Varint(value).encode(to: &valData)
-            var lenData = Data()
-            Varint(UInt64(valData.count)).encode(to: &lenData)
-            data.append(idData)
-            data.append(lenData)
-            data.append(valData)
-        }
-
-        appendParameter(id: 0x04, value: params.initialMaxData)
-        appendParameter(id: 0x05, value: params.initialMaxStreamDataBidiLocal)
-        appendParameter(id: 0x06, value: params.initialMaxStreamDataBidiRemote)
-        appendParameter(id: 0x07, value: params.initialMaxStreamDataUni)
-        appendParameter(id: 0x08, value: params.initialMaxStreamsBidi)
-        appendParameter(id: 0x09, value: params.initialMaxStreamsUni)
-
-        return data
+        // Use proper TransportParameterCodec for RFC 9000 compliant encoding
+        // This includes mandatory initial_source_connection_id parameter
+        return TransportParameterCodec.encode(params)
     }
 
     /// Decodes transport parameters from wire format
     private func decodeTransportParameters(_ data: Data) -> TransportParameters? {
-        // For mock TLS, just return defaults
-        // Real implementation would parse the TLV format
-        return TransportParameters()
+        // Use proper TransportParameterCodec for RFC 9000 compliant decoding
+        return try? TransportParameterCodec.decode(data)
     }
 }
 
@@ -1121,6 +1111,191 @@ extension ManagedConnection {
             offeredVersions: [version]
         )
     }
+
+    // MARK: - Connection Migration (RFC 9000 Section 9)
+
+    /// The current remote address (may differ from initial address after migration)
+    public var currentRemoteAddress: SocketAddress {
+        state.withLock { $0.currentRemoteAddress ?? remoteAddress }
+    }
+
+    /// Whether the current path has been validated
+    public var isPathValidated: Bool {
+        state.withLock { $0.pathValidated }
+    }
+
+    /// Handles a packet received from a different address (potential migration)
+    ///
+    /// RFC 9000 Section 9.3: When receiving a packet from a new peer address,
+    /// the endpoint MUST perform path validation if it has not previously done so.
+    ///
+    /// - Parameters:
+    ///   - packet: The received packet data
+    ///   - newAddress: The new remote address from which the packet was received
+    /// - Returns: Packets to send in response (may include PATH_CHALLENGE)
+    /// - Throws: `MigrationError` if migration is not allowed
+    public func handleAddressChange(
+        packet: Data,
+        newAddress: SocketAddress
+    ) async throws -> [Data] {
+        // Check if migration is allowed
+        let (allowMigration, currentAddress) = state.withLock { s in
+            (
+                !s.peerDisableActiveMigration,
+                s.currentRemoteAddress ?? remoteAddress
+            )
+        }
+
+        // If address hasn't changed, process normally
+        if newAddress == currentAddress {
+            return try await processIncomingPacket(packet)
+        }
+
+        // Check if peer allows migration
+        guard allowMigration else {
+            throw MigrationError.migrationDisabled
+        }
+
+        // Update address and mark path as not validated
+        state.withLock { s in
+            s.currentRemoteAddress = newAddress
+            s.pathValidated = false
+        }
+
+        // For servers: reset anti-amplification limit for new path (RFC 9000 Section 9.3)
+        // Note: Address validation needs to be completed via PATH_CHALLENGE/RESPONSE
+        // The amplification limiter will be reset once path validation completes
+
+        // Record bytes received for anti-amplification
+        amplificationLimiter.recordBytesReceived(UInt64(packet.count))
+
+        // Process the packet
+        var responses = try await processIncomingPacket(packet)
+
+        // Initiate path validation by sending PATH_CHALLENGE
+        let path = NetworkPath(
+            localAddress: localAddress?.description ?? "",
+            remoteAddress: newAddress.description
+        )
+        let challengeData = pathValidationManager.startValidation(for: path)
+
+        // Queue PATH_CHALLENGE to be sent with next packet
+        state.withLock { s in
+            s.pendingPathChallenges.append(challengeData)
+        }
+
+        // Generate a packet with PATH_CHALLENGE if we can
+        if let challengePacket = try createPathChallengePacket(challengeData: challengeData) {
+            responses.append(challengePacket)
+        }
+
+        return responses
+    }
+
+    /// Handles a PATH_CHALLENGE frame
+    ///
+    /// RFC 9000 Section 9.3.2: An endpoint MUST respond immediately to a
+    /// PATH_CHALLENGE frame with a PATH_RESPONSE frame containing the same data.
+    ///
+    /// - Parameter data: The 8-byte challenge data
+    /// - Returns: PATH_RESPONSE packet to send
+    public func handlePathChallenge(_ data: Data) throws -> Data? {
+        // Generate PATH_RESPONSE
+        _ = pathValidationManager.handleChallenge(data)
+
+        // Queue response to be sent
+        state.withLock { s in
+            s.pendingPathResponses.append(data)
+        }
+
+        // Create packet with PATH_RESPONSE
+        return try createPathResponsePacket(data: data)
+    }
+
+    /// Handles a PATH_RESPONSE frame
+    ///
+    /// RFC 9000 Section 9.3.3: Receipt of a PATH_RESPONSE frame indicates
+    /// that the path is valid.
+    ///
+    /// - Parameter data: The 8-byte response data
+    /// - Returns: Whether this completes path validation
+    public func handlePathResponse(_ data: Data) -> Bool {
+        if let _ = pathValidationManager.handleResponse(data) {
+            // Path validated successfully
+            state.withLock { s in
+                s.pathValidated = true
+            }
+            return true
+        }
+        return false
+    }
+
+    /// Sets whether peer allows active migration (from transport parameters)
+    ///
+    /// Called when processing peer's transport parameters.
+    public func setPeerDisableActiveMigration(_ disabled: Bool) {
+        state.withLock { s in
+            s.peerDisableActiveMigration = disabled
+        }
+    }
+
+    /// Gets pending PATH_CHALLENGE frames to include in next packet
+    public func getPendingPathChallenges() -> [Data] {
+        state.withLock { s in
+            let challenges = s.pendingPathChallenges
+            s.pendingPathChallenges.removeAll()
+            return challenges
+        }
+    }
+
+    /// Gets pending PATH_RESPONSE frames to include in next packet
+    public func getPendingPathResponses() -> [Data] {
+        state.withLock { s in
+            let responses = s.pendingPathResponses
+            s.pendingPathResponses.removeAll()
+            return responses
+        }
+    }
+
+    // MARK: - Migration Private Helpers
+
+    /// Creates a packet containing a PATH_CHALLENGE frame
+    ///
+    /// - Note: This queues the frame to be sent with the next outbound packet.
+    ///   The actual packet creation happens via the normal packet sending mechanism.
+    private func createPathChallengePacket(challengeData: Data) throws -> Data? {
+        // PATH_CHALLENGE will be included in the next 1-RTT packet
+        // Queue the frame via the handler
+        handler.queueFrame(.pathChallenge(challengeData), level: .application)
+
+        // Return nil - the frame will be sent with normal packet flow
+        // This avoids duplicating packet creation logic
+        return nil
+    }
+
+    /// Creates a packet containing a PATH_RESPONSE frame
+    ///
+    /// - Note: This queues the frame to be sent with the next outbound packet.
+    private func createPathResponsePacket(data: Data) throws -> Data? {
+        // PATH_RESPONSE must be sent immediately (RFC 9000 Section 8.2.2)
+        // Queue the frame via the handler
+        handler.queueFrame(.pathResponse(data), level: .application)
+
+        // Return nil - the frame will be sent with normal packet flow
+        return nil
+    }
+}
+
+/// Connection migration errors
+public enum MigrationError: Error, Sendable {
+    /// Migration is disabled by peer (disable_active_migration transport parameter)
+    case migrationDisabled
+
+    /// Path validation failed
+    case pathValidationFailed(reason: String)
+
+    /// No active connection ID available for migration
+    case noActiveConnectionID
 }
 
 // MARK: - Internal State
@@ -1138,6 +1313,23 @@ private struct ManagedConnectionState: Sendable {
     /// Whether we have received and successfully processed any valid packet
     /// RFC 9000 Section 6.2: Used to discard late Version Negotiation packets
     var hasReceivedValidPacket: Bool = false
+
+    // MARK: - Connection Migration State
+
+    /// Current remote address (may change during connection migration)
+    var currentRemoteAddress: SocketAddress?
+
+    /// Whether the current path has been validated (RFC 9000 Section 9.3)
+    var pathValidated: Bool = true
+
+    /// Whether peer allows active migration (from transport parameters)
+    var peerDisableActiveMigration: Bool = false
+
+    /// Pending PATH_CHALLENGE frames to send
+    var pendingPathChallenges: [Data] = []
+
+    /// Pending PATH_RESPONSE frames to send
+    var pendingPathResponses: [Data] = []
 }
 
 // MARK: - Errors

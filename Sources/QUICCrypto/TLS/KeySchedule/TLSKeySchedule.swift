@@ -119,10 +119,11 @@ public struct TLSKeySchedule: Sendable {
         }
 
         // Derive-Secret(early_secret, "derived", "")
+        // RFC 8446: Transcript-Hash("") is the hash of empty string, not zeros
         let derivedSecret = deriveSecret(
             secret: earlySecret,
             label: "derived",
-            transcriptHash: Data(repeating: 0, count: hashLength)  // Empty hash
+            transcriptHash: emptyTranscriptHash()
         )
 
         // HKDF-Extract(derived_secret, shared_secret)
@@ -165,10 +166,11 @@ public struct TLSKeySchedule: Sendable {
         }
 
         // Derive-Secret(handshake_secret, "derived", "")
+        // RFC 8446: Transcript-Hash("") is the hash of empty string, not zeros
         let derivedSecret = deriveSecret(
             secret: handshakeSecret,
             label: "derived",
-            transcriptHash: Data(repeating: 0, count: hashLength)  // Empty hash
+            transcriptHash: emptyTranscriptHash()
         )
 
         // HKDF-Extract(derived_secret, 0)

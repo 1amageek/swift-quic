@@ -217,9 +217,15 @@ public final class PacketProcessor: Sendable {
     }
 
     /// Decrypts all packets from a coalesced UDP datagram
+    ///
+    /// RFC 9000 Section 12.2: A receiver MUST be able to process multiple QUIC packets in a single UDP datagram.
+    /// Packets that cannot be decrypted (e.g., no keys available yet) are skipped, and successfully
+    /// decrypted packets are returned. This is important for coalesced datagrams containing packets
+    /// at different encryption levels (e.g., Initial + Handshake).
+    ///
     /// - Parameter datagram: The UDP datagram
-    /// - Returns: Array of parsed packets
-    /// - Throws: Error if any packet fails to decrypt
+    /// - Returns: Array of successfully parsed packets (may be empty if none decrypt)
+    /// - Throws: Only throws for fatal errors like invalid datagram format
     public func decryptDatagram(_ datagram: Data) throws -> [ParsedPacket] {
         // Split coalesced packets (lock-free read)
         let dcid = dcidLengthValue
@@ -227,8 +233,22 @@ public final class PacketProcessor: Sendable {
 
         var results: [ParsedPacket] = []
         for info in packetInfos {
-            let parsed = try decryptPacket(info.data)
-            results.append(parsed)
+            do {
+                let parsed = try decryptPacket(info.data)
+                results.append(parsed)
+            } catch PacketCodecError.noOpener {
+                // No keys for this encryption level yet - skip this packet
+                // This is normal for coalesced datagrams during handshake
+                continue
+            } catch PacketCodecError.decryptionFailed {
+                // Decryption failed - packet may be corrupted or keys are wrong
+                continue
+            } catch QUICError.decryptionFailed {
+                // AEAD decryption failed - authentication tag mismatch
+                continue
+            } catch {
+                throw error
+            }
         }
         return results
     }
