@@ -8,7 +8,7 @@ This document maps the swift-quic implementation to the QUIC specifications (RFC
 |-----|-------|-------------------|
 | RFC 9000 | QUIC: A UDP-Based Multiplexed and Secure Transport | Compliant |
 | RFC 9001 | Using TLS to Secure QUIC | Compliant |
-| RFC 9002 | QUIC Loss Detection and Congestion Control | Partial |
+| RFC 9002 | QUIC Loss Detection and Congestion Control | Compliant |
 | RFC 9221 | DATAGRAM Extension | Compliant |
 | RFC 9369 | QUIC Version 2 | Compliant |
 
@@ -281,6 +281,49 @@ public mutating func updateKeys() throws -> (client: KeyMaterial, server: KeyMat
 ---
 
 ## RFC 9000: QUIC Transport Protocol
+
+### Section 8.1: Address Validation (Anti-Amplification)
+
+**RFC Requirement:**
+> Prior to validating the client address, servers MUST NOT send more than three times as many bytes as the number of bytes they have received.
+
+**Implementation:** `Sources/QUICRecovery/AntiAmplificationLimiter.swift:36-68`
+```swift
+public final class AntiAmplificationLimiter: Sendable {
+    private struct LimiterState: Sendable {
+        var bytesReceived: UInt64 = 0
+        var bytesSent: UInt64 = 0
+        let amplificationFactor: UInt64 = 3
+        var addressValidated: Bool = false
+        let isServer: Bool
+
+        /// Uses saturating multiplication to prevent overflow
+        var sendLimit: UInt64 {
+            let (result, overflow) = bytesReceived.multipliedReportingOverflow(by: amplificationFactor)
+            return overflow ? UInt64.max : result
+        }
+    }
+
+    public func canSend(bytes: UInt64) -> Bool {
+        state.withLock { s in
+            guard s.isServer else { return true }
+            guard !s.addressValidated else { return true }
+            let (total, overflow) = s.bytesSent.addingReportingOverflow(bytes)
+            if overflow { return false }
+            return total <= s.sendLimit
+        }
+    }
+}
+```
+
+**Security Hardening:**
+- Saturating multiplication prevents integer overflow when computing send limit
+- Saturating addition prevents overflow in byte tracking
+- Overflow check in `canSend()` prevents sending when arithmetic would overflow
+
+**Compliance:** COMPLIANT
+
+---
 
 ### Section 14.1: Initial Packet Size
 
@@ -662,6 +705,114 @@ public struct DatagramFrame: Sendable, Hashable {
 
 ---
 
+## RFC 9002: QUIC Loss Detection and Congestion Control
+
+### Section 6: Loss Detection
+
+**RFC Requirement:**
+> A packet is declared lost if it meets all the following conditions:
+> - The packet is unacknowledged, in-flight, and was sent prior to an acknowledged packet.
+> - The packet was sent kPacketThreshold packets before an acknowledged packet, or it was sent long enough in the past.
+
+**Implementation:** `Sources/QUICRecovery/LossDetector.swift:196-267`
+```swift
+private func detectLostPacketsInternal(
+    _ state: inout LossState,
+    now: ContinuousClock.Instant,
+    rttEstimator: RTTEstimator
+) -> [SentPacket] {
+    guard let largestAcked = state.largestAckedPacket else { return [] }
+
+    // Calculate loss delay threshold
+    let baseRTT = max(rttEstimator.latestRTT, rttEstimator.smoothedRTT)
+    let lossDelay = baseRTT * LossDetectionConstants.timeThresholdNumerator /
+                    LossDetectionConstants.timeThresholdDenominator
+    let lossDelayThreshold = max(lossDelay, LossDetectionConstants.granularity)
+
+    for (pn, packet) in state.sentPackets {
+        // Packet threshold loss: 3+ newer packets acknowledged
+        let packetLost = largestAcked >= pn + LossDetectionConstants.packetThreshold
+        // Time threshold loss
+        let timeLost = (now - packet.timeSent) >= lossDelayThreshold
+
+        if packetLost || timeLost {
+            // Mark as lost
+        }
+    }
+}
+```
+
+**Security Hardening:**
+- ACK range validation prevents underflow attacks
+- Guards against malformed ACK frames with invalid gap/range combinations
+
+**Compliance:** COMPLIANT
+
+---
+
+### Section 7: Congestion Control
+
+**RFC Requirement:**
+> QUIC's default congestion controller is similar to TCP NewReno.
+
+**Implementation:** `Sources/QUICRecovery/NewRenoCongestionController.swift`
+- Slow start with exponential growth
+- Congestion avoidance with AIMD
+- Fast recovery on packet loss
+- Persistent congestion detection
+- ECN-CE response
+
+**Compliance:** COMPLIANT
+
+---
+
+## Security Hardening
+
+### Integer Overflow Protection
+
+All arithmetic operations that could overflow use saturating arithmetic:
+
+| Component | Protection |
+|-----------|------------|
+| AntiAmplificationLimiter | `multipliedReportingOverflow`, `addingReportingOverflow` |
+| FlowController | Overflow checks before credit operations |
+| LossDetector | ACK range validation before subtraction |
+
+### ACK Range Validation
+
+**Implementation:** `Sources/QUICRecovery/LossDetector.swift:144-166`
+```swift
+for (index, range) in ackFrame.ackRanges.enumerated() {
+    if index == 0 {
+        // Validate: rangeLength must not exceed current to prevent underflow
+        guard range.rangeLength <= current else { continue }
+        rangeStart = current - range.rangeLength
+    } else {
+        // Validate: gap + 2 must not exceed current to prevent underflow
+        let gapOffset = range.gap + 2
+        guard gapOffset <= current else { break }
+        current = current - gapOffset
+        guard range.rangeLength <= current else { continue }
+        rangeStart = current - range.rangeLength
+    }
+}
+```
+
+### Connection ID Validation
+
+**Implementation:** `Sources/QUIC/PacketProcessor.swift`
+- DCID length clamped to 0-20 bytes per RFC 9000 Section 17.2
+- Prevents buffer over-read attacks
+
+### Race Condition Prevention
+
+**Implementation:** `Sources/QUIC/ManagedConnection.swift`
+- `shutdown()` guards against concurrent calls
+- `start()` / `startWith0RTT()` atomic state transition prevents double-start
+- AsyncStream continuation properly finished on shutdown
+
+---
+
 ## Verification Checklist
 
 ### Cryptographic Operations
@@ -716,11 +867,13 @@ public struct DatagramFrame: Sendable, Hashable {
 
 ## Notes
 
-1. **MockTLSProvider**: The current implementation uses a mock TLS provider for testing. For production use, integration with a real TLS 1.3 implementation (BoringSSL, Security.framework) is required.
+1. **TLS 1.3 Integration**: The implementation includes a native TLS 1.3 handshake state machine (`TLS13Handler`) with certificate validation support. A `MockTLSProvider` is also available for testing.
 
-2. **ChaCha20-Poly1305**: RFC 9001 also defines ChaCha20-Poly1305 as an alternative cipher suite. This implementation currently only supports AES-128-GCM.
+2. **Cipher Suites**: Both AES-128-GCM and ChaCha20-Poly1305 are supported per RFC 9001.
 
 3. **Platform Support**: AES-ECB for header protection uses CommonCrypto on Apple platforms. Linux support would require an alternative implementation.
+
+4. **0-RTT Support**: Early data transmission is supported with replay protection. Session tickets are managed via `SessionTicketStore` (server) and `ClientSessionCache` (client).
 
 ---
 

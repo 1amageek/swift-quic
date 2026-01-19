@@ -8,13 +8,17 @@ swift-quic provides a modern, type-safe QUIC implementation designed for the swi
 
 ## Features
 
-- **RFC 9000/9001/9002 Compliant**: Core QUIC transport protocol implementation
+- **RFC 9000/9001/9002 Compliant**: Full QUIC transport protocol implementation
+- **TLS 1.3 Integration**: Native TLS 1.3 handshake with certificate validation
+- **0-RTT Support**: Early data transmission with session resumption
+- **Connection Migration**: PATH_CHALLENGE/RESPONSE with address validation
 - **Type-Safe**: Leverages Swift's type system for compile-time safety
 - **Modern Concurrency**: Built with async/await, Sendable types, and structured concurrency
 - **Modular Design**: Clean separation between core types, crypto, and connection handling
 - **High Performance**: Optimized for 1Gbps+ throughput with low-latency packet processing
-- **Memory Safe**: Validated encoding/decoding with bounds checking
+- **Memory Safe**: Validated encoding/decoding with bounds checking and overflow protection
 - **Graceful Shutdown**: Proper continuation management prevents hangs
+- **Security Hardened**: Integer overflow protection, ACK range validation, race condition prevention
 
 ## Requirements
 
@@ -91,8 +95,14 @@ Cryptographic operations:
 
 - **InitialSecrets**: Initial key derivation (RFC 9001)
 - **KeyMaterial**: Encryption key management
-- **AEAD**: AES-128-GCM encryption
+- **AEAD**: AES-128-GCM and ChaCha20-Poly1305 encryption
 - **HeaderProtection**: AES-ECB header protection
+- **KeyUpdate**: AEAD limit tracking and key rotation (RFC 9001 Section 6)
+- **RetryIntegrityTag**: Retry packet integrity verification (RFC 9001 Section 5.8)
+- **TLS13Handler**: Native TLS 1.3 handshake state machine
+- **SessionTicketStore**: Server-side session ticket management
+- **ClientSessionCache**: Client-side session resumption
+- **ReplayProtection**: 0-RTT replay attack prevention
 
 ### QUICRecovery
 
@@ -105,6 +115,7 @@ Loss detection and congestion control (RFC 9002):
 - **SentPacket**: Sent packet metadata for loss tracking
 - **CongestionController**: Congestion control protocol with pacing support
 - **NewRenoCongestionController**: NewReno implementation with slow start, congestion avoidance, and recovery
+- **AntiAmplificationLimiter**: Server-side 3x amplification limit (RFC 9000 Section 8.1)
 
 ### QUICConnection
 
@@ -113,6 +124,17 @@ Connection state management:
 - **ConnectionState**: State machine for QUIC connections
 - **QUICConnectionHandler**: Main connection orchestrator
 - **CryptoStreamManager**: CRYPTO frame reassembly
+- **PathValidationManager**: PATH_CHALLENGE/RESPONSE handling
+- **StatelessResetManager**: Stateless reset token generation and validation
+- **IdleTimeoutManager**: Connection idle timeout tracking
+
+### QUICTransport
+
+Transport-level features:
+
+- **ECN**: Explicit Congestion Notification support
+- **Pacing**: Token bucket pacing for burst prevention
+- **UDPSocket**: UDP datagram transmission
 
 ### QUICStream
 
@@ -335,7 +357,7 @@ Run all tests:
 swift test
 ```
 
-353 tests covering:
+641 tests covering:
 - Frame encoding/decoding for all 19 frame types
 - Packet encoding/decoding with header protection
 - Coalesced packet building and parsing
@@ -348,6 +370,12 @@ swift test
 - Out-of-order data reassembly (DataBuffer)
 - Priority scheduling (StreamPriority, StreamScheduler)
 - RFC 9000 Section 4.5 compliance (Stream Final Size)
+- RFC 9001 test vectors (Initial secrets, key derivation)
+- TLS 1.3 handshake flow (client/server, HelloRetryRequest)
+- 0-RTT early data handling
+- Key Update state transitions and AEAD limits
+- Version Negotiation and Retry packet processing
+- Anti-amplification limit enforcement
 - ManagedConnection shutdown safety (continuation management)
 - AsyncStream lifecycle and graceful termination
 - Performance benchmarks
@@ -375,16 +403,25 @@ swift test --filter Benchmark
   - Final size immutability enforcement
   - RESET_STREAM final size vs flow control limit validation
   - Out-of-order FIN validation against buffered data
+- **RFC 9000 Section 8.1**: Anti-Amplification Limit
+  - Server-side 3x amplification limit before address validation
+  - Overflow-safe byte tracking with saturating arithmetic
 - **RFC 9000 Section 12.4**: Varint-encoded frame types (supports extended frame types)
 - **RFC 9000 Section 14.1**: Initial packet minimum size (1200 bytes) with automatic padding
 - **RFC 9000 Section 17**: Long and Short header formats with validation
 - **RFC 9000 Section 19**: All 19 frame types with proper encoding/decoding
+- **RFC 9001 Section 4**: 0-RTT early data with replay protection
+- **RFC 9001 Section 5.2**: Initial keys with AES-128-GCM-SHA256
 - **RFC 9001 Section 5.4**: Header protection with 4-byte packet number handling
-- **RFC 9001 Section 5.8**: Retry packet integrity tag parsing
+- **RFC 9001 Section 5.8**: Retry packet integrity tag verification
+- **RFC 9001 Section 6**: Key Update mechanism with AEAD limit tracking
 - **RFC 9218**: Extensible priority scheme (urgency 0-7, incremental flag)
   - Priority-based stream scheduling
   - Fair queuing within same priority level (round-robin)
   - Mutable stream priorities
+- **RFC 9002 Section 6**: Loss Detection
+  - Packet and time threshold based detection
+  - PTO (Probe Timeout) calculation
 - **RFC 9002 Section 7**: Congestion Control
   - NewReno congestion controller with slow start, congestion avoidance, recovery
   - Pacing support for burst prevention
@@ -393,11 +430,16 @@ swift test --filter Benchmark
 
 ### Security
 
+- Integer overflow protection with saturating arithmetic
+- ACK range underflow validation (prevents malformed ACK processing)
 - ACK range count validation (prevents memory exhaustion attacks)
 - PATH_CHALLENGE/PATH_RESPONSE 8-byte payload enforcement
 - STREAM/DATAGRAM frame boundary validation
 - Flow control violation detection (connection close on violation)
 - RESET_STREAM final size validation against advertised limits
+- DCID length validation (0-20 bytes per RFC 9000 Section 17.2)
+- Double-start prevention in connection handshake
+- Race condition prevention in shutdown paths
 - Graceful shutdown prevents continuation leaks and resource exhaustion
 
 ## Roadmap
@@ -428,20 +470,32 @@ swift test --filter Benchmark
   - [x] DataBuffer for out-of-order reassembly
   - [x] STOP_SENDING/RESET_STREAM handling
   - [x] Priority scheduling (RFC 9218)
-- [x] Phase 5: High-Level API
-  - [x] QUICEndpoint (server/client entry point)
-  - [x] ManagedConnection with async stream APIs
-  - [x] ConnectionRouter with DCID routing
-  - [x] PacketProcessor for encryption integration
-  - [x] Graceful shutdown with continuation cleanup
-- [x] Phase 6: Congestion Control (RFC 9002 Section 7)
-  - [x] CongestionController protocol with pacing support
-  - [x] NewRenoCongestionController (slow start, congestion avoidance, recovery)
-  - [x] Persistent congestion detection
-  - [x] ECN congestion event handling
-- [ ] Phase 7: Full Integration
-  - [ ] E2E handshake with real TLS
-  - [ ] Interoperability testing (quiche, quinn)
+- [x] Phase 5: Version Negotiation & Retry
+  - [x] VersionNegotiator for VN packet handling
+  - [x] RetryIntegrityTag verification (RFC 9001 Section 5.8)
+  - [x] AntiAmplificationLimiter (RFC 9000 Section 8.1)
+- [x] Phase 6: Connection Migration
+  - [x] PathValidationManager (PATH_CHALLENGE/RESPONSE)
+  - [x] StatelessResetManager
+  - [x] IdleTimeoutManager
+- [x] Phase 7: 0-RTT & Session Resumption
+  - [x] ClientSessionCache for session tickets
+  - [x] SessionTicketStore for server-side
+  - [x] ReplayProtection for 0-RTT
+  - [x] startWith0RTT() API
+- [x] Phase 8: Quality Improvements
+  - [x] ECN support for congestion signaling
+  - [x] Pacing for send rate control
+  - [x] KeyUpdate for AEAD limit tracking
+  - [x] ChaCha20-Poly1305 support
+- [x] Phase 9: Security Hardening
+  - [x] Integer overflow protection (saturating arithmetic)
+  - [x] ACK range underflow validation
+  - [x] Race condition prevention in shutdown
+  - [x] Double-start vulnerability fix
+- [ ] Phase 10: Interoperability Testing
+  - [ ] quic-go interop tests
+  - [ ] ngtcp2 interop tests
 
 ## References
 
