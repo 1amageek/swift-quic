@@ -143,26 +143,36 @@ public struct FlowController: Sendable {
     /// - Parameter bytes: Number of bytes to receive
     /// - Returns: true if within receive limit
     public func canReceive(bytes: UInt64) -> Bool {
-        connectionBytesReceived + bytes <= connectionRecvLimit
+        // Use saturating arithmetic to prevent overflow
+        let (total, overflow) = connectionBytesReceived.addingReportingOverflow(bytes)
+        if overflow { return false }
+        return total <= connectionRecvLimit
     }
 
     /// Record bytes received on the connection
     /// - Parameter bytes: Number of bytes received
     public mutating func recordBytesReceived(_ bytes: UInt64) {
-        connectionBytesReceived += bytes
+        // Use saturating addition to prevent overflow
+        let (total, overflow) = connectionBytesReceived.addingReportingOverflow(bytes)
+        connectionBytesReceived = overflow ? UInt64.max : total
     }
 
     /// Check if we can send more data on the connection
     /// - Parameter bytes: Number of bytes to send
     /// - Returns: true if within send limit
     public func canSend(bytes: UInt64) -> Bool {
-        connectionBytesSent + bytes <= connectionSendLimit
+        // Use saturating arithmetic to prevent overflow
+        let (total, overflow) = connectionBytesSent.addingReportingOverflow(bytes)
+        if overflow { return false }
+        return total <= connectionSendLimit
     }
 
     /// Record bytes sent on the connection
     /// - Parameter bytes: Number of bytes sent
     public mutating func recordBytesSent(_ bytes: UInt64) {
-        connectionBytesSent += bytes
+        // Use saturating addition to prevent overflow
+        let (total, overflow) = connectionBytesSent.addingReportingOverflow(bytes)
+        connectionBytesSent = overflow ? UInt64.max : total
         if connectionBytesSent >= connectionSendLimit {
             connectionBlocked = true
         }
@@ -186,14 +196,19 @@ public struct FlowController: Sendable {
     /// Generate MAX_DATA frame if needed
     /// - Returns: MAX_DATA frame if window update needed, nil otherwise
     public mutating func generateMaxData() -> MaxDataFrame? {
-        // Calculate remaining window
+        // Calculate remaining window (with underflow protection)
+        guard connectionRecvLimit >= connectionBytesReceived else {
+            // Already exceeded limit - shouldn't happen but protect against it
+            return nil
+        }
         let remaining = connectionRecvLimit - connectionBytesReceived
         let threshold = UInt64(Double(initialConnectionRecvLimit) * autoUpdateThreshold)
 
         // Send MAX_DATA if remaining window is below threshold
         if remaining < threshold {
-            // Increase limit by initial amount
-            connectionRecvLimit += initialConnectionRecvLimit
+            // Increase limit by initial amount (with overflow protection)
+            let (newLimit, overflow) = connectionRecvLimit.addingReportingOverflow(initialConnectionRecvLimit)
+            connectionRecvLimit = overflow ? UInt64.max : newLimit
             return MaxDataFrame(maxData: connectionRecvLimit)
         }
 
@@ -293,14 +308,18 @@ public struct FlowController: Sendable {
             return nil
         }
 
+        // Underflow protection
+        guard limit >= received else { return nil }
         let remaining = limit - received
         let initialLimit = getInitialStreamLimit(for: streamID)
         let threshold = UInt64(Double(initialLimit) * autoUpdateThreshold)
 
         if remaining < threshold {
-            let newLimit = limit + initialLimit
-            streamRecvLimits[streamID] = newLimit
-            return MaxStreamDataFrame(streamID: streamID, maxStreamData: newLimit)
+            // Overflow protection
+            let (newLimit, overflow) = limit.addingReportingOverflow(initialLimit)
+            let safeLimit = overflow ? UInt64.max : newLimit
+            streamRecvLimits[streamID] = safeLimit
+            return MaxStreamDataFrame(streamID: streamID, maxStreamData: safeLimit)
         }
 
         return nil
@@ -406,13 +425,17 @@ public struct FlowController: Sendable {
         if bidirectional {
             let threshold = maxLocalBidiStreams / 2
             if openRemoteBidiStreams >= threshold {
-                maxLocalBidiStreams += 10  // Increase by 10
+                // Overflow protection
+                let (newLimit, overflow) = maxLocalBidiStreams.addingReportingOverflow(10)
+                maxLocalBidiStreams = overflow ? UInt64.max : newLimit
                 return MaxStreamsFrame(maxStreams: maxLocalBidiStreams, isBidirectional: true)
             }
         } else {
             let threshold = maxLocalUniStreams / 2
             if openRemoteUniStreams >= threshold {
-                maxLocalUniStreams += 10
+                // Overflow protection
+                let (newLimit, overflow) = maxLocalUniStreams.addingReportingOverflow(10)
+                maxLocalUniStreams = overflow ? UInt64.max : newLimit
                 return MaxStreamsFrame(maxStreams: maxLocalUniStreams, isBidirectional: false)
             }
         }

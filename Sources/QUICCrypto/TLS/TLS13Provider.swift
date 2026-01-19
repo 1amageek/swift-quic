@@ -87,6 +87,24 @@ public protocol TLS13Provider: Sendable {
         context: Data?,
         length: Int
     ) throws -> Data
+
+    /// Configures session resumption with 0-RTT support
+    ///
+    /// Must be called before `startHandshake()` on the client side.
+    ///
+    /// - Parameters:
+    ///   - ticket: The session ticket data for resumption
+    ///   - attemptEarlyData: Whether to attempt 0-RTT early data
+    func configureResumption(ticket: SessionTicketData, attemptEarlyData: Bool) throws
+
+    /// Whether 0-RTT was accepted by the server
+    ///
+    /// Only valid after receiving the server's EncryptedExtensions.
+    /// Returns true if the server included the early_data extension.
+    var is0RTTAccepted: Bool { get }
+
+    /// Whether 0-RTT was attempted in this handshake
+    var is0RTTAttempted: Bool { get }
 }
 
 // MARK: - TLS Configuration

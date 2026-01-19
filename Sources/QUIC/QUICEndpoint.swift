@@ -8,6 +8,7 @@ import Synchronization
 import QUICCore
 import QUICCrypto
 import QUICConnection
+import QUICTransport
 
 // MARK: - QUIC Endpoint
 
@@ -60,11 +61,20 @@ public actor QUICEndpoint {
     /// Send callback (for testing without real socket)
     private var sendCallback: (@Sendable (Data, SocketAddress) async throws -> Void)?
 
+    /// The UDP socket (for real I/O)
+    private var socket: (any QUICSocket)?
+
+    /// Task running the main I/O loop
+    private var ioTask: Task<Void, Never>?
+
     /// Local address
     private var _localAddress: SocketAddress?
 
     /// Whether the endpoint is running
     private var isRunning: Bool = false
+
+    /// Stop signal for the I/O loop
+    private var shouldStop: Bool = false
 
     // MARK: - Initialization
 
@@ -99,6 +109,32 @@ public actor QUICEndpoint {
         let endpoint = QUICEndpoint(configuration: configuration, isServer: true)
         await endpoint.setLocalAddress(address)
         return endpoint
+    }
+
+    /// Creates a server endpoint with a UDP socket and starts it
+    /// - Parameters:
+    ///   - socket: The UDP socket to use
+    ///   - configuration: QUIC configuration
+    /// - Returns: A tuple of (endpoint, runTask) - the task runs the I/O loop
+    public static func serve(
+        socket: any QUICSocket,
+        configuration: QUICConfiguration
+    ) async throws -> (endpoint: QUICEndpoint, runTask: Task<Void, Error>) {
+        let endpoint = QUICEndpoint(configuration: configuration, isServer: true)
+
+        // Start the I/O loop in a separate task
+        let runTask = Task {
+            try await endpoint.run(socket: socket)
+        }
+
+        // Wait briefly for the socket to start and get the address
+        try await Task.sleep(for: .milliseconds(10))
+        if let nioAddr = await socket.localAddress,
+           let addr = SocketAddress(nioAddr) {
+            await endpoint.setLocalAddress(addr)
+        }
+
+        return (endpoint, runTask)
     }
 
     /// Sets the local address (internal)
@@ -173,6 +209,127 @@ public actor QUICEndpoint {
         return connection
     }
 
+    // MARK: - 0-RTT Client API
+
+    /// Connects to a remote QUIC server with 0-RTT early data
+    ///
+    /// Attempts to use a cached session for 0-RTT early data. If a valid session
+    /// is found, the client will send Initial + 0-RTT packets in the first flight.
+    ///
+    /// - Parameters:
+    ///   - address: The server address
+    ///   - earlyData: Data to send as 0-RTT (optional, can send later via stream)
+    ///   - sessionCache: Client session cache for retrieving stored sessions
+    /// - Returns: Tuple of (connection, earlyDataAccepted)
+    /// - Throws: QUICEndpointError or connection errors
+    ///
+    /// ## Usage
+    /// ```swift
+    /// let sessionCache = ClientSessionCache()
+    /// // ... store sessions from previous connections ...
+    ///
+    /// let (connection, accepted) = try await endpoint.connectWith0RTT(
+    ///     to: serverAddress,
+    ///     earlyData: requestData,
+    ///     sessionCache: sessionCache
+    /// )
+    ///
+    /// if !accepted {
+    ///     // 0-RTT was rejected, resend data on 1-RTT
+    ///     try await stream.write(requestData)
+    /// }
+    /// ```
+    public func connectWith0RTT(
+        to address: SocketAddress,
+        earlyData: Data? = nil,
+        sessionCache: ClientSessionCache
+    ) async throws -> (connection: any QUICConnectionProtocol, earlyDataAccepted: Bool) {
+        guard !isServer else {
+            throw QUICEndpointError.serverCannotConnect
+        }
+
+        // Try to retrieve a session that supports early data
+        let serverIdentity = "\(address.ipAddress):\(address.port)"
+        let cachedSession = sessionCache.retrieveForEarlyData(for: serverIdentity)
+
+        if let session = cachedSession, session.supportsEarlyData {
+            // Connect with 0-RTT using cached session
+            return try await connectWithSession(
+                to: address,
+                session: session,
+                earlyData: earlyData,
+                sessionCache: sessionCache
+            )
+        } else {
+            // No valid session for 0-RTT, fall back to regular connection
+            let connection = try await connect(to: address)
+            return (connection, false)
+        }
+    }
+
+    /// Connects using a cached session (internal implementation)
+    private func connectWithSession(
+        to address: SocketAddress,
+        session: ClientSessionCache.CachedSession,
+        earlyData: Data?,
+        sessionCache: ClientSessionCache
+    ) async throws -> (connection: any QUICConnectionProtocol, earlyDataAccepted: Bool) {
+        // Generate connection IDs
+        let sourceConnectionID = ConnectionID.random(length: 8)
+        let destinationConnectionID = ConnectionID.random(length: 8)
+
+        // Create TLS provider with session ticket for resumption
+        let tlsProvider: any TLS13Provider
+        if let factory = configuration.tlsProviderFactory {
+            tlsProvider = factory(true)  // isClient = true
+        } else {
+            var tlsConfig = TLSConfiguration()
+            tlsConfig.sessionTicket = session.ticket.ticket
+            tlsConfig.maxEarlyDataSize = session.maxEarlyDataSize
+            tlsProvider = MockTLSProvider(configuration: tlsConfig)
+        }
+
+        // Create transport parameters from configuration
+        let transportParameters = TransportParameters(from: configuration, sourceConnectionID: sourceConnectionID)
+
+        // Create connection with 0-RTT support
+        let connection = ManagedConnection(
+            role: .client,
+            version: configuration.version,
+            sourceConnectionID: sourceConnectionID,
+            destinationConnectionID: destinationConnectionID,
+            transportParameters: transportParameters,
+            tlsProvider: tlsProvider,
+            localAddress: _localAddress,
+            remoteAddress: address
+        )
+
+        // Register connection
+        router.register(connection)
+        timerManager.register(connection)
+
+        // Start handshake with 0-RTT
+        let (initialPackets, zeroRTTPackets) = try await connection.startWith0RTT(
+            session: session,
+            earlyData: earlyData
+        )
+
+        // Send initial packets
+        for packet in initialPackets {
+            try await send(packet, to: address)
+        }
+
+        // Send 0-RTT packets
+        for packet in zeroRTTPackets {
+            try await send(packet, to: address)
+        }
+
+        // Wait for handshake to complete and check if 0-RTT was accepted
+        // For now, return optimistically - actual acceptance is determined later
+        // The caller should check connection.is0RTTAccepted after handshake completes
+        return (connection, true)
+    }
+
     // MARK: - Packet Processing
 
     /// Processes an incoming packet
@@ -181,6 +338,14 @@ public actor QUICEndpoint {
     ///   - remoteAddress: Where the packet came from
     /// - Returns: Outbound packets to send
     public func processIncomingPacket(_ data: Data, from remoteAddress: SocketAddress) async throws -> [Data] {
+        // Check for Version Negotiation packet first (version == 0 in long header)
+        // RFC 9000 Section 6: Version Negotiation packets are special and must be
+        // handled before normal routing
+        if VersionNegotiator.isVersionNegotiationPacket(data) {
+            try await handleVersionNegotiationPacket(data, from: remoteAddress)
+            return []  // VN packets don't generate responses
+        }
+
         // Route the packet
         switch router.route(data: data, from: remoteAddress) {
         case .routed(let connection):
@@ -268,6 +433,75 @@ public actor QUICEndpoint {
         return connection
     }
 
+    // MARK: - Version Negotiation
+
+    /// Handles a Version Negotiation packet
+    ///
+    /// RFC 9000 Section 6.2: When a client receives a Version Negotiation packet,
+    /// it must validate the packet and may retry with a different version.
+    ///
+    /// - Parameters:
+    ///   - data: The Version Negotiation packet data
+    ///   - remoteAddress: Where the packet came from
+    private func handleVersionNegotiationPacket(_ data: Data, from remoteAddress: SocketAddress) async throws {
+        // Only clients process Version Negotiation packets
+        guard !isServer else {
+            // Servers ignore VN packets (RFC 9000 Section 6)
+            return
+        }
+
+        // Find the connection that might be waiting for a response from this address
+        // VN packets have DCID = our SCID and SCID = our DCID
+        guard data.count >= 7 else { return }
+
+        // Extract DCID from VN packet (which should be our SCID)
+        let dcidLength = Int(data[5])
+        guard data.count >= 6 + dcidLength else { return }
+        let dcidBytes = data[6..<(6 + dcidLength)]
+        let vnDCID = ConnectionID(bytes: Data(dcidBytes))
+
+        // Try to find a connection with this SCID
+        guard let connection = router.connection(for: vnDCID) else {
+            // No connection found - possibly spoofed packet
+            return
+        }
+
+        // RFC 9000 Section 6.2: A client MUST discard any Version Negotiation packet
+        // if it has received and successfully processed any other packet
+        // (This check should be done in the connection)
+        if await connection.hasReceivedValidPacket {
+            return  // Discard late VN packets
+        }
+
+        // Validate and parse the packet
+        let offeredVersions: [QUICVersion]
+        do {
+            offeredVersions = try VersionNegotiator.validateAndParseVersionNegotiation(
+                data,
+                originalDCID: connection.destinationConnectionID,
+                originalSCID: connection.sourceConnectionID
+            )
+        } catch {
+            // Invalid VN packet, discard
+            return
+        }
+
+        // Try to select a common version
+        if let newVersion = VersionNegotiator.selectVersion(
+            offered: offeredVersions,
+            supported: QUICVersion.supportedVersions
+        ) {
+            // We can retry with the new version
+            try await connection.retryWithVersion(newVersion)
+        } else {
+            // No common version - close connection gracefully
+            // RFC 9000: This isn't a protocol error, just an incompatibility
+            await connection.close(error: nil)
+            router.unregister(connection)
+            timerManager.markClosed(connection)
+        }
+    }
+
     // MARK: - Timer Processing
 
     /// Processes expired timers
@@ -329,6 +563,151 @@ public actor QUICEndpoint {
         return outgoing
     }
 
+    // MARK: - UDP I/O Loop
+
+    /// Runs the main I/O loop with a real UDP socket
+    ///
+    /// This method starts the event loop that:
+    /// - Receives UDP datagrams from the socket
+    /// - Processes them through the QUIC state machine
+    /// - Sends response packets
+    /// - Handles timer events
+    ///
+    /// The loop runs until `stop()` is called.
+    ///
+    /// - Parameter socket: The UDP socket to use for I/O
+    /// - Throws: QUICEndpointError.alreadyRunning if already running
+    public func run(socket: any QUICSocket) async throws {
+        guard !isRunning else {
+            throw QUICEndpointError.alreadyRunning
+        }
+
+        self.socket = socket
+        self.isRunning = true
+        self.shouldStop = false
+
+        // Start the socket
+        try await socket.start()
+
+        // Update local address
+        if let nioAddr = await socket.localAddress,
+           let addr = SocketAddress(nioAddr) {
+            _localAddress = addr
+        }
+
+        // Start the I/O loop with cancellation handling
+        await withTaskCancellationHandler {
+            await withTaskGroup(of: Void.self) { group in
+                // Packet receiving task
+                group.addTask {
+                    await self.packetReceiveLoop(socket: socket)
+                }
+
+                // Timer processing task
+                group.addTask {
+                    await self.timerProcessingLoop(socket: socket)
+                }
+
+                // Wait for both tasks to complete
+                await group.waitForAll()
+            }
+        } onCancel: {
+            // When the task is cancelled, stop the socket to unblock the I/O loops
+            Task { [socket] in
+                await socket.stop()
+            }
+        }
+
+        // Cleanup
+        if !shouldStop {
+            // Only stop socket if not already stopped by stop()
+            await socket.stop()
+        }
+        self.socket = nil
+        self.isRunning = false
+    }
+
+    /// Stops the I/O loop
+    ///
+    /// This method signals the I/O tasks to stop and finishes the socket's
+    /// incoming stream, allowing the packet receive loop to exit gracefully.
+    public func stop() async {
+        guard isRunning else { return }
+        shouldStop = true
+
+        // Finish the incoming connections stream
+        incomingConnectionContinuation?.finish()
+        incomingConnectionContinuation = nil
+
+        // Stop the socket to finish its AsyncStream
+        // This will cause the packetReceiveLoop's for-await to exit
+        if let socket = socket {
+            await socket.stop()
+        }
+    }
+
+    /// The packet receive loop
+    private func packetReceiveLoop(socket: any QUICSocket) async {
+        for await packet in socket.incomingPackets {
+            guard !shouldStop else { break }
+
+            // Convert NIO address to QUIC address
+            guard let remoteAddress = SocketAddress(packet.remoteAddress) else {
+                continue
+            }
+
+            do {
+                let responses = try await processIncomingPacket(packet.data, from: remoteAddress)
+                for response in responses {
+                    try await socket.send(response, to: packet.remoteAddress)
+                }
+            } catch {
+                // Log error but continue processing
+                // In production, would use swift-log here
+            }
+        }
+    }
+
+    /// The timer processing loop
+    private func timerProcessingLoop(socket: any QUICSocket) async {
+        while !shouldStop {
+            // Calculate time until next timer
+            let nextDeadline = timerManager.nextDeadline()
+            let waitDuration: Duration
+
+            if let deadline = nextDeadline {
+                let now = ContinuousClock.now
+                if deadline <= now {
+                    waitDuration = .zero
+                } else {
+                    waitDuration = deadline - now
+                }
+            } else {
+                // No active timers, wait for a reasonable interval
+                waitDuration = .milliseconds(100)
+            }
+
+            // Wait until next timer or timeout
+            do {
+                try await Task.sleep(for: waitDuration)
+            } catch {
+                // Task was cancelled
+                break
+            }
+
+            // Process timer events
+            do {
+                let packets = try await processTimers()
+                for (data, address) in packets {
+                    let nioAddress = try address.toNIOAddress()
+                    try await socket.send(data, to: nioAddress)
+                }
+            } catch {
+                // Log error but continue
+            }
+        }
+    }
+
     // MARK: - Send Callback
 
     /// Sets a callback for sending packets (for testing)
@@ -338,10 +717,15 @@ public actor QUICEndpoint {
 
     /// Sends a packet
     private func send(_ data: Data, to address: SocketAddress) async throws {
-        if let callback = sendCallback {
+        if let socket = socket {
+            // Use the real socket - convert to NIO address
+            let nioAddress = try address.toNIOAddress()
+            try await socket.send(data, to: nioAddress)
+        } else if let callback = sendCallback {
+            // Use the callback (for testing)
             try await callback(data, address)
         }
-        // If no callback, packets are silently dropped (useful for unit testing)
+        // If neither, packets are silently dropped (useful for unit testing)
     }
 
     // MARK: - Connection Management

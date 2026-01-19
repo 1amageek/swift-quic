@@ -141,7 +141,7 @@ let package = Package(
 
         .testTarget(
             name: "QUICTests",
-            dependencies: ["QUIC"],
+            dependencies: ["QUIC", "QUICRecovery", "QUICTransport"],
             path: "Tests/QUICTests"
         ),
     ]

@@ -69,6 +69,13 @@ public struct CryptoContext: Sendable {
         self.opener = opener
         self.sealer = sealer
     }
+
+    /// Creates a crypto context with optional opener and/or sealer
+    /// Used for 0-RTT where only one direction is available
+    public init(opener: (any PacketOpener)?, sealer: (any PacketSealer)?) {
+        self.opener = opener
+        self.sealer = sealer
+    }
 }
 
 // MARK: - Crypto State

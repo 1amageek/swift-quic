@@ -111,3 +111,32 @@ extension SocketAddress: CustomStringConvertible {
         "\(ipAddress):\(port)"
     }
 }
+
+// MARK: - NIO Integration
+
+import NIOCore
+
+extension SocketAddress {
+    /// Creates a SocketAddress from a NIOCore.SocketAddress
+    public init?(_ nioAddress: NIOCore.SocketAddress) {
+        guard let port = nioAddress.port else {
+            return nil
+        }
+
+        switch nioAddress {
+        case .v4(let addr):
+            self.ipAddress = addr.host
+            self.port = UInt16(port)
+        case .v6(let addr):
+            self.ipAddress = addr.host
+            self.port = UInt16(port)
+        case .unixDomainSocket:
+            return nil
+        }
+    }
+
+    /// Converts to NIOCore.SocketAddress
+    public func toNIOAddress() throws -> NIOCore.SocketAddress {
+        try NIOCore.SocketAddress(ipAddress: ipAddress, port: Int(port))
+    }
+}

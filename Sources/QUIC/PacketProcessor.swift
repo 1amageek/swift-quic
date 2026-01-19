@@ -46,11 +46,16 @@ public final class PacketProcessor: Sendable {
 
     // MARK: - Initialization
 
+    /// Maximum allowed DCID length per RFC 9000 Section 17.2
+    private static let maxDCIDLength = 20
+
     /// Creates a new packet processor
-    /// - Parameter dcidLength: Expected DCID length for short headers
+    /// - Parameter dcidLength: Expected DCID length for short headers (0-20)
     public init(dcidLength: Int = 8) {
+        // Clamp to valid range (RFC 9000 Section 17.2: 0-20 bytes)
+        let validLength = max(0, min(dcidLength, Self.maxDCIDLength))
         self.contexts = Mutex([:])
-        self._dcidLength = Atomic(dcidLength)
+        self._dcidLength = Atomic(validLength)
         self.largestReceivedPN = Mutex([:])
     }
 
@@ -78,9 +83,11 @@ public final class PacketProcessor: Sendable {
     }
 
     /// Updates the DCID length (for short header parsing)
-    /// - Parameter length: The new DCID length
+    /// - Parameter length: The new DCID length (0-20, clamped if out of range)
     public func setDCIDLength(_ length: Int) {
-        _dcidLength.store(length, ordering: .relaxed)
+        // Clamp to valid range (RFC 9000 Section 17.2: 0-20 bytes)
+        let validLength = max(0, min(length, Self.maxDCIDLength))
+        _dcidLength.store(validLength, ordering: .relaxed)
     }
 
     // MARK: - Unified Key Management
@@ -95,17 +102,45 @@ public final class PacketProcessor: Sendable {
     ///   - isClient: Whether this is the client side
     /// - Throws: Error if key derivation or context creation fails
     public func installKeys(_ info: KeysAvailableInfo, isClient: Bool) throws {
-        // Derive key material from traffic secrets
-        let clientKeys = try KeyMaterial.derive(from: info.clientSecret)
-        let serverKeys = try KeyMaterial.derive(from: info.serverSecret)
+        let cipherSuite = info.cipherSuite
+
+        // Handle 0-RTT keys specially (only one direction)
+        if info.level == .zeroRTT {
+            guard let clientSecret = info.clientSecret else {
+                throw PacketCodecError.invalidPacketFormat("0-RTT requires client secret")
+            }
+            let clientKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
+            let (opener, sealer) = try clientKeys.createCrypto()
+
+            if isClient {
+                // Client writes 0-RTT data
+                let context = CryptoContext(opener: nil, sealer: sealer)
+                installContext(context, for: info.level)
+            } else {
+                // Server reads 0-RTT data
+                let context = CryptoContext(opener: opener, sealer: nil)
+                installContext(context, for: info.level)
+            }
+            return
+        }
+
+        // Standard bidirectional keys
+        guard let clientSecret = info.clientSecret,
+              let serverSecret = info.serverSecret else {
+            throw PacketCodecError.invalidPacketFormat("Both client and server secrets required")
+        }
+
+        // Derive key material from traffic secrets using negotiated cipher suite
+        let clientKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
+        let serverKeys = try KeyMaterial.derive(from: serverSecret, cipherSuite: cipherSuite)
 
         // Client reads server keys, writes client keys (and vice versa)
         let readKeys = isClient ? serverKeys : clientKeys
         let writeKeys = isClient ? clientKeys : serverKeys
 
-        // Create opener (for decryption) and sealer (for encryption)
-        let opener = try AES128GCMOpener(keyMaterial: readKeys)
-        let sealer = try AES128GCMSealer(keyMaterial: writeKeys)
+        // Create opener (for decryption) and sealer (for encryption) using factory method
+        let (opener, _) = try readKeys.createCrypto()
+        let (_, sealer) = try writeKeys.createCrypto()
 
         // Install the crypto context
         let context = CryptoContext(opener: opener, sealer: sealer)
@@ -534,16 +569,19 @@ extension PacketProcessor {
         // Derive initial secrets
         let initialSecrets = try InitialSecrets.derive(connectionID: connectionID, version: version)
 
-        // Derive key material from secrets
-        let clientKeys = try KeyMaterial.derive(from: initialSecrets.clientSecret)
-        let serverKeys = try KeyMaterial.derive(from: initialSecrets.serverSecret)
+        // Initial keys always use AES-128-GCM per RFC 9001 Section 5.2
+        let cipherSuite: QUICCipherSuite = .aes128GcmSha256
 
-        // Create opener/sealer
+        // Derive key material from secrets
+        let clientKeys = try KeyMaterial.derive(from: initialSecrets.clientSecret, cipherSuite: cipherSuite)
+        let serverKeys = try KeyMaterial.derive(from: initialSecrets.serverSecret, cipherSuite: cipherSuite)
+
+        // Create opener/sealer using factory method
         let readKeys = isClient ? serverKeys : clientKeys
         let writeKeys = isClient ? clientKeys : serverKeys
 
-        let opener = try AES128GCMOpener(keyMaterial: readKeys)
-        let sealer = try AES128GCMSealer(keyMaterial: writeKeys)
+        let (opener, _) = try readKeys.createCrypto()
+        let (_, sealer) = try writeKeys.createCrypto()
 
         // Install context
         let context = CryptoContext(opener: opener, sealer: sealer)

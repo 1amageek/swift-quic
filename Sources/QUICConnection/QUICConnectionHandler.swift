@@ -11,6 +11,20 @@ import QUICRecovery
 import QUICCrypto
 import QUICStream
 
+// MARK: - Connection Handler Errors
+
+/// Errors that can occur during connection handling
+public enum QUICConnectionHandlerError: Error, Sendable {
+    /// Missing required secret for key derivation
+    case missingSecret(String)
+    /// Invalid encryption level
+    case invalidEncryptionLevel(EncryptionLevel)
+    /// Key derivation failed
+    case keyDerivationFailed(String)
+    /// Crypto operation failed
+    case cryptoError(String)
+}
+
 // MARK: - Connection Handler
 
 /// Main handler for a QUIC connection
@@ -60,6 +74,17 @@ public final class QUICConnectionHandler: Sendable {
     /// Whether handshake is complete
     private let handshakeComplete: Mutex<Bool> = Mutex(false)
 
+    // MARK: - Connection Migration Components
+
+    /// Path validation manager for connection migration
+    private let pathValidationManager: PathValidationManager
+
+    /// Connection ID manager for CID lifecycle
+    private let connectionIDManager: ConnectionIDManager
+
+    /// Stateless reset manager
+    private let statelessResetManager: StatelessResetManager
+
     // MARK: - Initialization
 
     /// Creates a new connection handler
@@ -101,6 +126,13 @@ public final class QUICConnectionHandler: Sendable {
         self.keySchedule = Mutex(KeySchedule())
         self.localTransportParams = transportParameters
         self.cryptoContexts = Mutex([:])
+
+        // Initialize connection migration components
+        self.pathValidationManager = PathValidationManager()
+        self.connectionIDManager = ConnectionIDManager(
+            activeConnectionIDLimit: UInt64(transportParameters.activeConnectionIDLimit)
+        )
+        self.statelessResetManager = StatelessResetManager()
     }
 
     // MARK: - TLS Provider
@@ -129,10 +161,13 @@ public final class QUICConnectionHandler: Sendable {
         }
 
         // Create and install crypto contexts
+        // RFC 9001 Section 5.2: Initial keys MUST use AES-128-GCM-SHA256
+        // The cipher suite for initial keys is not negotiated - it's fixed by the protocol
         let role = connectionState.withLock { $0.role }
         let (readKeys, writeKeys) = role == .client ?
             (serverKeys, clientKeys) : (clientKeys, serverKeys)
 
+        // Initial keys always use AES-128-GCM per RFC 9001 Section 5.2
         let opener = try AES128GCMOpener(keyMaterial: readKeys)
         let sealer = try AES128GCMSealer(keyMaterial: writeKeys)
 
@@ -240,6 +275,37 @@ public final class QUICConnectionHandler: Sendable {
             case .padding, .ping:
                 // No action needed
                 break
+
+            // MARK: - Connection Migration Frames
+
+            case .pathChallenge(let data):
+                // Handle challenge using PathValidationManager
+                // Queue PATH_RESPONSE frame to send back
+                let responseFrame = pathValidationManager.handleChallenge(data)
+                queueFrame(responseFrame, level: level)
+                result.pathChallengeData.append(data)
+
+            case .pathResponse(let data):
+                // Handle response using PathValidationManager
+                if let validatedPath = pathValidationManager.handleResponse(data) {
+                    result.pathValidated = validatedPath
+                }
+                result.pathResponseData.append(data)
+
+            case .newConnectionID(let frame):
+                // Process using ConnectionIDManager
+                connectionIDManager.handleNewConnectionID(frame)
+                // Register the stateless reset token
+                statelessResetManager.registerReceivedToken(frame.statelessResetToken)
+                result.newConnectionIDs.append(frame)
+
+            case .retireConnectionID(let sequenceNumber):
+                // Process using ConnectionIDManager
+                if let retired = connectionIDManager.handleRetireConnectionID(sequenceNumber) {
+                    // Remove the associated reset token
+                    statelessResetManager.removeReceivedToken(retired.statelessResetToken)
+                }
+                result.retiredConnectionIDs.append(sequenceNumber)
 
             default:
                 // Other frames handled as needed
@@ -375,20 +441,52 @@ public final class QUICConnectionHandler: Sendable {
     /// - Parameter info: Information about the available keys
     public func installKeys(_ info: KeysAvailableInfo) throws {
         let role = connectionState.withLock { $0.role }
+        let cipherSuite = info.cipherSuite
+
+        // Handle 0-RTT keys specially (only one direction)
+        if info.level == .zeroRTT {
+            guard let clientSecret = info.clientSecret else {
+                throw QUICConnectionHandlerError.missingSecret("0-RTT requires client secret")
+            }
+            let clientKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
+            let (opener, sealer) = try clientKeys.createCrypto()
+
+            if role == .client {
+                // Client writes 0-RTT data
+                cryptoContexts.withLock { contexts in
+                    // 0-RTT only has sealer for client
+                    contexts[info.level] = CryptoContext(opener: nil, sealer: sealer)
+                }
+            } else {
+                // Server reads 0-RTT data
+                cryptoContexts.withLock { contexts in
+                    // 0-RTT only has opener for server
+                    contexts[info.level] = CryptoContext(opener: opener, sealer: nil)
+                }
+            }
+            return
+        }
+
+        // Standard bidirectional keys
+        guard let clientSecret = info.clientSecret,
+              let serverSecret = info.serverSecret else {
+            throw QUICConnectionHandlerError.missingSecret("Both client and server secrets required")
+        }
 
         // Determine which keys to use for read/write based on role
         let readKeys: KeyMaterial
         let writeKeys: KeyMaterial
         if role == .client {
-            readKeys = try KeyMaterial.derive(from: info.serverSecret)
-            writeKeys = try KeyMaterial.derive(from: info.clientSecret)
+            readKeys = try KeyMaterial.derive(from: serverSecret, cipherSuite: cipherSuite)
+            writeKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
         } else {
-            readKeys = try KeyMaterial.derive(from: info.clientSecret)
-            writeKeys = try KeyMaterial.derive(from: info.serverSecret)
+            readKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
+            writeKeys = try KeyMaterial.derive(from: serverSecret, cipherSuite: cipherSuite)
         }
 
-        let opener = try AES128GCMOpener(keyMaterial: readKeys)
-        let sealer = try AES128GCMSealer(keyMaterial: writeKeys)
+        // Create opener/sealer using factory method (selects AES or ChaCha20)
+        let (opener, _) = try readKeys.createCrypto()
+        let (_, sealer) = try writeKeys.createCrypto()
 
         cryptoContexts.withLock { contexts in
             contexts[info.level] = CryptoContext(opener: opener, sealer: sealer)
@@ -399,13 +497,13 @@ public final class QUICConnectionHandler: Sendable {
             switch info.level {
             case .handshake:
                 _ = try? schedule.setHandshakeSecrets(
-                    clientSecret: info.clientSecret,
-                    serverSecret: info.serverSecret
+                    clientSecret: clientSecret,
+                    serverSecret: serverSecret
                 )
             case .application:
                 _ = try? schedule.setApplicationSecrets(
-                    clientSecret: info.clientSecret,
-                    serverSecret: info.serverSecret
+                    clientSecret: clientSecret,
+                    serverSecret: serverSecret
                 )
             default:
                 break
@@ -715,6 +813,78 @@ public final class QUICConnectionHandler: Sendable {
         connectionState.withLock { $0.version }
     }
 
+    // MARK: - Connection Migration API
+
+    /// Initiates path validation for a new network path
+    /// - Parameter path: The network path to validate
+    /// - Returns: PATH_CHALLENGE frame to send
+    public func initiatePathValidation(for path: NetworkPath) -> Frame {
+        pathValidationManager.createChallengeFrame(for: path)
+    }
+
+    /// Checks if a network path is validated
+    /// - Parameter path: The path to check
+    /// - Returns: True if the path has been validated
+    public func isPathValidated(_ path: NetworkPath) -> Bool {
+        pathValidationManager.isValidated(path)
+    }
+
+    /// Gets all validated network paths
+    public var validatedPaths: Set<NetworkPath> {
+        pathValidationManager.validatedPaths
+    }
+
+    /// Checks for path validation timeouts
+    /// - Returns: Paths that failed validation due to timeout
+    public func checkPathValidationTimeouts() -> [NetworkPath] {
+        pathValidationManager.checkTimeouts()
+    }
+
+    /// Issues a new connection ID to the peer
+    /// - Parameter length: Length of the connection ID (default 8)
+    /// - Returns: NEW_CONNECTION_ID frame to send
+    public func issueNewConnectionID(length: Int = 8) -> NewConnectionIDFrame {
+        connectionIDManager.issueNewConnectionID(length: length)
+    }
+
+    /// Gets the current active peer connection ID for sending
+    public var activePeerConnectionID: ConnectionID? {
+        connectionIDManager.activePeerConnectionID
+    }
+
+    /// Switches to a different peer connection ID
+    /// - Parameter sequenceNumber: The sequence number of the CID to use
+    /// - Returns: True if switch was successful
+    public func switchToConnectionID(sequenceNumber: UInt64) -> Bool {
+        connectionIDManager.switchToConnectionID(sequenceNumber: sequenceNumber)
+    }
+
+    /// Gets all available peer connection IDs
+    public var availablePeerCIDs: [ConnectionIDManager.PeerConnectionID] {
+        connectionIDManager.availablePeerCIDs
+    }
+
+    /// Retires a peer connection ID
+    /// - Parameter sequenceNumber: The sequence number to retire
+    /// - Returns: RETIRE_CONNECTION_ID frame to send, or nil if not found
+    public func retirePeerConnectionID(sequenceNumber: UInt64) -> Frame? {
+        connectionIDManager.retirePeerConnectionID(sequenceNumber: sequenceNumber)
+    }
+
+    /// Checks if a packet is a stateless reset
+    /// - Parameter data: The received packet data
+    /// - Returns: True if this is a stateless reset packet
+    public func isStatelessReset(_ data: Data) -> Bool {
+        statelessResetManager.isStatelessReset(data)
+    }
+
+    /// Creates a stateless reset packet
+    /// - Parameter connectionID: The connection ID being reset
+    /// - Returns: The encoded stateless reset packet, or nil if no token exists
+    public func createStatelessReset(for connectionID: ConnectionID) -> Data? {
+        statelessResetManager.createStatelessReset(for: connectionID)
+    }
+
     /// Discards an encryption level
     /// - Parameter level: The level to discard
     public func discardLevel(_ level: EncryptionLevel) {
@@ -743,6 +913,23 @@ public struct FrameProcessingResult: Sendable {
 
     /// Whether the connection was closed
     public var connectionClosed: Bool = false
+
+    // MARK: - Connection Migration
+
+    /// PATH_CHALLENGE data received (requires PATH_RESPONSE)
+    public var pathChallengeData: [Data] = []
+
+    /// PATH_RESPONSE data received (validates our challenge)
+    public var pathResponseData: [Data] = []
+
+    /// Path that was successfully validated (if any)
+    public var pathValidated: NetworkPath? = nil
+
+    /// New connection IDs issued by peer
+    public var newConnectionIDs: [NewConnectionIDFrame] = []
+
+    /// Connection IDs retired by peer
+    public var retiredConnectionIDs: [UInt64] = []
 }
 
 /// Packet to be sent

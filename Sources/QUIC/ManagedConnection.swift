@@ -45,6 +45,7 @@ public enum HandshakeState: Sendable, Equatable {
 /// - Packet encryption/decryption via PacketProcessor
 /// - TLS 1.3 integration
 /// - Stream management via QUICConnectionProtocol
+/// - Anti-amplification limit enforcement (RFC 9000 Section 8.1)
 public final class ManagedConnection: Sendable {
     // MARK: - Properties
 
@@ -56,6 +57,10 @@ public final class ManagedConnection: Sendable {
 
     /// TLS provider
     private let tlsProvider: any TLS13Provider
+
+    /// Anti-amplification limiter (RFC 9000 Section 8.1)
+    /// Servers must not send more than 3x bytes received until address is validated
+    private let amplificationLimiter: AntiAmplificationLimiter
 
     /// Internal state
     private let state: Mutex<ManagedConnectionState>
@@ -78,6 +83,16 @@ public final class ManagedConnection: Sendable {
         var pendingStreams: [any QUICStreamProtocol] = []
     }
     private let incomingStreamState: Mutex<IncomingStreamState>
+
+    /// State for session ticket stream (lazy initialization pattern)
+    private struct SessionTicketState: Sendable {
+        var continuation: AsyncStream<NewSessionTicketInfo>.Continuation?
+        var stream: AsyncStream<NewSessionTicketInfo>?
+        var isShutdown: Bool = false
+        /// Buffer for tickets that arrive before sessionTickets is accessed
+        var pendingTickets: [NewSessionTicketInfo] = []
+    }
+    private let sessionTicketState: Mutex<SessionTicketState>
 
     /// Original connection ID (for Initial key derivation)
     /// This is the DCID from the first client Initial packet
@@ -125,6 +140,7 @@ public final class ManagedConnection: Sendable {
         )
         self.packetProcessor = PacketProcessor(dcidLength: sourceConnectionID.length)
         self.tlsProvider = tlsProvider
+        self.amplificationLimiter = AntiAmplificationLimiter(isServer: role == .server)
         self.localAddress = localAddress
         self.remoteAddress = remoteAddress
         // For clients, original DCID is the initial destination CID
@@ -138,6 +154,7 @@ public final class ManagedConnection: Sendable {
         ))
         self.streamContinuationsState = Mutex(StreamContinuationsState())
         self.incomingStreamState = Mutex(IncomingStreamState())
+        self.sessionTicketState = Mutex(SessionTicketState())
 
         // Set TLS provider on handler
         handler.setTLSProvider(tlsProvider)
@@ -148,7 +165,14 @@ public final class ManagedConnection: Sendable {
     /// Starts the connection handshake
     /// - Returns: Initial packets to send (for client)
     public func start() async throws -> [Data] {
-        let role = state.withLock { $0.role }
+        // Prevent double-start: check and set state atomically
+        let role = try state.withLock { s -> ConnectionRole in
+            guard s.handshakeState == .idle else {
+                throw ManagedConnectionError.invalidState("Handshake already started")
+            }
+            s.handshakeState = .connecting
+            return s.role
+        }
 
         // Derive initial keys using the original connection ID
         // RFC 9001: Both client and server derive Initial keys from the
@@ -167,18 +191,137 @@ public final class ManagedConnection: Sendable {
         // Start TLS handshake
         let outputs = try await tlsProvider.startHandshake(isClient: role == .client)
 
-        state.withLock { $0.handshakeState = .connecting }
+        // State was already set to connecting at the beginning of this method
 
         // Process TLS outputs
         return try await processTLSOutputs(outputs)
+    }
+
+    /// Starts the connection handshake with 0-RTT early data
+    ///
+    /// RFC 9001 Section 4.6.1: Client sends Initial + 0-RTT packets in first flight
+    /// when resuming a session that supports early data.
+    ///
+    /// - Parameters:
+    ///   - session: The cached session to use for resumption
+    ///   - earlyData: Optional early data to send as 0-RTT
+    /// - Returns: Tuple of (Initial packets, 0-RTT packets)
+    public func startWith0RTT(
+        session: ClientSessionCache.CachedSession,
+        earlyData: Data?
+    ) async throws -> (initialPackets: [Data], zeroRTTPackets: [Data]) {
+        // Prevent double-start: check and set state atomically
+        try state.withLock { s in
+            guard s.handshakeState == .idle else {
+                throw ManagedConnectionError.invalidState("Handshake already started")
+            }
+            guard s.role == .client else {
+                throw QUICEarlyDataError.earlyDataNotSupported
+            }
+            s.handshakeState = .connecting
+            s.is0RTTAttempted = true
+        }
+
+        // Derive initial keys using the original connection ID
+        let (_, _) = try packetProcessor.deriveAndInstallInitialKeys(
+            connectionID: originalConnectionID,
+            isClient: true,
+            version: handler.version
+        )
+
+        // Set transport parameters on TLS
+        let encodedParams = encodeTransportParameters(transportParameters)
+        try tlsProvider.setLocalTransportParameters(encodedParams)
+
+        // Configure TLS for session resumption with 0-RTT
+        // This must be done BEFORE startHandshake() so the ClientStateMachine
+        // can derive 0-RTT keys using the correct ClientHello transcript hash
+        try tlsProvider.configureResumption(
+            ticket: session.sessionTicketData,
+            attemptEarlyData: earlyData != nil
+        )
+
+        // Start TLS handshake (will include PSK extension for resumption)
+        // The TLS provider will:
+        // 1. Build ClientHello with PSK extension
+        // 2. Derive early secret from PSK
+        // 3. Compute ClientHello transcript hash
+        // 4. Derive client_early_traffic_secret with correct transcript
+        // 5. Return 0-RTT keys in the outputs
+        let outputs = try await tlsProvider.startHandshake(isClient: true)
+
+        // State was already set to connecting at the beginning of this method
+
+        // Process TLS outputs (installs 0-RTT keys and generates Initial packets)
+        let initialPackets = try await processTLSOutputs(outputs)
+
+        // Generate 0-RTT packets with early data
+        var zeroRTTPackets: [Data] = []
+        if let data = earlyData, !data.isEmpty {
+            // Open a stream for early data (stream ID 0 for client-initiated bidirectional)
+            let streamID: UInt64 = 0
+            handler.queueFrame(.stream(StreamFrame(
+                streamID: streamID,
+                offset: 0,
+                data: data,
+                fin: false
+            )), level: .zeroRTT)
+
+            // Generate 0-RTT packet
+            let packets = try generate0RTTPackets()
+            zeroRTTPackets.append(contentsOf: packets)
+        }
+
+        return (initialPackets, zeroRTTPackets)
+    }
+
+    /// Generates 0-RTT packets from queued frames
+    private func generate0RTTPackets() throws -> [Data] {
+        let outboundPackets = handler.getOutboundPackets()
+        var result: [Data] = []
+
+        for packet in outboundPackets where packet.level == .zeroRTT {
+            let pn = handler.getNextPacketNumber(for: .zeroRTT)
+            let header = build0RTTHeader(packetNumber: pn)
+
+            let encrypted = try packetProcessor.encryptLongHeaderPacket(
+                frames: packet.frames,
+                header: header,
+                packetNumber: pn,
+                padToMinimum: false
+            )
+            result.append(encrypted)
+        }
+
+        return result
+    }
+
+    /// Builds a 0-RTT packet header
+    private func build0RTTHeader(packetNumber: UInt64) -> LongHeader {
+        let (scid, dcid) = state.withLock { ($0.sourceConnectionID, $0.destinationConnectionID) }
+        return LongHeader(
+            packetType: .zeroRTT,
+            version: handler.version,
+            destinationConnectionID: dcid,
+            sourceConnectionID: scid,
+            packetNumber: packetNumber
+        )
     }
 
     /// Processes an incoming packet
     /// - Parameter data: The encrypted packet data
     /// - Returns: Outbound packets to send in response
     public func processIncomingPacket(_ data: Data) async throws -> [Data] {
+        // Record received bytes for anti-amplification limit
+        amplificationLimiter.recordBytesReceived(UInt64(data.count))
+
         // Decrypt the packet
         let parsed = try packetProcessor.decryptPacket(data)
+
+        // RFC 9000 Section 8.1: Server validates client address upon receiving Handshake packet
+        if parsed.encryptionLevel == .handshake {
+            amplificationLimiter.validateAddress()
+        }
 
         // Record received packet
         handler.recordReceivedPacket(
@@ -198,18 +341,33 @@ public final class ManagedConnection: Sendable {
         let responsePackets = try generateOutboundPackets()
         outboundPackets.append(contentsOf: responsePackets)
 
-        return outboundPackets
+        // Apply anti-amplification limit
+        return applyAmplificationLimit(to: outboundPackets)
     }
 
     /// Processes a coalesced datagram (multiple packets)
     /// - Parameter datagram: The UDP datagram
     /// - Returns: Outbound packets to send in response
     public func processDatagram(_ datagram: Data) async throws -> [Data] {
+        // Record received bytes for anti-amplification limit
+        amplificationLimiter.recordBytesReceived(UInt64(datagram.count))
+
         let parsedPackets = try packetProcessor.decryptDatagram(datagram)
+
+        // RFC 9000 Section 6.2: Mark that we've received a valid packet
+        // This prevents late Version Negotiation packets from being processed
+        if !parsedPackets.isEmpty {
+            state.withLock { $0.hasReceivedValidPacket = true }
+        }
 
         var allOutbound: [Data] = []
 
         for parsed in parsedPackets {
+            // RFC 9000 Section 8.1: Server validates client address upon receiving Handshake packet
+            if parsed.encryptionLevel == .handshake {
+                amplificationLimiter.validateAddress()
+            }
+
             // Record received packet
             handler.recordReceivedPacket(
                 packetNumber: parsed.packetNumber,
@@ -230,7 +388,32 @@ public final class ManagedConnection: Sendable {
         let responsePackets = try generateOutboundPackets()
         allOutbound.append(contentsOf: responsePackets)
 
-        return allOutbound
+        // Apply anti-amplification limit to outbound packets (servers only)
+        return applyAmplificationLimit(to: allOutbound)
+    }
+
+    /// Applies the anti-amplification limit to outbound packets
+    ///
+    /// RFC 9000 Section 8.1: Before address validation, servers MUST NOT send
+    /// more than 3 times the data received from the client.
+    ///
+    /// - Parameter packets: Packets to potentially send
+    /// - Returns: Packets that fit within the amplification limit
+    private func applyAmplificationLimit(to packets: [Data]) -> [Data] {
+        var allowedPackets: [Data] = []
+
+        for packet in packets {
+            let packetSize = UInt64(packet.count)
+
+            if amplificationLimiter.canSend(bytes: packetSize) {
+                amplificationLimiter.recordBytesSent(packetSize)
+                allowedPackets.append(packet)
+            }
+            // Packets that exceed the limit are dropped
+            // They will be retransmitted once more data is received
+        }
+
+        return allowedPackets
     }
 
     /// Generates outbound packets ready to send
@@ -362,6 +545,9 @@ public final class ManagedConnection: Sendable {
                     }
                 }
 
+                // RFC 9000 Section 8.1: Lift amplification limit when handshake is confirmed
+                amplificationLimiter.confirmHandshake()
+
                 // Server: Send HANDSHAKE_DONE
                 let role = state.withLock { $0.role }
                 if role == .server {
@@ -388,6 +574,11 @@ public final class ManagedConnection: Sendable {
                     alert: alert.alertDescription.rawValue,
                     description: alert.description
                 )
+
+            case .newSessionTicket(let ticketInfo):
+                // RFC 8446 Section 4.6.1: NewSessionTicket received post-handshake
+                // Store it for the client to use for future connections
+                notifySessionTicketReceived(ticketInfo)
             }
         }
 
@@ -676,6 +867,70 @@ extension ManagedConnection: QUICConnectionProtocol {
         }
     }
 
+    /// Stream of session tickets received from the server
+    ///
+    /// Use this to receive `NewSessionTicket` messages for session resumption.
+    /// Store these tickets in a `ClientSessionCache` for future 0-RTT connections.
+    ///
+    /// ## Usage
+    /// ```swift
+    /// let sessionCache = ClientSessionCache()
+    /// Task {
+    ///     for await ticketInfo in connection.sessionTickets {
+    ///         sessionCache.storeTicket(
+    ///             ticketInfo.ticket,
+    ///             resumptionMasterSecret: ticketInfo.resumptionMasterSecret,
+    ///             cipherSuite: ticketInfo.cipherSuite,
+    ///             alpn: ticketInfo.alpn,
+    ///             serverIdentity: "\(connection.remoteAddress)"
+    ///         )
+    ///     }
+    /// }
+    /// ```
+    public var sessionTickets: AsyncStream<NewSessionTicketInfo> {
+        sessionTicketState.withLock { state in
+            // If shutdown, return existing finished stream or create a finished one
+            if state.isShutdown {
+                if let existing = state.stream { return existing }
+                let (stream, continuation) = AsyncStream<NewSessionTicketInfo>.makeStream()
+                continuation.finish()
+                state.stream = stream
+                return stream
+            }
+
+            // Return existing stream if already created
+            if let existing = state.stream { return existing }
+
+            // Create new stream
+            let (stream, continuation) = AsyncStream<NewSessionTicketInfo>.makeStream()
+            state.stream = stream
+            state.continuation = continuation
+
+            // Drain any pending tickets
+            for pendingTicket in state.pendingTickets {
+                continuation.yield(pendingTicket)
+            }
+            state.pendingTickets.removeAll()
+
+            return stream
+        }
+    }
+
+    /// Notifies that a session ticket was received (internal helper)
+    private func notifySessionTicketReceived(_ ticketInfo: NewSessionTicketInfo) {
+        sessionTicketState.withLock { state in
+            guard !state.isShutdown else { return }
+
+            if let continuation = state.continuation {
+                // Stream is active, yield directly
+                continuation.yield(ticketInfo)
+            } else {
+                // Buffer until sessionTickets is accessed
+                state.pendingTickets.append(ticketInfo)
+            }
+        }
+    }
+
     public func close(error: UInt64?) async {
         handler.close(error: error.map { ConnectionCloseError(code: $0) })
         state.withLock { $0.handshakeState = .closing }
@@ -698,7 +953,9 @@ extension ManagedConnection: QUICConnectionProtocol {
     /// new iterators from hanging (they get an already-finished stream).
     public func shutdown() {
         // Finish incoming stream continuation and mark as shutdown
+        // Guard against concurrent calls - finish() is idempotent but we avoid duplicate work
         incomingStreamState.withLock { state in
+            guard !state.isShutdown else { return }  // Already shutdown
             state.isShutdown = true  // Mark as shutdown FIRST
             state.continuation?.finish()
             state.continuation = nil
@@ -706,9 +963,19 @@ extension ManagedConnection: QUICConnectionProtocol {
             // DO NOT set stream = nil - existing iterators need it
         }
 
+        // Finish session ticket stream and mark as shutdown
+        sessionTicketState.withLock { state in
+            guard !state.isShutdown else { return }  // Already shutdown
+            state.isShutdown = true
+            state.continuation?.finish()
+            state.continuation = nil
+            state.pendingTickets.removeAll()
+        }
+
         // Resume any waiting stream readers with connection closed error
         // and mark as shutdown to prevent new readers from hanging
         streamContinuationsState.withLock { state in
+            guard !state.isShutdown else { return }  // Already shutdown
             state.isShutdown = true  // Mark as shutdown FIRST
             for (_, continuation) in state.continuations {
                 continuation.resume(throwing: ManagedConnectionError.connectionClosed)
@@ -810,6 +1077,50 @@ extension ManagedConnection {
 
     // Note: Connection ID tracking is now managed by ConnectionRouter.
     // Use router.registeredConnectionIDs(for:) to query CIDs for a connection.
+
+    // MARK: - Amplification Limit
+
+    /// Whether the connection is blocked by the anti-amplification limit
+    ///
+    /// When blocked, the server must wait for more data from the client
+    /// before it can send additional packets.
+    public var isAmplificationBlocked: Bool {
+        amplificationLimiter.isBlocked
+    }
+
+    /// Whether the client's address has been validated
+    ///
+    /// Address validation lifts the anti-amplification limit.
+    public var isAddressValidated: Bool {
+        amplificationLimiter.isAddressValidated
+    }
+
+    // MARK: - Version Negotiation
+
+    /// Whether we have received and successfully processed any valid packet
+    ///
+    /// RFC 9000 Section 6.2: A client MUST discard any Version Negotiation packet
+    /// if it has received and successfully processed any other packet.
+    public var hasReceivedValidPacket: Bool {
+        get async { state.withLock { $0.hasReceivedValidPacket } }
+    }
+
+    /// Retry the connection with a different QUIC version
+    ///
+    /// Called when a Version Negotiation packet is received offering a version we support.
+    /// This resets the connection state and restarts the handshake with the new version.
+    ///
+    /// - Parameter version: The new version to use
+    public func retryWithVersion(_ version: QUICVersion) async throws {
+        // This is a complex operation that requires:
+        // 1. Resetting TLS state
+        // 2. Regenerating Initial keys with the new version
+        // 3. Rebuilding and resending ClientHello
+        // For now, throw an error indicating manual reconnection is needed
+        throw QUICVersionError.versionNegotiationReceived(
+            offeredVersions: [version]
+        )
+    }
 }
 
 // MARK: - Internal State
@@ -820,6 +1131,13 @@ private struct ManagedConnectionState: Sendable {
     var sourceConnectionID: ConnectionID
     var destinationConnectionID: ConnectionID
     var negotiatedALPN: String? = nil
+    /// Whether 0-RTT was attempted in this connection
+    var is0RTTAttempted: Bool = false
+    /// Whether 0-RTT was accepted by server (set after receiving EncryptedExtensions)
+    var is0RTTAccepted: Bool = false
+    /// Whether we have received and successfully processed any valid packet
+    /// RFC 9000 Section 6.2: Used to discard late Version Negotiation packets
+    var hasReceivedValidPacket: Bool = false
 }
 
 // MARK: - Errors

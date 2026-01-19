@@ -6,6 +6,46 @@ import Foundation
 import Synchronization
 import QUICCore
 
+// MARK: - PTO Action
+
+/// Action to take when PTO (Probe Timeout) expires
+///
+/// RFC 9002 Section 6.2: When a PTO expires, the sender MUST send
+/// one or two probe datagrams. This struct describes what action
+/// to take.
+public struct PTOAction: Sendable, Equatable {
+    /// The encryption level at which to send the probe
+    public let level: EncryptionLevel
+
+    /// Number of probe packets to send (1 or 2)
+    ///
+    /// RFC 9002 Section 6.2.4: It is RECOMMENDED that implementations
+    /// send two probe datagrams to improve detection of packet loss.
+    public let probeCount: Int
+
+    /// Packets that can be retransmitted as probes (if any)
+    ///
+    /// If empty, the sender should send a PING frame.
+    public let packetsToProbe: [SentPacket]
+
+    /// Creates a PTO action
+    public init(
+        level: EncryptionLevel,
+        probeCount: Int = 2,
+        packetsToProbe: [SentPacket] = []
+    ) {
+        self.level = level
+        self.probeCount = probeCount
+        self.packetsToProbe = packetsToProbe
+    }
+
+    public static func == (lhs: PTOAction, rhs: PTOAction) -> Bool {
+        lhs.level == rhs.level &&
+        lhs.probeCount == rhs.probeCount &&
+        lhs.packetsToProbe.count == rhs.packetsToProbe.count
+    }
+}
+
 /// Manages loss detection and ACK state for all packet number spaces
 public final class PacketNumberSpaceManager: Sendable {
     /// Loss detectors per encryption level (packet number space)
@@ -333,5 +373,108 @@ public final class PacketNumberSpaceManager: Sendable {
         let congestionPeriod = pto * 2 * LossDetectionConstants.persistentCongestionThreshold
 
         return timeSpan >= congestionPeriod
+    }
+
+    // MARK: - PTO (Probe Timeout) Handling
+
+    /// Determines the encryption level at which to send probe packets
+    ///
+    /// RFC 9002 Section 6.2.1: Priority order for PTO probes:
+    /// 1. Initial (if keys available and packets in flight)
+    /// 2. Handshake (if keys available and packets in flight)
+    /// 3. Application (1-RTT) data
+    ///
+    /// - Parameter hasInitialKeys: Whether Initial keys are available
+    /// - Parameter hasHandshakeKeys: Whether Handshake keys are available
+    /// - Returns: The encryption level for probing, or nil if none needed
+    public func getPTOSpace(
+        hasInitialKeys: Bool,
+        hasHandshakeKeys: Bool
+    ) -> EncryptionLevel? {
+        // During handshake, prioritize Initial and Handshake spaces
+        if !handshakeConfirmed {
+            // Check Initial space first
+            if hasInitialKeys {
+                if let detector = lossDetectors[.initial],
+                   detector.ackElicitingInFlight > 0 {
+                    return .initial
+                }
+            }
+
+            // Then Handshake space
+            if hasHandshakeKeys {
+                if let detector = lossDetectors[.handshake],
+                   detector.ackElicitingInFlight > 0 {
+                    return .handshake
+                }
+            }
+        }
+
+        // Finally Application space
+        if let detector = lossDetectors[.application],
+           detector.ackElicitingInFlight > 0 {
+            return .application
+        }
+
+        // RFC 9002 Section 6.2.2.1: If no ack-eliciting packets in flight,
+        // client should still probe during handshake
+        if !handshakeConfirmed {
+            if hasInitialKeys {
+                return .initial
+            }
+            if hasHandshakeKeys {
+                return .handshake
+            }
+        }
+
+        return nil
+    }
+
+    /// Handles PTO timeout and determines what action to take
+    ///
+    /// RFC 9002 Section 6.2: When the PTO timer expires, send probe packets.
+    ///
+    /// - Parameters:
+    ///   - hasInitialKeys: Whether Initial keys are available
+    ///   - hasHandshakeKeys: Whether Handshake keys are available
+    /// - Returns: The action to take, or nil if no probing needed
+    public func handlePTOTimeout(
+        hasInitialKeys: Bool,
+        hasHandshakeKeys: Bool
+    ) -> PTOAction? {
+        // Determine which space to probe
+        guard let level = getPTOSpace(
+            hasInitialKeys: hasInitialKeys,
+            hasHandshakeKeys: hasHandshakeKeys
+        ) else {
+            return nil
+        }
+
+        // Increment PTO count
+        onPTOExpired()
+
+        // Get packets that can be retransmitted
+        // (oldest unacknowledged ack-eliciting packets)
+        let packetsToProbe: [SentPacket]
+        if let detector = lossDetectors[level] {
+            packetsToProbe = detector.getOldestUnackedPackets(count: 2)
+        } else {
+            packetsToProbe = []
+        }
+
+        return PTOAction(
+            level: level,
+            probeCount: 2,
+            packetsToProbe: packetsToProbe
+        )
+    }
+
+    /// Whether PTO probing is needed (no ack-eliciting packets in flight
+    /// but handshake is not confirmed - client should send probes)
+    ///
+    /// RFC 9002 Section 6.2.2.1: If there are no ack-eliciting packets in
+    /// flight, the client SHOULD set a PTO timer to send probe packets.
+    public var needsPTOProbeEvenWithoutInFlight: Bool {
+        !handshakeConfirmed && !hasAckElicitingInFlight
     }
 }

@@ -28,6 +28,42 @@ public enum TLSOutput: Sendable {
     /// A TLS alert to be sent to the peer (RFC 8446 Section 6)
     /// For QUIC, this is converted to a CONNECTION_CLOSE frame
     case alert(TLSAlert)
+
+    /// A NewSessionTicket was received (RFC 8446 Section 4.6.1)
+    ///
+    /// This is sent post-handshake by servers to enable session resumption.
+    /// Clients should store this ticket for future connections.
+    case newSessionTicket(NewSessionTicketInfo)
+}
+
+// MARK: - NewSessionTicket Info
+
+/// Information about a received NewSessionTicket
+public struct NewSessionTicketInfo: Sendable {
+    /// The raw NewSessionTicket message
+    public let ticket: NewSessionTicket
+
+    /// The resumption master secret for deriving the PSK
+    public let resumptionMasterSecret: SymmetricKey
+
+    /// The cipher suite used in this connection
+    public let cipherSuite: CipherSuite
+
+    /// The negotiated ALPN protocol (if any)
+    public let alpn: String?
+
+    /// Creates new session ticket info
+    public init(
+        ticket: NewSessionTicket,
+        resumptionMasterSecret: SymmetricKey,
+        cipherSuite: CipherSuite,
+        alpn: String? = nil
+    ) {
+        self.ticket = ticket
+        self.resumptionMasterSecret = resumptionMasterSecret
+        self.cipherSuite = cipherSuite
+        self.alpn = alpn
+    }
 }
 
 // MARK: - Keys Available Info
@@ -38,20 +74,25 @@ public struct KeysAvailableInfo: Sendable {
     public let level: EncryptionLevel
 
     /// Client traffic secret
-    public let clientSecret: SymmetricKey
+    public let clientSecret: SymmetricKey?
 
     /// Server traffic secret
-    public let serverSecret: SymmetricKey
+    public let serverSecret: SymmetricKey?
+
+    /// The negotiated cipher suite for packet protection
+    public let cipherSuite: QUICCipherSuite
 
     /// Creates keys available info
     public init(
         level: EncryptionLevel,
-        clientSecret: SymmetricKey,
-        serverSecret: SymmetricKey
+        clientSecret: SymmetricKey?,
+        serverSecret: SymmetricKey?,
+        cipherSuite: QUICCipherSuite = .aes128GcmSha256
     ) {
         self.level = level
         self.clientSecret = clientSecret
         self.serverSecret = serverSecret
+        self.cipherSuite = cipherSuite
     }
 }
 

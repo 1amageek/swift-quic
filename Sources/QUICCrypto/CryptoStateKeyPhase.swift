@@ -267,6 +267,9 @@ public final class KeyPhaseManager: Sendable {
                 updateCount: currentContext.updateCount + 1
             )
 
+            // RFC 9001 Section 6.1: After receiving a peer-initiated key update,
+            // must not initiate another key update until packets with new keys are acknowledged
+            state.keyUpdateAllowed = false
             state.lastKeyUpdateTime = .now
         }
     }

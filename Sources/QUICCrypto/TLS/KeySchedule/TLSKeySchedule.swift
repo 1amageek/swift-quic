@@ -59,7 +59,7 @@ public struct TLSKeySchedule: Sendable {
     private var state: KeyScheduleState
 
     /// The negotiated cipher suite
-    private let cipherSuite: CipherSuite
+    public let cipherSuite: CipherSuite
 
     /// Hash length (32 for SHA-256, 48 for SHA-384)
     public let hashLength: Int

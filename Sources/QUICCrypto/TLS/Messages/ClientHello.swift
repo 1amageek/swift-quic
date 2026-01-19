@@ -215,4 +215,24 @@ public struct ClientHello: Sendable {
         }
         return nil
     }
+
+    /// Get pre-shared key extension
+    public var preSharedKey: OfferedPsks? {
+        for ext in extensions {
+            if case .preSharedKey(.clientHello(let offered)) = ext {
+                return offered
+            }
+        }
+        return nil
+    }
+
+    /// Get early_data extension
+    public var earlyData: Bool {
+        for ext in extensions {
+            if case .earlyData = ext {
+                return true
+            }
+        }
+        return false
+    }
 }

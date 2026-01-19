@@ -112,10 +112,15 @@ public final class ClientStateMachine: Sendable {
                 extensions.append(.pskKeyExchangeModesList([.psk_dhe_ke]))
 
                 // early_data (if attempting 0-RTT)
-                if attemptEarlyData && ticket.maxEarlyDataSize > 0 {
+                // Sanity check: limit max early data to 16MB to prevent memory issues
+                // from maliciously large values
+                let maxAllowedEarlyData: UInt32 = 16 * 1024 * 1024  // 16 MB
+                let effectiveMaxEarlyData = min(ticket.maxEarlyDataSize, maxAllowedEarlyData)
+
+                if attemptEarlyData && effectiveMaxEarlyData > 0 {
                     extensions.append(.earlyDataClient())
                     state.context.earlyDataState.attemptingEarlyData = true
-                    state.context.earlyDataState.maxEarlyDataSize = ticket.maxEarlyDataSize
+                    state.context.earlyDataState.maxEarlyDataSize = effectiveMaxEarlyData
                 }
 
                 // pre_shared_key must be the last extension
@@ -131,6 +136,10 @@ public final class ClientStateMachine: Sendable {
                 let psk = SymmetricKey(data: ticket.resumptionPSK)
                 state.context.keySchedule = TLSKeySchedule(cipherSuite: ticket.cipherSuite)
                 state.context.keySchedule.deriveEarlySecret(psk: psk)
+
+                // Store the PSK cipher suite for 0-RTT key output
+                // (will be updated to negotiated suite after ServerHello)
+                state.context.cipherSuite = ticket.cipherSuite
             }
 
             // If offering PSK, we need to compute binders using a two-pass approach
@@ -216,11 +225,13 @@ public final class ClientStateMachine: Sendable {
             var outputs: [TLSOutput] = []
 
             // If attempting early data, provide the early keys (0-RTT)
-            if let earlySecret = state.context.clientEarlyTrafficSecret {
+            if let earlySecret = state.context.clientEarlyTrafficSecret,
+               let cipherSuite = state.context.cipherSuite {
                 outputs.append(.keysAvailable(KeysAvailableInfo(
                     level: .zeroRTT,
                     clientSecret: earlySecret,
-                    serverSecret: earlySecret // Not used for 0-RTT (client-to-server only)
+                    serverSecret: earlySecret, // Not used for 0-RTT (client-to-server only)
+                    cipherSuite: cipherSuite.toQUICCipherSuite
                 )))
             }
 
@@ -269,10 +280,20 @@ public final class ClientStateMachine: Sendable {
             var pskAccepted = false
             if let pskExtension = serverHello.extensions.first(where: { $0.extensionType == .preSharedKey }) {
                 if case .preSharedKey(.serverHello(let selectedPsk)) = pskExtension {
-                    // Verify the selected identity is valid
+                    // Verify the selected identity is valid (we only offer 1 PSK, so must be 0)
                     guard selectedPsk.selectedIdentity == 0 else {
-                        throw TLSHandshakeError.invalidExtension("Invalid PSK selection")
+                        throw TLSHandshakeError.invalidExtension("Invalid PSK selection: \(selectedPsk.selectedIdentity)")
                     }
+
+                    // RFC 8446 Section 4.2.11: The cipher suite MUST match the PSK's cipher suite
+                    // state.context.cipherSuite was set to ticket.cipherSuite when we started with PSK
+                    if let pskCipherSuite = state.context.cipherSuite,
+                       pskCipherSuite != serverHello.cipherSuite {
+                        throw TLSHandshakeError.invalidExtension(
+                            "Cipher suite mismatch: PSK uses \(pskCipherSuite), server selected \(serverHello.cipherSuite)"
+                        )
+                    }
+
                     pskAccepted = true
                     state.context.pskUsed = true
                     state.context.selectedPskIdentity = selectedPsk.selectedIdentity
@@ -526,7 +547,8 @@ public final class ClientStateMachine: Sendable {
             state.context.peerCertificates = certificate.certificates
 
             // Parse and validate X.509 certificate if verification is enabled
-            if state.configuration.verifyPeer {
+            // Skip X.509 parsing if expectedPeerPublicKey is set (raw public key verification)
+            if state.configuration.verifyPeer && state.configuration.expectedPeerPublicKey == nil {
                 guard let leafCertData = certificate.leafCertificate else {
                     throw TLSHandshakeError.certificateVerificationFailed("No certificate provided")
                 }

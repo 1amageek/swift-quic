@@ -41,6 +41,14 @@ public final class TLS13Handler: TLS13Provider, Sendable {
 
         // Key phase counter (number of key updates performed)
         var keyPhase: UInt8 = 0
+
+        // Session resumption configuration (set before startHandshake)
+        var resumptionTicket: SessionTicketData?
+        var attemptEarlyData: Bool = false
+
+        // 0-RTT state tracking
+        var is0RTTAttempted: Bool = false
+        var is0RTTAccepted: Bool = false
     }
 
     // MARK: - Initialization
@@ -59,10 +67,16 @@ public final class TLS13Handler: TLS13Provider, Sendable {
                 let clientMachine = ClientStateMachine()
                 state.clientStateMachine = clientMachine
 
+                // Pass session ticket and early data flag to ClientStateMachine
                 let (clientHello, outputs) = try clientMachine.startHandshake(
                     configuration: configuration,
-                    transportParameters: state.localTransportParams ?? Data()
+                    transportParameters: state.localTransportParams ?? Data(),
+                    sessionTicket: state.resumptionTicket,
+                    attemptEarlyData: state.attemptEarlyData
                 )
+
+                // Track if 0-RTT was attempted
+                state.is0RTTAttempted = state.attemptEarlyData && state.resumptionTicket != nil
 
                 var result = outputs
                 result.insert(.handshakeData(clientHello, level: .initial), at: 0)
@@ -149,6 +163,21 @@ public final class TLS13Handler: TLS13Provider, Sendable {
         state.withLock { $0.negotiatedALPN }
     }
 
+    public func configureResumption(ticket: SessionTicketData, attemptEarlyData: Bool) throws {
+        state.withLock { state in
+            state.resumptionTicket = ticket
+            state.attemptEarlyData = attemptEarlyData
+        }
+    }
+
+    public var is0RTTAccepted: Bool {
+        state.withLock { $0.is0RTTAccepted }
+    }
+
+    public var is0RTTAttempted: Bool {
+        state.withLock { $0.is0RTTAttempted }
+    }
+
     public func requestKeyUpdate() async throws -> [TLSOutput] {
         // Key update implementation (RFC 9001 Section 6 for QUIC)
         return try state.withLock { state in
@@ -174,11 +203,15 @@ public final class TLS13Handler: TLS13Provider, Sendable {
             state.serverApplicationSecret = nextServerSecret
             state.keyPhase = (state.keyPhase + 1) % 2  // Toggle key phase bit
 
+            // Get cipher suite from key schedule
+            let cipherSuite = state.keySchedule.cipherSuite.toQUICCipherSuite
+
             return [
                 .keysAvailable(KeysAvailableInfo(
                     level: .application,
                     clientSecret: nextClientSecret,
-                    serverSecret: nextServerSecret
+                    serverSecret: nextServerSecret,
+                    cipherSuite: cipherSuite
                 ))
             ]
         }
@@ -323,6 +356,10 @@ public final class TLS13Handler: TLS13Provider, Sendable {
             if let params = clientMachine.peerTransportParameters {
                 state.peerTransportParams = params
             }
+            // Update 0-RTT acceptance status from client state machine
+            if state.is0RTTAttempted {
+                state.is0RTTAccepted = clientMachine.earlyDataAccepted
+            }
 
         case .certificate:
             outputs = try clientMachine.processCertificate(content)
@@ -423,14 +460,16 @@ public final class ServerStateMachine: Sendable {
 
     private let state = Mutex<ServerState>(ServerState())
     private let configuration: TLSConfiguration
+    private let sessionTicketStore: SessionTicketStore?
 
     private struct ServerState: Sendable {
         var handshakeState: ServerHandshakeState = .start
         var context: HandshakeContext = HandshakeContext()
     }
 
-    public init(configuration: TLSConfiguration) {
+    public init(configuration: TLSConfiguration, sessionTicketStore: SessionTicketStore? = nil) {
         self.configuration = configuration
+        self.sessionTicketStore = sessionTicketStore
     }
 
     /// Response from processing ClientHello
@@ -525,9 +564,95 @@ public final class ServerStateMachine: Sendable {
             state.context.clientRandom = clientHello.random
             state.context.sessionID = clientHello.legacySessionID
 
-            // Update transcript with ClientHello
+            // Try PSK validation if offered
+            var pskValidationResult: PSKValidationResult = .noPskOffered
+            var selectedPskIndex: UInt16? = nil
+
+            if let offeredPsks = clientHello.preSharedKey,
+               let store = self.sessionTicketStore {
+                // Compute truncated transcript for binder validation
+                // ClientHello without binders section
+                let clientHelloMessage = HandshakeCodec.encode(type: .clientHello, content: data)
+                let bindersSize = offeredPsks.bindersSize
+                let truncatedLength = clientHelloMessage.count - bindersSize
+                let truncatedTranscript = clientHelloMessage.prefix(truncatedLength)
+
+                // Try each offered PSK identity
+                for (index, identity) in offeredPsks.identities.enumerated() {
+                    guard let session = store.lookupSession(ticketId: identity.identity) else {
+                        continue
+                    }
+
+                    // Validate ticket age
+                    guard session.isValidAge(obfuscatedAge: identity.obfuscatedTicketAge) else {
+                        continue
+                    }
+
+                    // Get the corresponding binder
+                    guard index < offeredPsks.binders.count else {
+                        continue
+                    }
+                    let binder = offeredPsks.binders[index]
+
+                    // Derive PSK from session using the stored ticket nonce
+                    let ticketNonce = session.ticketNonce
+
+                    // Initialize key schedule with PSK
+                    var pskKeySchedule = TLSKeySchedule(cipherSuite: session.cipherSuite)
+                    let psk = session.derivePSK(ticketNonce: ticketNonce, keySchedule: pskKeySchedule)
+                    pskKeySchedule.deriveEarlySecret(psk: psk)
+
+                    // Validate binder
+                    if let binderKey = try? pskKeySchedule.deriveBinderKey(isResumption: true) {
+                        let helper = PSKBinderHelper(cipherSuite: session.cipherSuite)
+                        let binderKeyData = binderKey.withUnsafeBytes { Data($0) }
+                        // Use cipher suite's hash algorithm (SHA-256 or SHA-384)
+                        let transcriptHash = session.cipherSuite.transcriptHash(of: truncatedTranscript)
+
+                        if helper.isValidBinder(forKey: binderKeyData, transcriptHash: transcriptHash, expected: binder) {
+                            // PSK validated successfully
+                            selectedPskIndex = UInt16(index)
+                            state.context.pskUsed = true
+                            state.context.selectedPskIdentity = UInt16(index)
+                            state.context.cipherSuite = session.cipherSuite
+                            pskValidationResult = .valid(index: UInt16(index), session: session, psk: psk)
+                            break
+                        }
+                    }
+                }
+            }
+
+            // Update transcript with ClientHello (after PSK validation which needs truncated transcript)
             let clientHelloMessage = HandshakeCodec.encode(type: .clientHello, content: data)
             state.context.transcriptHash.update(with: clientHelloMessage)
+
+            // If PSK was validated, derive early secret in the main key schedule
+            if selectedPskIndex != nil,
+               case .valid(_, let session, let psk) = pskValidationResult {
+                state.context.keySchedule = TLSKeySchedule(cipherSuite: session.cipherSuite)
+                state.context.keySchedule.deriveEarlySecret(psk: psk)
+
+                // Check if client offered early_data and session allows it
+                if clientHello.earlyData && session.maxEarlyDataSize > 0 {
+                    // Accept early data
+                    state.context.earlyDataState.attemptingEarlyData = true
+                    state.context.earlyDataState.earlyDataAccepted = true
+                    state.context.earlyDataState.maxEarlyDataSize = session.maxEarlyDataSize
+
+                    // Derive client early traffic secret (RFC 8446 Section 7.1)
+                    let earlyTranscript = state.context.transcriptHash.currentHash()
+                    if let earlyTrafficSecret = try? state.context.keySchedule.deriveClientEarlyTrafficSecret(
+                        transcriptHash: earlyTranscript
+                    ) {
+                        state.context.clientEarlyTrafficSecret = earlyTrafficSecret
+                        let secretData = earlyTrafficSecret.withUnsafeBytes { Data($0) }
+                        state.context.earlyDataState.clientEarlyTrafficSecret = secretData
+                    }
+                }
+            } else {
+                // No PSK - derive early secret with nil PSK
+                state.context.keySchedule.deriveEarlySecret(psk: nil)
+            }
 
             // Generate server key pair for selected group
             let serverKeyExchange = try KeyExchange.generate(for: selectedGroup)
@@ -551,14 +676,22 @@ public final class ServerStateMachine: Sendable {
             var messages: [(Data, EncryptionLevel)] = []
             var outputs: [TLSOutput] = []
 
+            // Build ServerHello extensions
+            var serverHelloExtensions: [TLSExtension] = [
+                .supportedVersionsServer(TLSConstants.version13),
+                .keyShareServer(serverKeyExchange.keyShareEntry())
+            ]
+
+            // Add pre_shared_key extension if PSK was accepted
+            if let pskIndex = selectedPskIndex {
+                serverHelloExtensions.append(.preSharedKeyServer(selectedIdentity: pskIndex))
+            }
+
             // Generate ServerHello
             let serverHello = ServerHello(
                 legacySessionIDEcho: clientHello.legacySessionID,
-                cipherSuite: .tls_aes_128_gcm_sha256,
-                extensions: [
-                    .supportedVersionsServer(TLSConstants.version13),
-                    .keyShareServer(serverKeyExchange.keyShareEntry())
-                ]
+                cipherSuite: state.context.cipherSuite ?? .tls_aes_128_gcm_sha256,
+                extensions: serverHelloExtensions
             )
 
             let serverHelloMessage = serverHello.encodeAsHandshake()
@@ -575,10 +708,14 @@ public final class ServerStateMachine: Sendable {
             state.context.clientHandshakeSecret = clientSecret
             state.context.serverHandshakeSecret = serverSecret
 
+            // Get cipher suite for packet protection
+            let cipherSuite = (state.context.cipherSuite ?? .tls_aes_128_gcm_sha256).toQUICCipherSuite
+
             outputs.append(.keysAvailable(KeysAvailableInfo(
                 level: .handshake,
                 clientSecret: clientSecret,
-                serverSecret: serverSecret
+                serverSecret: serverSecret,
+                cipherSuite: cipherSuite
             )))
 
             // Generate EncryptedExtensions
@@ -588,38 +725,56 @@ public final class ServerStateMachine: Sendable {
             }
             eeExtensions.append(.quicTransportParameters(transportParameters))
 
+            // Add early_data extension if we accepted it (RFC 8446 Section 4.2.10)
+            if state.context.earlyDataState.earlyDataAccepted {
+                eeExtensions.append(.earlyData(.encryptedExtensions))
+
+                // Output 0-RTT keys
+                if let earlyTrafficSecret = state.context.clientEarlyTrafficSecret {
+                    outputs.append(.keysAvailable(KeysAvailableInfo(
+                        level: .zeroRTT,
+                        clientSecret: earlyTrafficSecret,
+                        serverSecret: nil,  // Server doesn't send 0-RTT
+                        cipherSuite: cipherSuite
+                    )))
+                }
+            }
+
             let encryptedExtensions = EncryptedExtensions(extensions: eeExtensions)
             let eeMessage = encryptedExtensions.encodeAsHandshake()
             state.context.transcriptHash.update(with: eeMessage)
             messages.append((eeMessage, .handshake))
 
             // Generate Certificate and CertificateVerify if we have certificate material
-            if let signingKey = self.configuration.signingKey,
-               let certChain = self.configuration.certificateChain,
-               !certChain.isEmpty {
+            // Skip for PSK-only handshakes (RFC 8446 Section 2.3)
+            if !state.context.pskUsed {
+                if let signingKey = self.configuration.signingKey,
+                   let certChain = self.configuration.certificateChain,
+                   !certChain.isEmpty {
 
-                // Generate Certificate message
-                let certificate = Certificate(certificates: certChain)
-                let certMessage = certificate.encodeAsHandshake()
-                state.context.transcriptHash.update(with: certMessage)
-                messages.append((certMessage, .handshake))
+                    // Generate Certificate message
+                    let certificate = Certificate(certificates: certChain)
+                    let certMessage = certificate.encodeAsHandshake()
+                    state.context.transcriptHash.update(with: certMessage)
+                    messages.append((certMessage, .handshake))
 
-                // Generate CertificateVerify signature
-                // The signature is over the transcript up to (but not including) CertificateVerify
-                let transcriptForCV = state.context.transcriptHash.currentHash()
-                let signatureContent = CertificateVerify.constructSignatureContent(
-                    transcriptHash: transcriptForCV,
-                    isServer: true
-                )
+                    // Generate CertificateVerify signature
+                    // The signature is over the transcript up to (but not including) CertificateVerify
+                    let transcriptForCV = state.context.transcriptHash.currentHash()
+                    let signatureContent = CertificateVerify.constructSignatureContent(
+                        transcriptHash: transcriptForCV,
+                        isServer: true
+                    )
 
-                let signature = try signingKey.sign(signatureContent)
-                let certificateVerify = CertificateVerify(
-                    algorithm: signingKey.scheme,
-                    signature: signature
-                )
-                let cvMessage = certificateVerify.encodeAsHandshake()
-                state.context.transcriptHash.update(with: cvMessage)
-                messages.append((cvMessage, .handshake))
+                    let signature = try signingKey.sign(signatureContent)
+                    let certificateVerify = CertificateVerify(
+                        algorithm: signingKey.scheme,
+                        signature: signature
+                    )
+                    let cvMessage = certificateVerify.encodeAsHandshake()
+                    state.context.transcriptHash.update(with: cvMessage)
+                    messages.append((cvMessage, .handshake))
+                }
             }
 
             // Generate server Finished
@@ -653,7 +808,8 @@ public final class ServerStateMachine: Sendable {
             outputs.append(.keysAvailable(KeysAvailableInfo(
                 level: .application,
                 clientSecret: clientAppSecret,
-                serverSecret: serverAppSecret
+                serverSecret: serverAppSecret,
+                cipherSuite: cipherSuite
             )))
 
             // Transition state
@@ -748,16 +904,68 @@ public final class ServerStateMachine: Sendable {
             let message = HandshakeCodec.encode(type: .finished, content: data)
             state.context.transcriptHash.update(with: message)
 
+            // Derive resumption master secret (RFC 8446 Section 7.1)
+            let resumptionTranscript = state.context.transcriptHash.currentHash()
+            let resumptionMasterSecret = try state.context.keySchedule.deriveResumptionMasterSecret(
+                transcriptHash: resumptionTranscript
+            )
+            state.context.resumptionMasterSecret = resumptionMasterSecret
+
             // Transition state
             state.handshakeState = .connected
 
             return [
                 .handshakeComplete(HandshakeCompleteInfo(
                     alpn: state.context.negotiatedALPN,
-                    zeroRTTAccepted: false,
+                    zeroRTTAccepted: state.context.earlyDataState.earlyDataAccepted,
                     resumptionTicket: nil
                 ))
             ]
+        }
+    }
+
+    /// Generate a NewSessionTicket for the client
+    /// Call this after handshake completion to enable session resumption
+    public func generateNewSessionTicket(
+        maxEarlyDataSize: UInt32 = 0,
+        lifetime: UInt32 = 86400
+    ) throws -> (ticket: NewSessionTicket, data: Data) {
+        return try state.withLock { state in
+            guard state.handshakeState == .connected else {
+                throw TLSHandshakeError.internalError("Cannot generate ticket before handshake completion")
+            }
+
+            guard let store = sessionTicketStore else {
+                throw TLSHandshakeError.internalError("No session ticket store configured")
+            }
+
+            guard let resumptionMasterSecret = state.context.resumptionMasterSecret else {
+                throw TLSHandshakeError.internalError("Missing resumption master secret")
+            }
+
+            // Generate random ticket_age_add
+            var ticketAgeAdd: UInt32 = 0
+            withUnsafeMutableBytes(of: &ticketAgeAdd) { ptr in
+                _ = SecRandomCopyBytes(kSecRandomDefault, 4, ptr.baseAddress!)
+            }
+
+            // Create stored session
+            let session = SessionTicketStore.StoredSession(
+                resumptionMasterSecret: resumptionMasterSecret,
+                cipherSuite: state.context.cipherSuite ?? .tls_aes_128_gcm_sha256,
+                lifetime: lifetime,
+                ticketAgeAdd: ticketAgeAdd,
+                alpn: state.context.negotiatedALPN,
+                maxEarlyDataSize: maxEarlyDataSize
+            )
+
+            // Generate ticket through store
+            let ticket = store.generateTicket(for: session)
+
+            // Encode as handshake message
+            let ticketData = ticket.encodeMessage()
+
+            return (ticket, ticketData)
         }
     }
 
@@ -779,5 +987,47 @@ public final class ServerStateMachine: Sendable {
     /// Exporter master secret (available after handshake completion)
     public var exporterMasterSecret: SymmetricKey? {
         state.withLock { $0.context.exporterMasterSecret }
+    }
+
+    /// Whether PSK was used for authentication
+    public var pskUsed: Bool {
+        state.withLock { $0.context.pskUsed }
+    }
+
+    /// Resumption master secret (available after handshake completion)
+    public var resumptionMasterSecret: SymmetricKey? {
+        state.withLock { $0.context.resumptionMasterSecret }
+    }
+}
+
+// MARK: - Cipher Suite Conversion
+
+extension CipherSuite {
+    /// Converts TLS CipherSuite to QUICCipherSuite for packet protection
+    public var toQUICCipherSuite: QUICCipherSuite {
+        switch self {
+        case .tls_chacha20_poly1305_sha256:
+            return .chacha20Poly1305Sha256
+        case .tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384:
+            // AES-256-GCM uses SHA-384 for TLS key derivation but
+            // QUIC packet protection still uses AES-128-GCM key sizes
+            // per RFC 9001 (QUIC only supports AES-128-GCM and ChaCha20)
+            return .aes128GcmSha256
+        }
+    }
+
+    /// Computes transcript hash using the appropriate hash algorithm for this cipher suite
+    ///
+    /// RFC 8446 Section 4.4.1: The Hash function used for transcript hashing
+    /// is the one associated with the cipher suite.
+    /// - AES-128-GCM-SHA256, ChaCha20-Poly1305-SHA256: SHA-256
+    /// - AES-256-GCM-SHA384: SHA-384
+    func transcriptHash(of data: Data) -> Data {
+        switch self {
+        case .tls_aes_256_gcm_sha384:
+            return Data(SHA384.hash(data: data))
+        case .tls_aes_128_gcm_sha256, .tls_chacha20_poly1305_sha256:
+            return Data(SHA256.hash(data: data))
+        }
     }
 }

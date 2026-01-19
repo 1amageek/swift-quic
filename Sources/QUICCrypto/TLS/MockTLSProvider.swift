@@ -157,6 +157,21 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
         state.withLock { $0.negotiatedALPN }
     }
 
+    public func configureResumption(ticket: SessionTicketData, attemptEarlyData: Bool) throws {
+        state.withLock { state in
+            state.resumptionTicket = ticket
+            state.attemptEarlyData = attemptEarlyData
+        }
+    }
+
+    public var is0RTTAccepted: Bool {
+        state.withLock { $0.is0RTTAccepted }
+    }
+
+    public var is0RTTAttempted: Bool {
+        state.withLock { $0.is0RTTAttempted }
+    }
+
     public func requestKeyUpdate() async throws -> [TLSOutput] {
         state.withLock { state in
             state.keyUpdateCount += 1
@@ -447,4 +462,10 @@ private struct MockTLSState: Sendable {
     var localTransportParameters: Data? = nil
     var peerTransportParameters: Data? = nil
     var keyUpdateCount: Int = 0
+
+    // 0-RTT state
+    var resumptionTicket: SessionTicketData? = nil
+    var attemptEarlyData: Bool = false
+    var is0RTTAttempted: Bool = false
+    var is0RTTAccepted: Bool = false
 }

@@ -144,9 +144,24 @@ public final class LossDetector: Sendable {
         for (index, range) in ackFrame.ackRanges.enumerated() {
             let rangeStart: UInt64
             if index == 0 {
+                // Validate: rangeLength must not exceed current to prevent underflow
+                guard range.rangeLength <= current else {
+                    // Invalid ACK range - skip this range
+                    continue
+                }
                 rangeStart = current - range.rangeLength
             } else {
-                current = current - range.gap - 2
+                // Validate: gap + 2 must not exceed current to prevent underflow
+                let gapOffset = range.gap + 2
+                guard gapOffset <= current else {
+                    // Invalid ACK gap - stop processing
+                    break
+                }
+                current = current - gapOffset
+                // Validate: rangeLength must not exceed current
+                guard range.rangeLength <= current else {
+                    continue
+                }
                 rangeStart = current - range.rangeLength
             }
 
@@ -302,6 +317,29 @@ public final class LossDetector: Sendable {
     /// Gets the smallest unacked packet number
     public var smallestUnacked: UInt64? {
         state.withLock { $0.smallestUnacked }
+    }
+
+    /// Gets the oldest unacknowledged ack-eliciting packets for PTO probing
+    ///
+    /// RFC 9002 Section 6.2: When PTO expires, send probe packets.
+    /// The probe SHOULD carry data from the oldest unacked packet.
+    ///
+    /// - Parameter count: Maximum number of packets to return (typically 2)
+    /// - Returns: Oldest unacked ack-eliciting packets, sorted by packet number
+    public func getOldestUnackedPackets(count: Int) -> [SentPacket] {
+        state.withLock { state in
+            // Get all ack-eliciting packets
+            var ackEliciting: [SentPacket] = []
+            ackEliciting.reserveCapacity(min(count * 2, state.ackElicitingInFlight))
+
+            for packet in state.sentPackets.values where packet.ackEliciting {
+                ackEliciting.append(packet)
+            }
+
+            // Sort by packet number (ascending) and take oldest
+            ackEliciting.sort { $0.packetNumber < $1.packetNumber }
+            return Array(ackEliciting.prefix(count))
+        }
     }
 
     /// Clears state (called when encryption level is discarded)

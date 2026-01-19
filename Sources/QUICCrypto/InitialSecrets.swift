@@ -68,6 +68,42 @@ public struct InitialSecrets: Sendable {
     }
 }
 
+// MARK: - QUIC Cipher Suite
+
+/// QUIC cipher suites for packet protection
+public enum QUICCipherSuite: Sendable {
+    /// AES-128-GCM with SHA-256 (TLS_AES_128_GCM_SHA256)
+    case aes128GcmSha256
+
+    /// ChaCha20-Poly1305 with SHA-256 (TLS_CHACHA20_POLY1305_SHA256)
+    case chacha20Poly1305Sha256
+
+    /// Key length in bytes
+    public var keyLength: Int {
+        switch self {
+        case .aes128GcmSha256:
+            return 16
+        case .chacha20Poly1305Sha256:
+            return 32
+        }
+    }
+
+    /// IV length in bytes (always 12 for QUIC)
+    public var ivLength: Int {
+        return 12
+    }
+
+    /// Header protection key length in bytes
+    public var hpKeyLength: Int {
+        switch self {
+        case .aes128GcmSha256:
+            return 16
+        case .chacha20Poly1305Sha256:
+            return 32
+        }
+    }
+}
+
 // MARK: - Key Material
 
 /// Cryptographic key material derived from a secret
@@ -81,41 +117,72 @@ public struct KeyMaterial: Sendable {
     /// The header protection key
     public let hp: SymmetricKey
 
-    /// Derives key material from a secret
+    /// The cipher suite used to derive this key material
+    public let cipherSuite: QUICCipherSuite
+
+    /// Derives key material from a secret using AES-128-GCM (default)
     /// - Parameter secret: The secret to derive from
     /// - Returns: The derived key material
     public static func derive(from secret: SymmetricKey) throws -> KeyMaterial {
-        // For AES-128-GCM:
-        // key = HKDF-Expand-Label(secret, "quic key", "", 16)
-        // iv = HKDF-Expand-Label(secret, "quic iv", "", 12)
-        // hp = HKDF-Expand-Label(secret, "quic hp", "", 16)
+        return try derive(from: secret, cipherSuite: .aes128GcmSha256)
+    }
+
+    /// Derives key material from a secret using the specified cipher suite
+    /// - Parameters:
+    ///   - secret: The secret to derive from
+    ///   - cipherSuite: The cipher suite to use
+    /// - Returns: The derived key material
+    public static func derive(
+        from secret: SymmetricKey,
+        cipherSuite: QUICCipherSuite
+    ) throws -> KeyMaterial {
+        // Key lengths depend on cipher suite
+        let keyLength = cipherSuite.keyLength
+        let ivLength = cipherSuite.ivLength
+        let hpLength = cipherSuite.hpKeyLength
 
         let key = try hkdfExpandLabel(
             secret: secret,
             label: "quic key",
             context: Data(),
-            length: 16
+            length: keyLength
         )
 
         let iv = try hkdfExpandLabel(
             secret: secret,
             label: "quic iv",
             context: Data(),
-            length: 12
+            length: ivLength
         )
 
         let hp = try hkdfExpandLabel(
             secret: secret,
             label: "quic hp",
             context: Data(),
-            length: 16
+            length: hpLength
         )
 
         return KeyMaterial(
             key: SymmetricKey(data: key),
             iv: iv,
-            hp: SymmetricKey(data: hp)
+            hp: SymmetricKey(data: hp),
+            cipherSuite: cipherSuite
         )
+    }
+
+    /// Creates opener and sealer for this key material
+    /// - Returns: Tuple of (opener, sealer)
+    public func createCrypto() throws -> (opener: any PacketOpener, sealer: any PacketSealer) {
+        switch cipherSuite {
+        case .aes128GcmSha256:
+            let opener = try AES128GCMOpener(keyMaterial: self)
+            let sealer = try AES128GCMSealer(keyMaterial: self)
+            return (opener, sealer)
+        case .chacha20Poly1305Sha256:
+            let opener = try ChaCha20Poly1305Opener(keyMaterial: self)
+            let sealer = try ChaCha20Poly1305Sealer(keyMaterial: self)
+            return (opener, sealer)
+        }
     }
 }
 

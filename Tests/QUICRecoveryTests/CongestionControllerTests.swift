@@ -725,3 +725,463 @@ struct PersistentCongestionDetectionTests {
         #expect(result == false)
     }
 }
+
+// MARK: - Anti-Amplification Limiter Tests
+
+@Suite("Anti-Amplification Limiter Tests")
+struct AntiAmplificationLimiterTests {
+
+    @Test("Client is not subject to amplification limit")
+    func clientNotLimited() {
+        let limiter = AntiAmplificationLimiter(isServer: false)
+
+        // Client can send unlimited data
+        #expect(limiter.canSend(bytes: 1_000_000) == true)
+        #expect(limiter.availableSendWindow() == UInt64.max)
+        #expect(limiter.isBlocked == false)
+    }
+
+    @Test("Server is limited before address validation")
+    func serverLimitedBeforeValidation() {
+        let limiter = AntiAmplificationLimiter(isServer: true)
+
+        // No data received yet - can't send anything
+        #expect(limiter.canSend(bytes: 1) == false)
+        #expect(limiter.availableSendWindow() == 0)
+        #expect(limiter.isBlocked == true)
+    }
+
+    @Test("Server can send 3x received bytes")
+    func serverCanSend3xReceived() {
+        let limiter = AntiAmplificationLimiter(isServer: true)
+
+        // Receive 1000 bytes
+        limiter.recordBytesReceived(1000)
+
+        // Can send up to 3000 bytes
+        #expect(limiter.canSend(bytes: 3000) == true)
+        #expect(limiter.canSend(bytes: 3001) == false)
+        #expect(limiter.availableSendWindow() == 3000)
+        #expect(limiter.isBlocked == false)
+    }
+
+    @Test("Server send limit tracks sent bytes")
+    func serverSendLimitTracksSentBytes() {
+        let limiter = AntiAmplificationLimiter(isServer: true)
+
+        // Receive 1000 bytes -> can send 3000
+        limiter.recordBytesReceived(1000)
+
+        // Send 2000 bytes
+        limiter.recordBytesSent(2000)
+
+        // Can only send 1000 more
+        #expect(limiter.canSend(bytes: 1000) == true)
+        #expect(limiter.canSend(bytes: 1001) == false)
+        #expect(limiter.availableSendWindow() == 1000)
+    }
+
+    @Test("Server becomes blocked when limit reached")
+    func serverBecomesBlockedAtLimit() {
+        let limiter = AntiAmplificationLimiter(isServer: true)
+
+        limiter.recordBytesReceived(1000)
+        limiter.recordBytesSent(3000)
+
+        #expect(limiter.canSend(bytes: 1) == false)
+        #expect(limiter.availableSendWindow() == 0)
+        #expect(limiter.isBlocked == true)
+    }
+
+    @Test("Receiving more bytes increases allowance")
+    func receivingIncreasesAllowance() {
+        let limiter = AntiAmplificationLimiter(isServer: true)
+
+        limiter.recordBytesReceived(1000)
+        limiter.recordBytesSent(3000)
+        #expect(limiter.isBlocked == true)
+
+        // Receive more data
+        limiter.recordBytesReceived(1000)
+
+        // Now can send 3000 more (total limit is 6000, already sent 3000)
+        #expect(limiter.canSend(bytes: 3000) == true)
+        #expect(limiter.availableSendWindow() == 3000)
+        #expect(limiter.isBlocked == false)
+    }
+
+    @Test("Address validation lifts the limit")
+    func addressValidationLiftsLimit() {
+        let limiter = AntiAmplificationLimiter(isServer: true)
+
+        limiter.recordBytesReceived(1000)
+        limiter.recordBytesSent(3000)
+        #expect(limiter.isBlocked == true)
+
+        // Validate address
+        limiter.validateAddress()
+
+        // Now unlimited
+        #expect(limiter.canSend(bytes: 1_000_000) == true)
+        #expect(limiter.availableSendWindow() == UInt64.max)
+        #expect(limiter.isBlocked == false)
+        #expect(limiter.isAddressValidated == true)
+    }
+
+    @Test("Handshake confirmation validates address")
+    func handshakeConfirmationValidatesAddress() {
+        let limiter = AntiAmplificationLimiter(isServer: true)
+
+        limiter.recordBytesReceived(1000)
+        limiter.recordBytesSent(3000)
+        #expect(limiter.isBlocked == true)
+
+        // Confirm handshake
+        limiter.confirmHandshake()
+
+        // Now unlimited
+        #expect(limiter.canSend(bytes: 1_000_000) == true)
+        #expect(limiter.isAddressValidated == true)
+    }
+
+    @Test("Statistics tracking")
+    func statisticsTracking() {
+        let limiter = AntiAmplificationLimiter(isServer: true)
+
+        limiter.recordBytesReceived(1000)
+        limiter.recordBytesReceived(500)
+        limiter.recordBytesSent(2000)
+        limiter.recordBytesSent(500)
+
+        #expect(limiter.bytesReceived == 1500)
+        #expect(limiter.bytesSent == 2500)
+        #expect(limiter.sendLimit == 4500)  // 1500 * 3
+    }
+}
+
+// MARK: - PTO Action Tests
+
+@Suite("PTO Action Tests")
+struct PTOActionTests {
+
+    @Test("PTO space selection during handshake with Initial")
+    func ptoSpaceSelectionInitial() {
+        let manager = PacketNumberSpaceManager()
+        let now = ContinuousClock.Instant.now
+
+        // Send an Initial packet
+        let packet = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .initial,
+            timeSent: now,
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        manager.onPacketSent(packet)
+
+        // Should select Initial space
+        let space = manager.getPTOSpace(hasInitialKeys: true, hasHandshakeKeys: false)
+        #expect(space == .initial)
+    }
+
+    @Test("PTO space selection during handshake with Handshake")
+    func ptoSpaceSelectionHandshake() {
+        let manager = PacketNumberSpaceManager()
+        let now = ContinuousClock.Instant.now
+
+        // Send a Handshake packet
+        let packet = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .handshake,
+            timeSent: now,
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        manager.onPacketSent(packet)
+
+        // Should select Handshake space (Initial has no packets)
+        let space = manager.getPTOSpace(hasInitialKeys: true, hasHandshakeKeys: true)
+        #expect(space == .handshake)
+    }
+
+    @Test("PTO space selection prioritizes Initial over Handshake")
+    func ptoSpaceSelectionPrioritizesInitial() {
+        let manager = PacketNumberSpaceManager()
+        let now = ContinuousClock.Instant.now
+
+        // Send both Initial and Handshake packets
+        let initialPacket = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .initial,
+            timeSent: now,
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        manager.onPacketSent(initialPacket)
+
+        let handshakePacket = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .handshake,
+            timeSent: now,
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        manager.onPacketSent(handshakePacket)
+
+        // Should select Initial space (higher priority)
+        let space = manager.getPTOSpace(hasInitialKeys: true, hasHandshakeKeys: true)
+        #expect(space == .initial)
+    }
+
+    @Test("PTO space selection for application data")
+    func ptoSpaceSelectionApplication() {
+        let manager = PacketNumberSpaceManager()
+        manager.handshakeConfirmed = true
+        let now = ContinuousClock.Instant.now
+
+        // Send an application packet
+        let packet = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .application,
+            timeSent: now,
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        manager.onPacketSent(packet)
+
+        // Should select application space
+        let space = manager.getPTOSpace(hasInitialKeys: false, hasHandshakeKeys: false)
+        #expect(space == .application)
+    }
+
+    @Test("PTO space selection for client without in-flight packets")
+    func ptoSpaceSelectionClientNoInFlight() {
+        let manager = PacketNumberSpaceManager()
+
+        // No packets in flight, but handshake not confirmed
+        // Client should still probe during handshake
+        let space = manager.getPTOSpace(hasInitialKeys: true, hasHandshakeKeys: false)
+        #expect(space == .initial)
+    }
+
+    @Test("Handle PTO timeout returns correct action")
+    func handlePTOTimeoutReturnsAction() {
+        let manager = PacketNumberSpaceManager()
+        let now = ContinuousClock.Instant.now
+
+        // Send Initial packets
+        let packet1 = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .initial,
+            timeSent: now,
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        let packet2 = SentPacket(
+            packetNumber: 1,
+            encryptionLevel: .initial,
+            timeSent: now + .milliseconds(10),
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        manager.onPacketSent(packet1)
+        manager.onPacketSent(packet2)
+
+        // Handle PTO timeout
+        let action = manager.handlePTOTimeout(hasInitialKeys: true, hasHandshakeKeys: false)
+
+        #expect(action != nil)
+        #expect(action?.level == .initial)
+        #expect(action?.probeCount == 2)
+        #expect(action?.packetsToProbe.count == 2)
+    }
+
+    @Test("Handle PTO timeout increments PTO count")
+    func handlePTOTimeoutIncrementsPTOCount() {
+        let manager = PacketNumberSpaceManager()
+        let now = ContinuousClock.Instant.now
+
+        let packet = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .initial,
+            timeSent: now,
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        manager.onPacketSent(packet)
+
+        #expect(manager.ptoCount == 0)
+
+        _ = manager.handlePTOTimeout(hasInitialKeys: true, hasHandshakeKeys: false)
+        #expect(manager.ptoCount == 1)
+
+        _ = manager.handlePTOTimeout(hasInitialKeys: true, hasHandshakeKeys: false)
+        #expect(manager.ptoCount == 2)
+    }
+
+    @Test("Handle PTO timeout returns nil when no space needs probing")
+    func handlePTOTimeoutReturnsNilWhenNoSpace() {
+        let manager = PacketNumberSpaceManager()
+        manager.handshakeConfirmed = true
+
+        // No packets in flight and handshake confirmed
+        let action = manager.handlePTOTimeout(hasInitialKeys: false, hasHandshakeKeys: false)
+
+        #expect(action == nil)
+    }
+
+    @Test("PTO deadline exponential backoff")
+    func ptoDeadlineExponentialBackoff() {
+        let manager = PacketNumberSpaceManager()
+        let now = ContinuousClock.Instant.now
+
+        // First PTO deadline
+        let deadline1 = manager.nextPTODeadline(now: now)
+
+        // Increment PTO count
+        manager.onPTOExpired()
+        let deadline2 = manager.nextPTODeadline(now: now)
+
+        // Increment again
+        manager.onPTOExpired()
+        let deadline3 = manager.nextPTODeadline(now: now)
+
+        // Deadlines should double with each PTO
+        let interval1 = deadline1 - now
+        let interval2 = deadline2 - now
+        let interval3 = deadline3 - now
+
+        // interval2 should be approximately 2x interval1
+        // interval3 should be approximately 4x interval1
+        // Allow some tolerance for floating point
+        #expect(interval2 > interval1)
+        #expect(interval3 > interval2)
+    }
+
+    @Test("Needs PTO probe even without in-flight packets")
+    func needsPTOProbeEvenWithoutInFlight() {
+        let manager = PacketNumberSpaceManager()
+
+        // Handshake not confirmed, no packets in flight
+        #expect(manager.needsPTOProbeEvenWithoutInFlight == true)
+
+        // After handshake confirmed
+        manager.handshakeConfirmed = true
+        #expect(manager.needsPTOProbeEvenWithoutInFlight == false)
+    }
+}
+
+// MARK: - LossDetector PTO Support Tests
+
+@Suite("LossDetector PTO Support Tests")
+struct LossDetectorPTOSupportTests {
+
+    @Test("Get oldest unacked packets for PTO")
+    func getOldestUnackedPackets() {
+        let detector = LossDetector()
+        let now = ContinuousClock.Instant.now
+
+        // Send 5 packets
+        for i: UInt64 in 0..<5 {
+            let packet = SentPacket(
+                packetNumber: i,
+                encryptionLevel: .application,
+                timeSent: now + .milliseconds(Int64(i) * 10),
+                ackEliciting: true,
+                inFlight: true,
+                sentBytes: 1200
+            )
+            detector.onPacketSent(packet)
+        }
+
+        // Get oldest 2
+        let oldest = detector.getOldestUnackedPackets(count: 2)
+
+        #expect(oldest.count == 2)
+        #expect(oldest[0].packetNumber == 0)
+        #expect(oldest[1].packetNumber == 1)
+    }
+
+    @Test("Get oldest unacked packets filters non-ack-eliciting")
+    func getOldestUnackedPacketsFiltersNonAckEliciting() {
+        let detector = LossDetector()
+        let now = ContinuousClock.Instant.now
+
+        // Send mix of ack-eliciting and non-ack-eliciting packets
+        let packet0 = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .application,
+            timeSent: now,
+            ackEliciting: false,  // Non-ack-eliciting
+            inFlight: false,
+            sentBytes: 50
+        )
+        detector.onPacketSent(packet0)
+
+        let packet1 = SentPacket(
+            packetNumber: 1,
+            encryptionLevel: .application,
+            timeSent: now + .milliseconds(10),
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        detector.onPacketSent(packet1)
+
+        let packet2 = SentPacket(
+            packetNumber: 2,
+            encryptionLevel: .application,
+            timeSent: now + .milliseconds(20),
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        detector.onPacketSent(packet2)
+
+        // Get oldest 2 ack-eliciting packets
+        let oldest = detector.getOldestUnackedPackets(count: 2)
+
+        #expect(oldest.count == 2)
+        #expect(oldest[0].packetNumber == 1)  // Skipped packet 0
+        #expect(oldest[1].packetNumber == 2)
+    }
+
+    @Test("Get oldest unacked packets handles empty state")
+    func getOldestUnackedPacketsEmpty() {
+        let detector = LossDetector()
+
+        let oldest = detector.getOldestUnackedPackets(count: 2)
+
+        #expect(oldest.isEmpty)
+    }
+
+    @Test("Get oldest unacked packets handles fewer packets than requested")
+    func getOldestUnackedPacketsFewerThanRequested() {
+        let detector = LossDetector()
+        let now = ContinuousClock.Instant.now
+
+        // Only 1 packet
+        let packet = SentPacket(
+            packetNumber: 0,
+            encryptionLevel: .application,
+            timeSent: now,
+            ackEliciting: true,
+            inFlight: true,
+            sentBytes: 1200
+        )
+        detector.onPacketSent(packet)
+
+        let oldest = detector.getOldestUnackedPackets(count: 5)
+
+        #expect(oldest.count == 1)
+        #expect(oldest[0].packetNumber == 0)
+    }
+}

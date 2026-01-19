@@ -99,8 +99,13 @@ public final class NIOQUICSocket: QUICSocket, Sendable {
     }
 
     /// Stops the socket
+    ///
+    /// This method stops the underlying transport and finishes the incoming
+    /// packets AsyncStream, allowing any `for await` loops to exit gracefully.
     public func stop() async {
         await transport.stop()
+        // Finish the incoming stream to unblock any waiting consumers
+        incomingContinuation.finish()
     }
 
     /// Sends packet data to the specified address
