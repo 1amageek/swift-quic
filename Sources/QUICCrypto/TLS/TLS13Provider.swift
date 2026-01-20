@@ -107,6 +107,28 @@ public protocol TLS13Provider: Sendable {
     var is0RTTAttempted: Bool { get }
 }
 
+// MARK: - Certificate Validator
+
+/// Certificate validator callback type for custom certificate validation.
+///
+/// This callback allows applications to implement custom certificate validation logic.
+/// The TLS layer handles signature verification (CertificateVerify), while this callback
+/// handles content validation (e.g., checking extensions, deriving application-specific data).
+///
+/// - Parameter certificates: The peer's certificate chain (DER encoded), leaf first
+/// - Returns: Application-specific peer info (e.g., PeerID for libp2p), or nil if not needed
+/// - Throws: If certificate validation fails (will abort the handshake)
+///
+/// ## Example (libp2p)
+/// ```swift
+/// config.certificateValidator = { certChain in
+///     guard let certData = certChain.first else { throw MyError.noCertificate }
+///     let peerID = try extractLibP2PPeerID(from: certData)
+///     return peerID
+/// }
+/// ```
+public typealias CertificateValidator = @Sendable ([Data]) throws -> (any Sendable)?
+
 // MARK: - TLS Configuration
 
 /// Configuration for TLS 1.3 provider
@@ -126,7 +148,7 @@ public struct TLSConfiguration: Sendable {
     /// Private key (DER encoded) - alternative to file path
     public var privateKey: Data?
 
-    /// Signing key for CertificateVerify (server)
+    /// Signing key for CertificateVerify (server and client for mTLS)
     public var signingKey: SigningKey?
 
     /// Whether to verify peer certificates (default: true)
@@ -168,6 +190,37 @@ public struct TLSConfiguration: Sendable {
     ///   replay attacks on 0-RTT data.
     public var replayProtection: ReplayProtection?
 
+    // MARK: - Mutual TLS (mTLS) Configuration
+
+    /// Whether to require client certificate (server only).
+    ///
+    /// When `true`, the server sends a CertificateRequest message after EncryptedExtensions,
+    /// and the client must respond with Certificate and CertificateVerify messages.
+    ///
+    /// RFC 8446 Section 4.3.2: "A server which is authenticating with a certificate
+    /// MAY optionally request a certificate from the client."
+    ///
+    /// - Note: For libp2p, this should always be `true` as mutual authentication is required.
+    public var requireClientCertificate: Bool
+
+    /// Custom certificate validator for peer certificates.
+    ///
+    /// Called after TLS signature verification (CertificateVerify) succeeds, but before
+    /// the handshake is considered complete. This allows applications to:
+    /// - Validate certificate content (extensions, constraints)
+    /// - Extract application-specific data (e.g., PeerID for libp2p)
+    /// - Implement custom trust models (e.g., self-signed with specific extensions)
+    ///
+    /// If `nil`, only TLS-level verification is performed:
+    /// - Certificate chain validation (if `trustedRootCertificates` is set)
+    /// - CertificateVerify signature verification
+    ///
+    /// The returned value is stored and can be retrieved after handshake completion.
+    ///
+    /// - Important: This callback is called for BOTH server and client certificates
+    ///   when mutual TLS is enabled.
+    public var certificateValidator: CertificateValidator?
+
     /// Creates a default configuration
     public init() {
         self.alpnProtocols = ["h3"]
@@ -185,6 +238,8 @@ public struct TLSConfiguration: Sendable {
         self.maxEarlyDataSize = 0
         self.supportedGroups = [.x25519, .secp256r1]
         self.replayProtection = nil
+        self.requireClientCertificate = false
+        self.certificateValidator = nil
     }
 
     /// Creates a client configuration

@@ -186,6 +186,21 @@ public enum TLSExtension: Sendable {
         }
     }
 
+    /// Decode multiple extensions from a Data blob
+    ///
+    /// - Parameter data: The raw extensions data (without length prefix)
+    /// - Returns: Array of decoded extensions
+    /// - Throws: If decoding fails
+    public static func decodeExtensions(from data: Data) throws -> [TLSExtension] {
+        var reader = TLSReader(data: data)
+        var extensions: [TLSExtension] = []
+        while reader.hasMore {
+            let ext = try decode(from: &reader)
+            extensions.append(ext)
+        }
+        return extensions
+    }
+
     /// Helper to decode extension with known type and data
     private static func decodeWithTypeAndData(extensionType: TLSExtensionType, data: Data) throws -> TLSExtension {
         switch extensionType {

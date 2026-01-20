@@ -179,25 +179,46 @@ public final class TLS13Handler: TLS13Provider, Sendable {
     }
 
     /// Peer certificates (raw DER data, leaf certificate first)
-    /// Available after receiving peer's Certificate message
+    /// Available after receiving peer's Certificate message.
+    /// For client mode: returns server's certificates
+    /// For server mode (mTLS): returns client's certificates
     public var peerCertificates: [Data]? {
-        state.withLock { state in
+        state.withLock { state -> [Data]? in
             if state.isClientMode {
                 return state.clientStateMachine?.peerCertificates
             } else {
-                return state.serverStateMachine?.peerCertificates
+                // For server in mTLS, the peer is the client
+                // Client certificates are stored in clientCertificates, not peerCertificates
+                return state.serverStateMachine?.clientCertificates
             }
         }
     }
 
     /// Parsed peer leaf certificate
-    /// Available after receiving peer's Certificate message
+    /// Available after receiving peer's Certificate message.
+    /// For client mode: returns server's certificate
+    /// For server mode (mTLS): returns client's certificate
     public var peerCertificate: X509Certificate? {
-        state.withLock { state in
+        state.withLock { state -> X509Certificate? in
             if state.isClientMode {
                 return state.clientStateMachine?.peerCertificate
             } else {
-                return state.serverStateMachine?.peerCertificate
+                // For server in mTLS, the peer is the client
+                return state.serverStateMachine?.clientCertificate
+            }
+        }
+    }
+
+    /// Validated peer info from certificate validator callback.
+    ///
+    /// This contains the value returned by `TLSConfiguration.certificateValidator`
+    /// after successful certificate validation (e.g., PeerID for libp2p).
+    public var validatedPeerInfo: (any Sendable)? {
+        state.withLock { state in
+            if state.isClientMode {
+                return state.clientStateMachine?.validatedPeerInfo
+            } else {
+                return state.serverStateMachine?.validatedPeerInfo
             }
         }
     }
@@ -326,7 +347,7 @@ public final class TLS13Handler: TLS13Provider, Sendable {
         switch type {
         case .clientHello, .serverHello:
             expectedLevel = .initial
-        case .encryptedExtensions, .certificate, .certificateVerify, .finished:
+        case .encryptedExtensions, .certificateRequest, .certificate, .certificateVerify, .finished:
             expectedLevel = .handshake
         case .keyUpdate, .newSessionTicket:
             expectedLevel = .application
@@ -384,6 +405,10 @@ public final class TLS13Handler: TLS13Provider, Sendable {
             if state.is0RTTAttempted {
                 state.is0RTTAccepted = clientMachine.earlyDataAccepted
             }
+
+        case .certificateRequest:
+            // Server requesting client certificate (mutual TLS)
+            outputs = try clientMachine.processCertificateRequest(content)
 
         case .certificate:
             outputs = try clientMachine.processCertificate(content)
@@ -460,6 +485,14 @@ public final class TLS13Handler: TLS13Provider, Sendable {
             for (data, msgLevel) in response.messages {
                 outputs.insert(.handshakeData(data, level: msgLevel), at: outputs.count - clientHelloOutputs.count)
             }
+
+        case .certificate:
+            // Client's certificate (for mutual TLS)
+            outputs = try serverMachine.processClientCertificate(content)
+
+        case .certificateVerify:
+            // Client's CertificateVerify (for mutual TLS)
+            outputs = try serverMachine.processClientCertificateVerify(content)
 
         case .finished:
             let finishedOutputs = try serverMachine.processClientFinished(content)
@@ -781,36 +814,50 @@ public final class ServerStateMachine: Sendable {
             state.context.transcriptHash.update(with: eeMessage)
             messages.append((eeMessage, .handshake))
 
-            // Generate Certificate and CertificateVerify if we have certificate material
-            // Skip for PSK-only handshakes (RFC 8446 Section 2.3)
+            // Send CertificateRequest if mutual TLS is required (RFC 8446 Section 4.3.2)
+            // CertificateRequest is sent after EncryptedExtensions, before Certificate
+            // Only for non-PSK handshakes (PSK implies pre-established identity)
+            if !state.context.pskUsed && self.configuration.requireClientCertificate {
+                let certRequest = CertificateRequest.withDefaultSignatureAlgorithms()
+                let crMessage = certRequest.encodeAsHandshake()
+                state.context.transcriptHash.update(with: crMessage)
+                messages.append((crMessage, .handshake))
+
+                // Remember we requested client certificate
+                state.context.expectingClientCertificate = true
+            }
+
+            // Generate Certificate and CertificateVerify for non-PSK handshakes
+            // RFC 8446 Section 4.4.2: Server MUST send Certificate in non-PSK handshakes
             if !state.context.pskUsed {
-                if let signingKey = self.configuration.signingKey,
-                   let certChain = self.configuration.certificateChain,
-                   !certChain.isEmpty {
-
-                    // Generate Certificate message
-                    let certificate = Certificate(certificates: certChain)
-                    let certMessage = certificate.encodeAsHandshake()
-                    state.context.transcriptHash.update(with: certMessage)
-                    messages.append((certMessage, .handshake))
-
-                    // Generate CertificateVerify signature
-                    // The signature is over the transcript up to (but not including) CertificateVerify
-                    let transcriptForCV = state.context.transcriptHash.currentHash()
-                    let signatureContent = CertificateVerify.constructSignatureContent(
-                        transcriptHash: transcriptForCV,
-                        isServer: true
-                    )
-
-                    let signature = try signingKey.sign(signatureContent)
-                    let certificateVerify = CertificateVerify(
-                        algorithm: signingKey.scheme,
-                        signature: signature
-                    )
-                    let cvMessage = certificateVerify.encodeAsHandshake()
-                    state.context.transcriptHash.update(with: cvMessage)
-                    messages.append((cvMessage, .handshake))
+                guard let signingKey = self.configuration.signingKey,
+                      let certChain = self.configuration.certificateChain,
+                      !certChain.isEmpty else {
+                    throw TLSHandshakeError.certificateRequired
                 }
+
+                // Generate Certificate message
+                let certificate = Certificate(certificates: certChain)
+                let certMessage = certificate.encodeAsHandshake()
+                state.context.transcriptHash.update(with: certMessage)
+                messages.append((certMessage, .handshake))
+
+                // Generate CertificateVerify signature
+                // The signature is over the transcript up to (but not including) CertificateVerify
+                let transcriptForCV = state.context.transcriptHash.currentHash()
+                let signatureContent = CertificateVerify.constructSignatureContent(
+                    transcriptHash: transcriptForCV,
+                    isServer: true
+                )
+
+                let signature = try signingKey.sign(signatureContent)
+                let certificateVerify = CertificateVerify(
+                    algorithm: signingKey.scheme,
+                    signature: signature
+                )
+                let cvMessage = certificateVerify.encodeAsHandshake()
+                state.context.transcriptHash.update(with: cvMessage)
+                messages.append((cvMessage, .handshake))
             }
 
             // Generate server Finished
@@ -848,8 +895,12 @@ public final class ServerStateMachine: Sendable {
                 cipherSuite: cipherSuite
             )))
 
-            // Transition state
-            state.handshakeState = .waitFinished
+            // Transition state - wait for client certificate if we requested it
+            if state.context.expectingClientCertificate {
+                state.handshakeState = .waitClientCertificate
+            } else {
+                state.handshakeState = .waitFinished
+            }
 
             return (ClientHelloResponse(messages: messages), outputs)
         }
@@ -909,6 +960,120 @@ public final class ServerStateMachine: Sendable {
             ClientHelloResponse(messages: [(hrrMessage, .initial)]),
             []  // No keys available yet, handshake continues after ClientHello2
         )
+    }
+
+    /// Process client Certificate message (for mutual TLS)
+    ///
+    /// RFC 8446 Section 4.4.2: Client sends Certificate in response to CertificateRequest.
+    /// The certificate_request_context MUST match what was sent in CertificateRequest.
+    public func processClientCertificate(_ data: Data) throws -> [TLSOutput] {
+        return try state.withLock { state in
+            guard state.handshakeState == .waitClientCertificate else {
+                throw TLSHandshakeError.unexpectedMessage("Unexpected client Certificate")
+            }
+
+            let certificate = try Certificate.decode(from: data)
+
+            // Verify certificate_request_context matches (should be empty for post-handshake auth)
+            // For initial handshake, context is typically empty
+
+            // Check if client sent any certificates
+            guard !certificate.certificates.isEmpty else {
+                // Client sent empty certificate - fail if we require client auth
+                if configuration.requireClientCertificate {
+                    throw TLSHandshakeError.certificateRequired
+                }
+                // No client cert, skip to waiting for Finished
+                state.handshakeState = .waitFinished
+
+                // Update transcript
+                let message = HandshakeCodec.encode(type: .certificate, content: data)
+                state.context.transcriptHash.update(with: message)
+
+                return []
+            }
+
+            // Store client certificates
+            state.context.clientCertificates = certificate.certificates
+
+            // Parse leaf certificate for verification
+            guard let leafCertData = certificate.certificates.first else {
+                throw TLSHandshakeError.certificateVerificationFailed("No leaf certificate")
+            }
+
+            let leafCert = try X509Certificate.parse(from: leafCertData)
+            state.context.clientCertificate = leafCert
+
+            // Extract verification key from certificate
+            state.context.clientVerificationKey = try leafCert.extractPublicKey()
+
+            // Update transcript
+            let message = HandshakeCodec.encode(type: .certificate, content: data)
+            state.context.transcriptHash.update(with: message)
+
+            // Transition to wait for CertificateVerify
+            state.handshakeState = .waitClientCertificateVerify
+
+            return []
+        }
+    }
+
+    /// Process client CertificateVerify message (for mutual TLS)
+    ///
+    /// RFC 8446 Section 4.4.3: Verifies client's signature over the transcript.
+    /// The signature context is "TLS 1.3, client CertificateVerify".
+    public func processClientCertificateVerify(_ data: Data) throws -> [TLSOutput] {
+        return try state.withLock { state in
+            guard state.handshakeState == .waitClientCertificateVerify else {
+                throw TLSHandshakeError.unexpectedMessage("Unexpected client CertificateVerify")
+            }
+
+            let certificateVerify = try CertificateVerify.decode(from: data)
+
+            // Get verification key from client's certificate
+            guard let verificationKey = state.context.clientVerificationKey else {
+                throw TLSHandshakeError.internalError("Missing client verification key")
+            }
+
+            // Verify the signature scheme matches the key type
+            guard verificationKey.scheme == certificateVerify.algorithm else {
+                throw TLSHandshakeError.signatureVerificationFailed
+            }
+
+            // Construct signature content (transcript hash + context string)
+            // isServer: false because this is CLIENT's CertificateVerify
+            let transcriptHash = state.context.transcriptHash.currentHash()
+            let signatureContent = TLSSignature.certificateVerifyContent(
+                transcriptHash: transcriptHash,
+                isServer: false
+            )
+
+            // Verify signature
+            let isValid = try verificationKey.verify(
+                signature: certificateVerify.signature,
+                for: signatureContent
+            )
+
+            guard isValid else {
+                throw TLSHandshakeError.signatureVerificationFailed
+            }
+
+            // Update transcript AFTER using it for signature verification
+            let message = HandshakeCodec.encode(type: .certificateVerify, content: data)
+            state.context.transcriptHash.update(with: message)
+
+            // Call custom certificate validator if configured
+            if let validator = configuration.certificateValidator,
+               let clientCerts = state.context.clientCertificates {
+                let peerInfo = try validator(clientCerts)
+                state.context.validatedPeerInfo = peerInfo
+            }
+
+            // Transition to wait for Finished
+            state.handshakeState = .waitFinished
+
+            return []
+        }
     }
 
     /// Process client Finished message
@@ -1038,6 +1203,24 @@ public final class ServerStateMachine: Sendable {
     /// Peer certificates (raw DER data, leaf certificate first)
     public var peerCertificates: [Data]? {
         state.withLock { $0.context.peerCertificates }
+    }
+
+    /// Validated peer info from certificate validator callback.
+    ///
+    /// This contains the value returned by `TLSConfiguration.certificateValidator`
+    /// after successful certificate validation (e.g., PeerID for libp2p).
+    public var validatedPeerInfo: (any Sendable)? {
+        state.withLock { $0.context.validatedPeerInfo }
+    }
+
+    /// Client certificates received from peer (server-side, for mTLS).
+    public var clientCertificates: [Data]? {
+        state.withLock { $0.context.clientCertificates }
+    }
+
+    /// Parsed client leaf certificate (server-side, for mTLS).
+    public var clientCertificate: X509Certificate? {
+        state.withLock { $0.context.clientCertificate }
     }
 
     /// Parsed peer leaf certificate

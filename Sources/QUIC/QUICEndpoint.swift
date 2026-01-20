@@ -9,7 +9,7 @@ import Logging
 import QUICCore
 import QUICCrypto
 import QUICConnection
-import QUICTransport
+@_exported import QUICTransport
 
 // MARK: - QUIC Endpoint
 
@@ -257,6 +257,63 @@ public actor QUICEndpoint {
 
     // MARK: - Client API
 
+    /// Dials a remote QUIC server and waits for handshake completion
+    ///
+    /// This method creates a socket, starts the packet I/O loop, connects to
+    /// the server, and waits for the TLS handshake to complete before returning.
+    ///
+    /// - Parameters:
+    ///   - address: The server address
+    ///   - timeout: Maximum time to wait for handshake (default 30 seconds)
+    /// - Returns: The established connection (handshake complete)
+    /// - Throws: QUICEndpointError if connection or handshake fails
+    ///
+    /// ## Usage
+    /// ```swift
+    /// let endpoint = QUICEndpoint(configuration: config)
+    /// let connection = try await endpoint.dial(address: serverAddress)
+    /// // Connection is now established and ready to use
+    /// let stream = try await connection.openStream()
+    /// ```
+    public func dial(
+        address: SocketAddress,
+        timeout: Duration = .seconds(30)
+    ) async throws -> any QUICConnectionProtocol {
+        guard !isServer else {
+            throw QUICEndpointError.serverCannotConnect
+        }
+
+        // Create socket with a random local port
+        let socket = NIOQUICSocket(configuration: .unicast(port: 0))
+        try await socket.start()
+
+        // Set socket directly before running to avoid race condition
+        // (run() also sets this but we need it immediately for send())
+        self.socket = socket
+        self.isRunning = true
+
+        // Start I/O loop in background task
+        let runTask = Task { [self] in
+            try await runPacketLoop(socket: socket)
+        }
+
+        // Connect (this returns immediately, handshake not complete)
+        let connection = try await connect(to: address)
+
+        // Wait for handshake completion with timeout
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while !connection.isEstablished {
+            if ContinuousClock.now >= deadline {
+                runTask.cancel()
+                await socket.stop()
+                throw QUICEndpointError.handshakeTimeout
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        return connection
+    }
+
     /// Connects to a remote QUIC server
     /// - Parameter address: The server address
     /// - Returns: The established connection
@@ -293,6 +350,20 @@ public actor QUICEndpoint {
         // Register connection
         router.register(connection)
         timerManager.register(connection)
+
+        // Initialize sendSignal stream before starting the loop
+        // This ensures the continuation is set up before any writes can occur
+        let sendSignal = connection.sendSignal
+
+        // Start outbound send loop for this connection
+        // This runs in the background and monitors sendSignal to send packets
+        // when stream data is written
+        if let socket = self.socket {
+            Task { [weak self] in
+                guard let self = self else { return }
+                await self.outboundSendLoop(connection: connection, sendSignal: sendSignal, socket: socket)
+            }
+        }
 
         // Start handshake
         let initialPackets = try await connection.start()
@@ -405,6 +476,17 @@ public actor QUICEndpoint {
         // Register connection
         router.register(connection)
         timerManager.register(connection)
+
+        // Initialize sendSignal stream before starting the loop
+        let sendSignal = connection.sendSignal
+
+        // Start outbound send loop for this connection
+        if let socket = self.socket {
+            Task { [weak self] in
+                guard let self = self else { return }
+                await self.outboundSendLoop(connection: connection, sendSignal: sendSignal, socket: socket)
+            }
+        }
 
         // Start handshake with 0-RTT
         let (initialPackets, zeroRTTPackets) = try await connection.startWith0RTT(
@@ -519,6 +601,20 @@ public actor QUICEndpoint {
             info.destinationConnectionID
         ])
         timerManager.register(connection)
+
+        // Initialize sendSignal stream before starting the loop
+        // This ensures the continuation is set up before any writes can occur
+        let sendSignal = connection.sendSignal
+
+        // Start outbound send loop for this connection
+        // This runs in the background and monitors sendSignal to send packets
+        // when stream data is written
+        if let socket = self.socket {
+            Task { [weak self] in
+                guard let self = self else { return }
+                await self.outboundSendLoop(connection: connection, sendSignal: sendSignal, socket: socket)
+            }
+        }
 
         // Start handshake (server doesn't send first)
         _ = try await connection.start()
@@ -724,6 +820,49 @@ public actor QUICEndpoint {
         self.isRunning = false
     }
 
+    /// Internal method to run packet loop without setup (for use by dial())
+    ///
+    /// - Parameter socket: The already-started socket
+    private func runPacketLoop(socket: any QUICSocket) async throws {
+        self.shouldStop = false
+
+        // Update local address
+        if let nioAddr = await socket.localAddress,
+           let addr = SocketAddress(nioAddr) {
+            _localAddress = addr
+        }
+
+        // Start the I/O loop with cancellation handling
+        await withTaskCancellationHandler {
+            await withTaskGroup(of: Void.self) { group in
+                // Packet receiving task
+                group.addTask {
+                    await self.packetReceiveLoop(socket: socket)
+                }
+
+                // Timer processing task
+                group.addTask {
+                    await self.timerProcessingLoop(socket: socket)
+                }
+
+                // Wait for both tasks to complete
+                await group.waitForAll()
+            }
+        } onCancel: {
+            // When the task is cancelled, stop the socket to unblock the I/O loops
+            Task { [socket] in
+                await socket.stop()
+            }
+        }
+
+        // Cleanup
+        if !shouldStop {
+            await socket.stop()
+        }
+        self.socket = nil
+        self.isRunning = false
+    }
+
     /// Stops the I/O loop
     ///
     /// This method signals the I/O tasks to stop and finishes the socket's
@@ -761,6 +900,50 @@ public actor QUICEndpoint {
             } catch {
                 // Log error for debugging
                 print("[QUICEndpoint] Error processing packet from \(remoteAddress): \(error)")
+            }
+        }
+    }
+
+    /// The outbound send loop for a connection
+    ///
+    /// Monitors the connection's sendSignal and sends packets when data is available.
+    /// This enables immediate packet transmission when stream data is written,
+    /// rather than waiting for incoming packets or timer events.
+    ///
+    /// The loop exits when:
+    /// - The connection is shut down (sendSignal finishes)
+    /// - The endpoint stops (shouldStop becomes true)
+    ///
+    /// - Parameters:
+    ///   - connection: The connection to monitor
+    ///   - sendSignal: The pre-initialized send signal stream
+    ///   - socket: The socket to send packets through
+    private func outboundSendLoop(
+        connection: ManagedConnection,
+        sendSignal: AsyncStream<Void>,
+        socket: any QUICSocket
+    ) async {
+        for await _ in sendSignal {
+            guard !shouldStop else { break }
+
+            do {
+                // Generate packets from pending stream data
+                let packets = try connection.generateOutboundPackets()
+
+                // Send each packet
+                for packet in packets {
+                    let nioAddress = try connection.remoteAddress.toNIOAddress()
+                    try await socket.send(packet, to: nioAddress)
+                }
+            } catch {
+                // Log error but continue - don't break the loop for transient errors
+                logger.warning(
+                    "Failed to send outbound packets",
+                    metadata: [
+                        "error": "\(error)",
+                        "remoteAddress": "\(connection.remoteAddress)"
+                    ]
+                )
             }
         }
     }
@@ -864,4 +1047,7 @@ public enum QUICEndpointError: Error, Sendable {
 
     /// Endpoint is not running
     case notRunning
+
+    /// Handshake timed out
+    case handshakeTimeout
 }

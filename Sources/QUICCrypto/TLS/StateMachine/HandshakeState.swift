@@ -21,7 +21,11 @@ public enum ClientHandshakeState: Sendable, Equatable {
     /// Waiting for EncryptedExtensions
     case waitEncryptedExtensions
 
-    /// Waiting for Certificate (may be skipped if PSK)
+    /// Waiting for CertificateRequest or Certificate
+    /// (CertificateRequest is optional - server may or may not request client auth)
+    case waitCertificateOrCertificateRequest
+
+    /// Waiting for Certificate (after receiving CertificateRequest)
     case waitCertificate
 
     /// Waiting for CertificateVerify
@@ -49,6 +53,12 @@ public enum ServerHandshakeState: Sendable, Equatable {
 
     /// Sent HelloRetryRequest, waiting for ClientHello2
     case sentHelloRetryRequest
+
+    /// Waiting for client Certificate (when mTLS is enabled)
+    case waitClientCertificate
+
+    /// Waiting for client CertificateVerify (when mTLS is enabled)
+    case waitClientCertificateVerify
 
     /// Waiting for client Finished
     case waitFinished
@@ -103,6 +113,12 @@ public enum TLSHandshakeError: Error, Sendable, Equatable {
     /// Internal error
     case internalError(String)
 
+    /// Client certificate required but not provided
+    case certificateRequired
+
+    /// Decode error (malformed message)
+    case decodeError(String)
+
     public static func == (lhs: TLSHandshakeError, rhs: TLSHandshakeError) -> Bool {
         switch (lhs, rhs) {
         case (.unexpectedMessage(let l), .unexpectedMessage(let r)): return l == r
@@ -118,6 +134,8 @@ public enum TLSHandshakeError: Error, Sendable, Equatable {
         case (.keyExchangeFailed(let l), .keyExchangeFailed(let r)): return l == r
         case (.decryptionFailed, .decryptionFailed): return true
         case (.internalError(let l), .internalError(let r)): return l == r
+        case (.certificateRequired, .certificateRequired): return true
+        case (.decodeError(let l), .decodeError(let r)): return l == r
         default: return false
         }
     }
@@ -151,6 +169,10 @@ public enum TLSHandshakeError: Error, Sendable, Equatable {
             return TLSAlert(description: .decryptError)
         case .internalError:
             return TLSAlert(description: .internalError)
+        case .certificateRequired:
+            return TLSAlert(description: .certificateRequired)
+        case .decodeError:
+            return TLSAlert(description: .decodeError)
         }
     }
 }
@@ -250,6 +272,46 @@ public struct HandshakeContext: Sendable {
 
     /// Client early traffic secret (for 0-RTT)
     public var clientEarlyTrafficSecret: SymmetricKey?
+
+    // MARK: - Mutual TLS (mTLS) State
+
+    /// Whether server requested client certificate (client-side flag).
+    ///
+    /// Set to `true` when client receives CertificateRequest from server.
+    /// Used to determine if client needs to send Certificate/CertificateVerify.
+    public var clientCertificateRequested: Bool = false
+
+    /// The certificate_request_context from CertificateRequest (client-side).
+    ///
+    /// RFC 8446 Section 4.4.2: "The certificate_request_context MUST be echoed
+    /// in the Certificate message."
+    public var certificateRequestContext: Data = Data()
+
+    /// Whether server is expecting client certificate (server-side flag).
+    ///
+    /// Set to `true` when server sends CertificateRequest.
+    public var expectingClientCertificate: Bool = false
+
+    /// Client's certificates received by server (raw DER data).
+    ///
+    /// Stored after receiving client's Certificate message.
+    public var clientCertificates: [Data]?
+
+    /// Parsed client leaf certificate (server-side).
+    ///
+    /// Used for signature verification in CertificateVerify.
+    public var clientCertificate: X509Certificate?
+
+    /// Client's public key extracted from certificate (server-side).
+    ///
+    /// Used to verify client's CertificateVerify signature.
+    public var clientVerificationKey: VerificationKey?
+
+    /// Application-specific peer info from certificate validator.
+    ///
+    /// Stores the return value from `TLSConfiguration.certificateValidator`.
+    /// For libp2p, this would be the peer's `PeerID`.
+    public var validatedPeerInfo: (any Sendable)?
 
     public init() {
         self.transcriptHash = TranscriptHash()

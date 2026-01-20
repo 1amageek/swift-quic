@@ -622,6 +622,14 @@ public final class StreamManager: Sendable {
         }
     }
 
+    /// Checks if any stream has data waiting to be sent
+    /// - Returns: true if at least one stream has pending data
+    public var hasPendingStreamData: Bool {
+        state.withLock { state in
+            state.streams.values.contains { $0.hasDataToSend }
+        }
+    }
+
     /// Get number of active streams
     public var activeStreamCount: Int {
         state.withLock { $0.streams.count }

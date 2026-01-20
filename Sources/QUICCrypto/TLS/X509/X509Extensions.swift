@@ -177,16 +177,40 @@ extension X509Certificate {
     /// Gets the raw value of an extension by OID
     ///
     /// - Parameter oid: The OID to search for
-    /// - Returns: The raw extension value if found, nil otherwise
+    /// - Returns: The raw extension value (contents of the OCTET STRING) if found, nil otherwise
     public func extensionValue(for oid: ASN1ObjectIdentifier) -> Data? {
         // Iterate through all extensions
         for ext in certificate.extensions {
             if ext.oid == oid {
-                // Return the raw value bytes
+                // Serialize the ASN1Any value
                 var serializer = DER.Serializer()
                 do {
                     try ext.value.serialize(into: &serializer)
-                    return Data(serializer.serializedBytes)
+                    let serialized = Data(serializer.serializedBytes)
+
+                    // ASN1Any.serialize() adds a wrapper (tag + length).
+                    // We need to skip this wrapper to get the actual content.
+                    // The format is: <tag:1byte> <length:1+ bytes> <content>
+                    guard serialized.count >= 2 else { return nil }
+
+                    // Skip the ASN1Any wrapper tag
+                    var offset = 1
+
+                    // Parse length (DER length encoding)
+                    let firstLengthByte = serialized[1]
+                    if firstLengthByte < 0x80 {
+                        // Short form: length is the byte itself
+                        offset = 2
+                    } else {
+                        // Long form: first byte indicates number of length bytes
+                        let numLengthBytes = Int(firstLengthByte & 0x7F)
+                        offset = 2 + numLengthBytes
+                    }
+
+                    guard offset < serialized.count else { return nil }
+
+                    // Return the content after the tag+length wrapper
+                    return serialized.dropFirst(offset)
                 } catch {
                     return nil
                 }

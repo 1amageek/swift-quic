@@ -74,6 +74,8 @@ public final class ManagedConnection: Sendable {
     /// State for stream read continuations
     private struct StreamContinuationsState: Sendable {
         var continuations: [UInt64: CheckedContinuation<Data, any Error>] = [:]
+        /// Buffer for stream data received before read() is called
+        var pendingData: [UInt64: [Data]] = [:]
         var isShutdown: Bool = false
     }
 
@@ -683,8 +685,8 @@ public final class ManagedConnection: Sendable {
         }
 
         // Handle stream data
-        for (streamID, _) in result.streamData {
-            notifyStreamDataAvailable(streamID)
+        for (streamID, data) in result.streamData {
+            notifyStreamDataReceived(streamID, data: data)
         }
 
         // Handle handshake completion (from HANDSHAKE_DONE frame)
@@ -751,28 +753,25 @@ public final class ManagedConnection: Sendable {
 
     // MARK: - Stream Helpers
 
-    /// Notifies that data is available on a stream
+    /// Notifies that data has been received on a stream
     ///
-    /// Thread-safe: Only consumes data if a reader is waiting.
-    /// If no reader is waiting, data stays in handler's buffer for later retrieval.
-    private func notifyStreamDataAvailable(_ streamID: UInt64) {
+    /// Thread-safe: If a reader is waiting, resume it with the data.
+    /// If no reader is waiting, buffer the data for later retrieval.
+    ///
+    /// - Parameters:
+    ///   - streamID: The stream ID
+    ///   - data: The received data
+    private func notifyStreamDataReceived(_ streamID: UInt64, data: Data) {
         streamContinuationsState.withLock { state in
             // Don't process if shutdown
             guard !state.isShutdown else { return }
 
-            // First check if someone is waiting - don't consume data otherwise
-            guard let continuation = state.continuations.removeValue(forKey: streamID) else {
-                // No reader waiting - data stays in handler's buffer
-                // Reader will get it via fast path in readFromStream()
-                return
-            }
-
-            // Now safe to consume the data
-            if let data = handler.readFromStream(streamID) {
+            // If someone is waiting, resume them with the data
+            if let continuation = state.continuations.removeValue(forKey: streamID) {
                 continuation.resume(returning: data)
             } else {
-                // Unexpected: notification without data - put continuation back
-                state.continuations[streamID] = continuation
+                // No reader waiting - buffer the data for later
+                state.pendingData[streamID, default: []].append(data)
             }
         }
     }
@@ -972,6 +971,14 @@ extension ManagedConnection: QUICConnectionProtocol {
             }
             state.continuations.removeAll()
         }
+
+        // Finish send signal stream to stop outboundSendLoop in QUICEndpoint
+        state.withLock { s in
+            guard !s.isSendSignalShutdown else { return }  // Already shutdown
+            s.isSendSignalShutdown = true
+            s.sendSignalContinuation?.finish()
+            s.sendSignalContinuation = nil
+        }
     }
 }
 
@@ -981,6 +988,7 @@ extension ManagedConnection {
     /// Writes data to a stream (called by ManagedStream)
     func writeToStream(_ streamID: UInt64, data: Data) throws {
         try handler.writeToStream(streamID, data: data)
+        signalNeedsSend()
     }
 
     /// Reads data from a stream (called by ManagedStream)
@@ -988,25 +996,40 @@ extension ManagedConnection {
     /// Thread-safe: Prevents concurrent reads on the same stream.
     /// Only one reader can wait for data at a time per stream.
     /// Returns connectionClosed error if called after shutdown.
+    ///
+    /// Data sources (in priority order):
+    /// 1. Pending data buffer (from processFrameResult)
+    /// 2. Handler's stream buffer
+    /// 3. Wait for data via continuation
     func readFromStream(_ streamID: UInt64) async throws -> Data {
-        // Fast path: data already available
-        if let data = handler.readFromStream(streamID) {
-            return data
-        }
-
-        // Slow path: wait for data notification
+        // Try to get data atomically - check buffer first, then handler
         return try await withCheckedThrowingContinuation { continuation in
             streamContinuationsState.withLock { state in
-                // Check if shutdown - must be inside lock to avoid race
+                // Check if shutdown
                 guard !state.isShutdown else {
                     continuation.resume(throwing: ManagedConnectionError.connectionClosed)
                     return
                 }
-                // Double-check: data may have arrived while acquiring lock
+
+                // Priority 1: Check pending data buffer
+                if var pending = state.pendingData[streamID], !pending.isEmpty {
+                    let data = pending.removeFirst()
+                    if pending.isEmpty {
+                        state.pendingData.removeValue(forKey: streamID)
+                    } else {
+                        state.pendingData[streamID] = pending
+                    }
+                    continuation.resume(returning: data)
+                    return
+                }
+
+                // Priority 2: Check handler's stream buffer
                 if let data = handler.readFromStream(streamID) {
                     continuation.resume(returning: data)
                     return
                 }
+
+                // Priority 3: Wait for data
                 // Prevent concurrent reads on the same stream
                 guard state.continuations[streamID] == nil else {
                     continuation.resume(throwing: ManagedConnectionError.invalidState("Concurrent read on stream \(streamID)"))
@@ -1020,6 +1043,7 @@ extension ManagedConnection {
     /// Finishes a stream (sends FIN)
     func finishStream(_ streamID: UInt64) throws {
         try handler.finishStream(streamID)
+        signalNeedsSend()
     }
 
     /// Resets a stream
@@ -1031,6 +1055,68 @@ extension ManagedConnection {
     func stopSending(_ streamID: UInt64, errorCode: UInt64) {
         // Handler will generate STOP_SENDING frame
         handler.closeStream(streamID)
+    }
+}
+
+// MARK: - Send Signal
+
+extension ManagedConnection {
+    /// Signal that packets need to be sent.
+    ///
+    /// QUICEndpoint monitors this stream and, upon receiving a signal,
+    /// calls `generateOutboundPackets()` to send packets.
+    ///
+    /// Multiple writes before signal processing will be coalesced into
+    /// a single packet generation (efficient batching via `bufferingNewest(1)`).
+    ///
+    /// ## Usage
+    /// ```swift
+    /// // In QUICEndpoint
+    /// Task {
+    ///     for await _ in connection.sendSignal {
+    ///         let packets = try connection.generateOutboundPackets()
+    ///         for packet in packets {
+    ///             socket.send(packet, to: address)
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    public var sendSignal: AsyncStream<Void> {
+        state.withLock { s in
+            // After shutdown, return an already-finished stream
+            if s.isSendSignalShutdown {
+                if let existing = s.sendSignalStream { return existing }
+                let (stream, continuation) = AsyncStream<Void>.makeStream(
+                    bufferingPolicy: .bufferingNewest(1)
+                )
+                continuation.finish()
+                s.sendSignalStream = stream
+                return stream
+            }
+
+            // Return existing stream if already created (lazy initialization)
+            if let existing = s.sendSignalStream { return existing }
+
+            // Create new stream with bufferingNewest(1) for coalescing
+            // Multiple yields before consumption result in only one signal
+            let (stream, continuation) = AsyncStream<Void>.makeStream(
+                bufferingPolicy: .bufferingNewest(1)
+            )
+            s.sendSignalStream = stream
+            s.sendSignalContinuation = continuation
+            return stream
+        }
+    }
+
+    /// Notifies that packets need to be sent.
+    ///
+    /// Called after `writeToStream()` or `finishStream()` to trigger
+    /// packet generation and transmission in QUICEndpoint.
+    private func signalNeedsSend() {
+        state.withLock { s in
+            guard !s.isSendSignalShutdown else { return }
+            s.sendSignalContinuation?.yield(())
+        }
     }
 }
 
@@ -1330,6 +1416,17 @@ private struct ManagedConnectionState: Sendable {
 
     /// Pending PATH_RESPONSE frames to send
     var pendingPathResponses: [Data] = []
+
+    // MARK: - Send Signal State
+
+    /// Continuation for send signal stream
+    var sendSignalContinuation: AsyncStream<Void>.Continuation?
+
+    /// Send signal stream (lazily initialized)
+    var sendSignalStream: AsyncStream<Void>?
+
+    /// Whether send signal has been shutdown
+    var isSendSignalShutdown: Bool = false
 }
 
 // MARK: - Errors

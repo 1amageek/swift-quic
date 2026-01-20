@@ -16,6 +16,11 @@ import Synchronization
 @Suite("TLS Integration Tests")
 struct TLSIntegrationTests {
 
+    /// Shared server signing key for tests (generated once per test suite)
+    private static let serverSigningKey = SigningKey.generateP256()
+    /// Mock certificate chain for server (minimal valid DER structure)
+    private static let serverCertificateChain = [Data([0x30, 0x82, 0x01, 0x00])]
+
     /// Creates a client ManagedConnection with TLS13Handler
     private func createClientConnection(
         dcid: ConnectionID,
@@ -25,11 +30,13 @@ struct TLSIntegrationTests {
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
 
-        // Use real TLS13Handler
-        let tlsConfig = TLSConfiguration.client(
+        // Use real TLS13Handler with public key verification
+        var tlsConfig = TLSConfiguration.client(
             serverName: serverName,
             alpnProtocols: ["h3"]
         )
+        // Use public key verification for test certificates
+        tlsConfig.expectedPeerPublicKey = Self.serverSigningKey.publicKeyBytes
         let tlsProvider = TLS13Handler(configuration: tlsConfig)
 
         let address = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
@@ -54,8 +61,11 @@ struct TLSIntegrationTests {
         let config = QUICConfiguration()
         let params = TransportParameters(from: config, sourceConnectionID: scid)
 
-        // Use real TLS13Handler (server mode)
-        let tlsConfig = TLSConfiguration()  // Default config
+        // Use real TLS13Handler with certificate
+        var tlsConfig = TLSConfiguration()
+        tlsConfig.alpnProtocols = ["h3"]
+        tlsConfig.signingKey = Self.serverSigningKey
+        tlsConfig.certificateChain = Self.serverCertificateChain
         let tlsProvider = TLS13Handler(configuration: tlsConfig)
 
         let address = SocketAddress(ipAddress: "127.0.0.1", port: 54321)

@@ -748,6 +748,13 @@ public final class QUICConnectionHandler: Sendable {
         streamManager.activeStreamCount
     }
 
+    /// Whether any stream has data waiting to be sent
+    ///
+    /// Use this to check if outbound packets need to be generated and sent.
+    public var hasPendingStreamData: Bool {
+        streamManager.hasPendingStreamData
+    }
+
     // MARK: - Connection Close
 
     /// Closes the connection
