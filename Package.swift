@@ -36,6 +36,9 @@ let package = Package(
 
         // Logging
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
+
+        // Documentation
+        .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
     ],
     targets: [
         // MARK: - Core Types (No I/O)
