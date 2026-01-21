@@ -107,9 +107,14 @@ public enum FrameSize {
         }
 
         // Additional ACK Ranges (gap + range pairs)
-        for range in frame.ackRanges.dropFirst() {
-            size += Varint.encodedLength(for: range.gap)
-            size += Varint.encodedLength(for: range.rangeLength)
+        // インデックスベースのループで ArraySlice 作成を回避
+        // dropFirst() は ArraySlice を返すため、iterator 生成コストが発生する
+        let ranges = frame.ackRanges
+        if ranges.count > 1 {
+            for i in 1..<ranges.count {
+                size += Varint.encodedLength(for: ranges[i].gap)
+                size += Varint.encodedLength(for: ranges[i].rangeLength)
+            }
         }
 
         // ECN Counts (if present)

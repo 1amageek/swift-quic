@@ -51,12 +51,24 @@ public protocol FrameDecoder: Sendable {
 // MARK: - Standard Frame Codec
 
 /// Standard implementation of frame encoding and decoding
+///
+/// ## パフォーマンス最適化
+/// - `@inlinable` アノテーションにより、モジュール境界を越えてインライン展開可能
+/// - 関数呼び出しオーバーヘッドを削減し、さらなるコンパイラ最適化を有効化
+/// - 特に小さなフレーム（PING, ACK）で効果的
 public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
 
+    @inlinable
     public init() {}
 
     // MARK: - Encoding
 
+    /// フレームをバイナリデータにエンコード
+    ///
+    /// ## 最適化
+    /// - `@inlinable` により呼び出し元でインライン展開可能
+    /// - 事前サイズ計算により再割り当てを回避
+    @inlinable
     public func encode(_ frame: Frame) throws -> Data {
         // Pre-calculate frame size and allocate exact capacity to avoid reallocations
         let frameSize = FrameSize.frame(frame)
@@ -65,6 +77,8 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         return writer.toData()
     }
 
+    /// 複数フレームをバイナリデータにエンコード
+    @inlinable
     public func encodeFrames(_ frames: [Frame]) throws -> Data {
         // Pre-calculate total size for all frames to avoid reallocations
         let totalSize = frames.reduce(0) { $0 + FrameSize.frame($1) }
@@ -75,7 +89,10 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         return writer.toData()
     }
 
-    private func encodeFrame(_ frame: Frame, to writer: inout DataWriter) throws {
+    /// 内部エンコード実装（@inlinable から呼ばれるため @usableFromInline が必要）
+    @usableFromInline
+    @inline(__always)
+    internal func encodeFrame(_ frame: Frame, to writer: inout DataWriter) throws {
         switch frame {
         case .padding(let count):
             // PADDING frames are just 0x00 bytes
@@ -190,7 +207,14 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         }
     }
 
-    private func encodeAckFrame(_ ack: AckFrame, to writer: inout DataWriter) throws {
+    /// ACKフレームのエンコード
+    ///
+    /// ## 最適化
+    /// - `@usableFromInline` により @inlinable 関数からインライン展開可能
+    /// - インデックスベースのループで ArraySlice 作成を回避
+    @usableFromInline
+    @inline(__always)
+    internal func encodeAckFrame(_ ack: AckFrame, to writer: inout DataWriter) throws {
         // Type byte: 0x02 (ACK) or 0x03 (ACK with ECN)
         let hasECN = ack.ecnCounts != nil
         writer.writeByte(hasECN ? 0x03 : 0x02)
@@ -230,7 +254,10 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         }
     }
 
-    private func encodeStreamFrame(_ stream: StreamFrame, to writer: inout DataWriter) throws {
+    /// STREAMフレームのエンコード
+    @usableFromInline
+    @inline(__always)
+    internal func encodeStreamFrame(_ stream: StreamFrame, to writer: inout DataWriter) throws {
         // Build type byte with flags
         var typeByte: UInt8 = 0x08
         let hasOffset = stream.offset > 0
@@ -256,7 +283,10 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         writer.writeBytes(stream.data)
     }
 
-    private func encodeConnectionCloseFrame(_ close: ConnectionCloseFrame, to writer: inout DataWriter) throws {
+    /// CONNECTION_CLOSEフレームのエンコード
+    @usableFromInline
+    @inline(__always)
+    internal func encodeConnectionCloseFrame(_ close: ConnectionCloseFrame, to writer: inout DataWriter) throws {
         // Type: 0x1c (transport) or 0x1d (application)
         writer.writeByte(close.isApplicationError ? 0x1d : 0x1c)
 
@@ -275,6 +305,12 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
 
     // MARK: - Decoding
 
+    /// バイナリデータからフレームをデコード
+    ///
+    /// ## 最適化
+    /// - `@inlinable` により呼び出し元でインライン展開可能
+    /// - 1バイトvarint（フレームタイプ0x00-0x3F）の高速パス
+    @inlinable
     public func decode(from reader: inout DataReader) throws -> Frame {
         guard let firstByte = reader.peekByte() else {
             throw FrameCodecError.insufficientData
@@ -379,6 +415,8 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         }
     }
 
+    /// 複数フレームをデコード
+    @inlinable
     public func decodeFrames(from data: Data) throws -> [Frame] {
         var reader = DataReader(data)
         var frames: [Frame] = []
@@ -404,7 +442,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
 
     /// Checks if a frame consumed remaining bytes without an explicit length field.
     /// Per RFC 9000 Section 12.4, such frames must be the last frame in a packet.
-    private func isFrameWithoutExplicitLength(_ frame: Frame) -> Bool {
+    @usableFromInline
+    @inline(__always)
+    internal func isFrameWithoutExplicitLength(_ frame: Frame) -> Bool {
         switch frame {
         case .stream(let sf):
             return !sf.hasLength
@@ -416,8 +456,13 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     }
 
     // MARK: - Frame-Specific Decoders
+    // 以下のデコーダは @inlinable な decode() から呼び出されるため
+    // @usableFromInline でモジュール境界を越えたインライン展開を有効化
 
-    private func decodeAckFrame(from reader: inout DataReader, hasECN: Bool) throws -> Frame {
+    /// ACKフレームのデコード
+    @usableFromInline
+    @inline(__always)
+    internal func decodeAckFrame(from reader: inout DataReader, hasECN: Bool) throws -> Frame {
         let largestAcked = try reader.readVarintValue()
         let ackDelay = try reader.readVarintValue()
         let rangeCount = try reader.readVarintValue()
@@ -469,7 +514,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeResetStreamFrame(from reader: inout DataReader) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeResetStreamFrame(from reader: inout DataReader) throws -> Frame {
         let streamID = try reader.readVarintValue()
         let errorCode = try reader.readVarintValue()
         let finalSize = try reader.readVarintValue()
@@ -480,7 +527,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeStopSendingFrame(from reader: inout DataReader) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeStopSendingFrame(from reader: inout DataReader) throws -> Frame {
         let streamID = try reader.readVarintValue()
         let errorCode = try reader.readVarintValue()
         return .stopSending(StopSendingFrame(
@@ -489,7 +538,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeCryptoFrame(from reader: inout DataReader) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeCryptoFrame(from reader: inout DataReader) throws -> Frame {
         let offset = try reader.readVarintValue()
         let length = try reader.readVarintValue()
         let safeLength = try SafeConversions.toInt(
@@ -503,7 +554,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         return .crypto(CryptoFrame(offset: offset, data: data))
     }
 
-    private func decodeNewTokenFrame(from reader: inout DataReader) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeNewTokenFrame(from reader: inout DataReader) throws -> Frame {
         let length = try reader.readVarintValue()
         let safeLength = try SafeConversions.toInt(
             length,
@@ -516,7 +569,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         return .newToken(token)
     }
 
-    private func decodeStreamFrame(from reader: inout DataReader, typeByte: UInt8) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeStreamFrame(from reader: inout DataReader, typeByte: UInt8) throws -> Frame {
         let hasOffset = (typeByte & 0x04) != 0
         let hasLength = (typeByte & 0x02) != 0
         let hasFin = (typeByte & 0x01) != 0
@@ -557,7 +612,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeMaxStreamDataFrame(from reader: inout DataReader) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeMaxStreamDataFrame(from reader: inout DataReader) throws -> Frame {
         let streamID = try reader.readVarintValue()
         let maxStreamData = try reader.readVarintValue()
         return .maxStreamData(MaxStreamDataFrame(
@@ -566,7 +623,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeMaxStreamsFrame(from reader: inout DataReader, isBidi: Bool) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeMaxStreamsFrame(from reader: inout DataReader, isBidi: Bool) throws -> Frame {
         let maxStreams = try reader.readVarintValue()
         return .maxStreams(MaxStreamsFrame(
             maxStreams: maxStreams,
@@ -574,7 +633,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeStreamDataBlockedFrame(from reader: inout DataReader) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeStreamDataBlockedFrame(from reader: inout DataReader) throws -> Frame {
         let streamID = try reader.readVarintValue()
         let limit = try reader.readVarintValue()
         return .streamDataBlocked(StreamDataBlockedFrame(
@@ -583,7 +644,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeStreamsBlockedFrame(from reader: inout DataReader, isBidi: Bool) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeStreamsBlockedFrame(from reader: inout DataReader, isBidi: Bool) throws -> Frame {
         let limit = try reader.readVarintValue()
         return .streamsBlocked(StreamsBlockedFrame(
             streamLimit: limit,
@@ -591,7 +654,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeNewConnectionIDFrame(from reader: inout DataReader) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeNewConnectionIDFrame(from reader: inout DataReader) throws -> Frame {
         let seqNum = try reader.readVarintValue()
         let retirePriorTo = try reader.readVarintValue()
 
@@ -619,7 +684,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeConnectionCloseFrame(from reader: inout DataReader, isApp: Bool) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeConnectionCloseFrame(from reader: inout DataReader, isApp: Bool) throws -> Frame {
         let errorCode = try reader.readVarintValue()
 
         var frameType: UInt64? = nil
@@ -651,7 +718,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    private func decodeDatagramFrame(from reader: inout DataReader, hasLength: Bool) throws -> Frame {
+    @usableFromInline
+    @inline(__always)
+    internal func decodeDatagramFrame(from reader: inout DataReader, hasLength: Bool) throws -> Frame {
         let data: Data
         if hasLength {
             let length = try reader.readVarintValue()

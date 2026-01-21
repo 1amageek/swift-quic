@@ -20,11 +20,9 @@ public final class LossDetector: Sendable {
     private struct LossState {
         /// Sent packets awaiting acknowledgment, stored as sorted array by packet number
         /// Sorted order enables efficient range queries and cache-friendly iteration
+        /// Note: Dictionary index was removed as profiling showed it was never read,
+        /// only written. Binary search on sorted array provides O(log n) lookup.
         var sentPackets: ContiguousArray<SentPacket>
-
-        /// Index for O(1) packet lookup by packet number
-        /// Maps packet number to index in sentPackets array
-        var packetIndex: [UInt64: Int]
 
         /// Largest packet number acknowledged
         var largestAckedPacket: UInt64?
@@ -49,7 +47,6 @@ public final class LossDetector: Sendable {
             // Typical QUIC connections have <1000 packets in flight
             self.sentPackets = ContiguousArray()
             self.sentPackets.reserveCapacity(128)
-            self.packetIndex = Dictionary(minimumCapacity: 128)
         }
     }
 
@@ -60,23 +57,22 @@ public final class LossDetector: Sendable {
 
     /// Records a sent packet
     /// - Parameter packet: The sent packet to track
+    ///
+    /// ## Performance
+    /// - Fast path (in-order): O(1) append
+    /// - Slow path (out-of-order): O(n) insert (rare in practice)
     public func onPacketSent(_ packet: SentPacket) {
         state.withLock { state in
             let pn = packet.packetNumber
 
             // Fast path: packets usually arrive in order (append to end)
             if state.sentPackets.isEmpty || pn > state.sentPackets.last!.packetNumber {
-                state.packetIndex[pn] = state.sentPackets.count
                 state.sentPackets.append(packet)
             } else {
                 // Slow path: out-of-order packet (rare in practice)
                 // Find insertion point using binary search
                 let insertIdx = state.sentPackets.partitioningIndex { $0.packetNumber >= pn }
                 state.sentPackets.insert(packet, at: insertIdx)
-                // Update indices for all packets after insertion point
-                for i in insertIdx..<state.sentPackets.count {
-                    state.packetIndex[state.sentPackets[i].packetNumber] = i
-                }
             }
 
             if packet.inFlight {
@@ -173,11 +169,11 @@ public final class LossDetector: Sendable {
     /// instead of iterating over ACK ranges (which could be attacker-controlled).
     /// This prevents CPU DoS attacks via malicious ACK frames with huge ranges.
     ///
-    /// OPTIMIZATION:
+    /// ## Performance Optimization
     /// - Pre-computes ACK ranges as intervals once
     /// - Uses binary search to find packet range bounds
     /// - Iterates only packets within [smallestAcked, largestAcked]
-    /// - Batch removal for efficiency
+    /// - Uses Set + removeAll(where:) for O(n) batch removal instead of O(k*n)
     @inline(__always)
     private func processAckedRanges(
         ackFrame: AckFrame,
@@ -202,9 +198,10 @@ public final class LossDetector: Sendable {
 
         guard startIdx < endIdx else { return }
 
-        // Collect indices to remove (iterate backwards for stable removal)
-        var indicesToRemove: ContiguousArray<Int> = []
-        indicesToRemove.reserveCapacity(endIdx - startIdx)
+        // Collect acknowledged packet numbers for efficient batch removal
+        // Using Set for O(1) lookup during removeAll
+        var ackedPacketNumbers = Set<UInt64>()
+        ackedPacketNumbers.reserveCapacity(endIdx - startIdx)
 
         for i in startIdx..<endIdx {
             let packet = state.sentPackets[i]
@@ -212,7 +209,7 @@ public final class LossDetector: Sendable {
 
             // Check if this packet number falls within any ACK range using binary search
             if isPacketInIntervals(pn, intervals: intervals) {
-                indicesToRemove.append(i)
+                ackedPacketNumbers.insert(pn)
                 ackedPackets.append(packet)
 
                 if packet.inFlight {
@@ -229,18 +226,10 @@ public final class LossDetector: Sendable {
             }
         }
 
-        // Batch remove in reverse order to maintain index validity
-        for i in indicesToRemove.reversed() {
-            let pn = state.sentPackets[i].packetNumber
-            state.packetIndex.removeValue(forKey: pn)
-            state.sentPackets.remove(at: i)
-        }
-
-        // Rebuild indices for remaining packets after removal point
-        if let firstRemoved = indicesToRemove.first {
-            for i in firstRemoved..<state.sentPackets.count {
-                state.packetIndex[state.sentPackets[i].packetNumber] = i
-            }
+        // Batch remove using removeAll(where:) - O(n) single pass
+        // This is much faster than individual remove(at:) calls which are O(n) each
+        if !ackedPacketNumbers.isEmpty {
+            state.sentPackets.removeAll { ackedPacketNumbers.contains($0.packetNumber) }
         }
     }
 
@@ -317,7 +306,10 @@ public final class LossDetector: Sendable {
     }
 
     /// Internal loss detection algorithm (RFC 9002 Section 4.3)
-    /// Optimized with bounded iteration and batch removal
+    ///
+    /// ## Performance Optimization
+    /// - Uses binary search to find boundary for iteration
+    /// - Uses Set + removeAll(where:) for O(n) batch removal instead of O(k*n)
     private func detectLostPacketsInternal(
         _ state: inout LossState,
         now: ContinuousClock.Instant,
@@ -334,8 +326,8 @@ public final class LossDetector: Sendable {
         var lostPackets: [SentPacket] = []
         lostPackets.reserveCapacity(8)
         var earliestLossTime: ContinuousClock.Instant? = nil
-        var indicesToRemove: ContiguousArray<Int> = []
-        indicesToRemove.reserveCapacity(8)
+        var lostPacketNumbers = Set<UInt64>()
+        lostPacketNumbers.reserveCapacity(8)
 
         // Only iterate packets with pn < largestAcked (potential loss candidates)
         // Use binary search to find the boundary
@@ -353,7 +345,7 @@ public final class LossDetector: Sendable {
             let timeLost = (now - packet.timeSent) >= lossDelayThreshold
 
             if packetLost || timeLost {
-                indicesToRemove.append(i)
+                lostPacketNumbers.insert(pn)
                 lostPackets.append(packet)
                 if packet.inFlight {
                     state.bytesInFlight -= packet.sentBytes
@@ -372,18 +364,9 @@ public final class LossDetector: Sendable {
             }
         }
 
-        // Batch remove lost packets in reverse order
-        for i in indicesToRemove.reversed() {
-            let pn = state.sentPackets[i].packetNumber
-            state.packetIndex.removeValue(forKey: pn)
-            state.sentPackets.remove(at: i)
-        }
-
-        // Rebuild indices after removal
-        if !indicesToRemove.isEmpty {
-            for i in 0..<state.sentPackets.count {
-                state.packetIndex[state.sentPackets[i].packetNumber] = i
-            }
+        // Batch remove using removeAll(where:) - O(n) single pass
+        if !lostPacketNumbers.isEmpty {
+            state.sentPackets.removeAll { lostPacketNumbers.contains($0.packetNumber) }
         }
 
         // Update smallest unacked
@@ -477,7 +460,6 @@ public final class LossDetector: Sendable {
     public func clear() {
         state.withLock { state in
             state.sentPackets.removeAll(keepingCapacity: true)
-            state.packetIndex.removeAll(keepingCapacity: true)
             state.largestAckedPacket = nil
             state.largestSent = nil
             state.lossTime = nil
