@@ -290,6 +290,89 @@ public struct ASN1Builder: Sendable {
         encode(tag: .printableString, content: Data(string.utf8))
     }
 
+    /// Encodes an INTEGER from Int value
+    public static func integer(_ value: Int) -> Data {
+        if value == 0 {
+            return encode(tag: .integer, content: Data([0x00]))
+        }
+
+        var bytes = Data()
+        var v = value
+        while v > 0 {
+            bytes.insert(UInt8(v & 0xFF), at: 0)
+            v >>= 8
+        }
+
+        // Ensure positive (add leading zero if high bit set)
+        if let first = bytes.first, first & 0x80 != 0 {
+            bytes.insert(0x00, at: 0)
+        }
+
+        return encode(tag: .integer, content: bytes)
+    }
+
+    /// Encodes a UTCTime (for X.509 validity dates)
+    public static func utcTime(_ date: Date) -> Data {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyMMddHHmmss'Z'"
+
+        let timeString = formatter.string(from: date)
+        return encode(tag: .utcTime, content: Data(timeString.utf8))
+    }
+
+    /// Encodes an OBJECT IDENTIFIER from component array
+    public static func oid(_ components: [UInt]) -> Data {
+        guard components.count >= 2 else {
+            return encode(tag: .objectIdentifier, content: Data())
+        }
+
+        var content = Data()
+
+        // First byte: first * 40 + second
+        content.append(UInt8(components[0] * 40 + components[1]))
+
+        // Remaining components use variable-length encoding
+        for i in 2..<components.count {
+            let comp = components[i]
+            if comp < 128 {
+                content.append(UInt8(comp))
+            } else {
+                var bytes: [UInt8] = []
+                var val = comp
+                bytes.append(UInt8(val & 0x7F))
+                val >>= 7
+                while val > 0 {
+                    bytes.append(UInt8((val & 0x7F) | 0x80))
+                    val >>= 7
+                }
+                content.append(contentsOf: bytes.reversed())
+            }
+        }
+
+        return encode(tag: .objectIdentifier, content: content)
+    }
+
+    /// Encodes an X.509 Extension
+    ///
+    /// Extension ::= SEQUENCE {
+    ///     extnID OBJECT IDENTIFIER,
+    ///     critical BOOLEAN DEFAULT FALSE,
+    ///     extnValue OCTET STRING
+    /// }
+    public static func x509Extension(oid oidComponents: [UInt], critical: Bool, value: Data) -> Data {
+        var content = oid(oidComponents)
+
+        if critical {
+            content.append(boolean(true))
+        }
+
+        content.append(octetString(value))
+
+        return sequence([content])
+    }
+
     /// Encodes a context-specific tagged value
     public static func contextSpecific(_ number: UInt, content: Data, isConstructed: Bool = true) -> Data {
         let tag = ASN1Tag.contextSpecific(number, isConstructed: isConstructed)
