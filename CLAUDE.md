@@ -115,11 +115,13 @@ swift-quic/
 │   │   ├── DataBuffer.swift       # Out-of-order data reassembly
 │   │   └── StreamState.swift      # Send/receive state enums
 │   │
-│   ├── QUICRecovery/            # Loss detection & congestion
-│   │   ├── LossDetection.swift
-│   │   ├── CongestionControl.swift
-│   │   ├── RTTEstimator.swift
-│   │   └── PacingTimer.swift
+│   ├── QUICRecovery/            # Loss detection & congestion (RFC 9002)
+│   │   ├── LossDetector.swift        # Packet loss detection with PTO support
+│   │   ├── AckManager.swift          # ACK frame generation & tracking
+│   │   ├── RTTEstimator.swift        # RTT measurement & smoothing
+│   │   ├── NewRenoCongestionController.swift  # NewReno congestion control
+│   │   ├── AntiAmplificationLimiter.swift     # Server amplification attack prevention
+│   │   └── SentPacket.swift          # Sent packet metadata
 │   │
 │   └── QUICTransport/           # UDP integration
 │       ├── UDPSocket.swift      # Uses swift-nio-udp
@@ -399,7 +401,8 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] RTT estimation (RTTEstimator)
 - [x] Loss detection (LossDetector)
 - [x] ACK management (AckManager)
-- [ ] Congestion control (NewReno, CUBIC)
+- [x] Congestion control (NewRenoCongestionController)
+- [x] Anti-amplification limiter (AntiAmplificationLimiter)
 
 ### Phase 6: Stream Layer (QUICStream) ✅
 - [x] DataStream (send/receive state machines)
