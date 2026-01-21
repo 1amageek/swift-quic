@@ -98,6 +98,11 @@ public final class LossDetector: Sendable {
     ///   - ackReceivedTime: When the ACK was received
     ///   - rttEstimator: The RTT estimator to update
     /// - Returns: Result containing acknowledged and lost packets
+    ///
+    /// ## RFC 9002 Compliance
+    /// - largestAckedPacket is only updated after successful ACK processing
+    /// - RTT sample is taken from the largest newly acknowledged ack-eliciting packet
+    /// - isFirstAckElicitingAck is set only when an ack-eliciting packet is actually acknowledged
     public func onAckReceived(
         ackFrame: AckFrame,
         ackReceivedTime: ContinuousClock.Instant,
@@ -117,18 +122,10 @@ public final class LossDetector: Sendable {
 
         state.withLock { state in
             let largestAcked = ackFrame.largestAcknowledged
-
-            // Check if this is first acknowledgment
-            if state.largestAckedPacket == nil {
-                isFirstAckElicitingAck = true
-            }
-
-            // Update largest acked
-            if state.largestAckedPacket == nil || largestAcked > state.largestAckedPacket! {
-                state.largestAckedPacket = largestAcked
-            }
+            let wasFirstAck = state.largestAckedPacket == nil
 
             // Process acknowledged packets directly from ACK ranges (no intermediate array)
+            // This validates ACK ranges by checking against our sent packets
             processAckedRanges(
                 ackFrame: ackFrame,
                 state: &state,
@@ -136,6 +133,20 @@ public final class LossDetector: Sendable {
                 rttSample: &rttSample,
                 ackReceivedTime: ackReceivedTime
             )
+
+            // [Critical Fix] Only update largestAckedPacket AFTER successful ACK processing
+            // This prevents spurious loss detection from invalid ACK frames
+            if !ackedPackets.isEmpty {
+                if state.largestAckedPacket == nil || largestAcked > state.largestAckedPacket! {
+                    state.largestAckedPacket = largestAcked
+                }
+
+                // [Warning Fix] isFirstAckElicitingAck: only set when we actually
+                // acknowledged an ack-eliciting packet for the first time
+                if wasFirstAck && ackedPackets.contains(where: { $0.ackEliciting }) {
+                    isFirstAckElicitingAck = true
+                }
+            }
 
             // Detect lost packets
             lostPackets = detectLostPacketsInternal(
@@ -174,6 +185,10 @@ public final class LossDetector: Sendable {
     /// - Uses binary search to find packet range bounds
     /// - Iterates only packets within [smallestAcked, largestAcked]
     /// - Uses Set + removeAll(where:) for O(n) batch removal instead of O(k*n)
+    ///
+    /// ## RFC 9002 Compliance
+    /// - RTT sample is taken ONLY if the largest newly acknowledged packet is ack-eliciting
+    ///   (RFC 9002 Section 5.1: use only the largest newly acknowledged packet)
     @inline(__always)
     private func processAckedRanges(
         ackFrame: AckFrame,
@@ -203,6 +218,10 @@ public final class LossDetector: Sendable {
         var ackedPacketNumbers = Set<UInt64>()
         ackedPacketNumbers.reserveCapacity(endIdx - startIdx)
 
+        // Track the largest acked packet for RTT sampling (RFC 9002 Section 5.1)
+        // RTT sample is only taken if this packet is ack-eliciting
+        var largestAckedPacket: SentPacket? = nil
+
         for i in startIdx..<endIdx {
             let packet = state.sentPackets[i]
             let pn = packet.packetNumber
@@ -219,11 +238,18 @@ public final class LossDetector: Sendable {
                     state.ackElicitingInFlight -= 1
                 }
 
-                // RTT sample from largest newly acked ack-eliciting packet
-                if pn == largestAcked && packet.ackEliciting {
-                    rttSample = ackReceivedTime - packet.timeSent
+                // Track largest acked packet (iteration is in ascending pn order)
+                // The last packet matching largestAcked is what we want
+                if pn == largestAcked {
+                    largestAckedPacket = packet
                 }
             }
+        }
+
+        // RFC 9002 Section 5.1: RTT sample is generated using ONLY the largest
+        // newly acknowledged packet, and only if it's ack-eliciting
+        if let packet = largestAckedPacket, packet.ackEliciting {
+            rttSample = ackReceivedTime - packet.timeSent
         }
 
         // Batch remove using removeAll(where:) - O(n) single pass
@@ -310,6 +336,10 @@ public final class LossDetector: Sendable {
     /// ## Performance Optimization
     /// - Uses binary search to find boundary for iteration
     /// - Uses Set + removeAll(where:) for O(n) batch removal instead of O(k*n)
+    ///
+    /// ## RFC 9002 Compliance
+    /// - Loss detection only applies to in-flight packets
+    /// - Loss timer (earliestLossTime) is only set based on in-flight packets
     private func detectLostPacketsInternal(
         _ state: inout LossState,
         now: ContinuousClock.Instant,
@@ -338,6 +368,23 @@ public final class LossDetector: Sendable {
             let packet = state.sentPackets[i]
             let pn = packet.packetNumber
 
+            // [Warning Fix] RFC 9002: Loss detection only applies to in-flight packets
+            // Non-in-flight packets (e.g., ACK-only) should not trigger loss detection
+            // or affect the loss timer
+            guard packet.inFlight else {
+                // Still remove non-in-flight packets that are older than loss threshold
+                // to avoid memory growth, but don't report them as lost
+                let packetLost = largestAcked >= pn + LossDetectionConstants.packetThreshold
+                let timeLost = (now - packet.timeSent) >= lossDelayThreshold
+                if packetLost || timeLost {
+                    lostPacketNumbers.insert(pn)
+                    if packet.ackEliciting {
+                        state.ackElicitingInFlight -= 1
+                    }
+                }
+                continue
+            }
+
             // Packet threshold loss: 3+ newer packets acknowledged
             let packetLost = largestAcked >= pn + LossDetectionConstants.packetThreshold
 
@@ -347,14 +394,13 @@ public final class LossDetector: Sendable {
             if packetLost || timeLost {
                 lostPacketNumbers.insert(pn)
                 lostPackets.append(packet)
-                if packet.inFlight {
-                    state.bytesInFlight -= packet.sentBytes
-                }
+                state.bytesInFlight -= packet.sentBytes
                 if packet.ackEliciting {
                     state.ackElicitingInFlight -= 1
                 }
             } else {
                 // Not yet lost by packet threshold - calculate when it will be lost by time
+                // Only in-flight packets contribute to the loss timer
                 if largestAcked < pn + LossDetectionConstants.packetThreshold {
                     let lossTime = packet.timeSent + lossDelayThreshold
                     if earliestLossTime == nil || lossTime < earliestLossTime! {
