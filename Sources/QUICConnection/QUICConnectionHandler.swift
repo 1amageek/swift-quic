@@ -402,6 +402,18 @@ public final class QUICConnectionHandler: Sendable {
         pnSpaceManager.handshakeConfirmed = true
     }
 
+    /// Marks handshake as complete.
+    ///
+    /// For servers: Called when TLS handshake completes (server doesn't receive HANDSHAKE_DONE).
+    /// For clients: HANDSHAKE_DONE frame processing calls processHandshakeDone() instead.
+    ///
+    /// This enables stream frame generation in getOutboundPackets().
+    public func markHandshakeComplete() {
+        handshakeComplete.withLock { $0 = true }
+        connectionState.withLock { $0.status = .established }
+        pnSpaceManager.handshakeConfirmed = true
+    }
+
     /// Sets peer transport parameters (called after TLS handshake)
     ///
     /// This updates various components with the peer's advertised limits and settings,

@@ -92,7 +92,14 @@ extension ManagedStream: QUICStreamProtocol {
             throw ManagedStreamError.connectionLost
         }
 
-        state.withLock { $0.writeClosed = true }
+        // Idempotent: only finish stream once
+        let alreadyClosed = state.withLock { s in
+            let was = s.writeClosed
+            s.writeClosed = true
+            return was
+        }
+
+        guard !alreadyClosed else { return }
         try conn.finishStream(id)
     }
 

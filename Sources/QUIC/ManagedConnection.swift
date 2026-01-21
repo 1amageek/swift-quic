@@ -562,10 +562,13 @@ public final class ManagedConnection: Sendable {
                 // RFC 9000 Section 8.1: Lift amplification limit when handshake is confirmed
                 amplificationLimiter.confirmHandshake()
 
-                // Server: Send HANDSHAKE_DONE
+                // Server: Send HANDSHAKE_DONE and mark handler handshake complete
+                // Client will set handshakeComplete when it receives HANDSHAKE_DONE frame
                 let role = state.withLock { $0.role }
                 if role == .server {
                     handler.queueFrame(.handshakeDone, level: .application)
+                    // Server must mark handshake complete here since it won't receive HANDSHAKE_DONE
+                    handler.markHandshakeComplete()
                 }
 
                 // Mark handshake as established but don't discard keys yet

@@ -946,6 +946,11 @@ public actor QUICEndpoint {
                 )
             }
         }
+
+        // Loop ended: connection closed or endpoint stopping
+        // Clean up connection from router and timer manager
+        router.unregister(connection)
+        timerManager.markClosed(connection)
     }
 
     /// The timer processing loop
@@ -1011,10 +1016,12 @@ public actor QUICEndpoint {
     // MARK: - Connection Management
 
     /// Closes all connections
+    ///
+    /// Note: Actual cleanup (router unregister, timer manager) happens
+    /// when each connection's outboundSendLoop ends after shutdown.
     public func closeAll() async {
         for connection in router.allConnections {
             await connection.close(error: nil)
-            timerManager.markClosed(connection)
         }
     }
 
