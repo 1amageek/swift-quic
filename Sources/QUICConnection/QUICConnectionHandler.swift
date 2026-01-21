@@ -212,6 +212,7 @@ public final class QUICConnectionHandler: Sendable {
     ///   - frames: The frames to process
     ///   - level: The encryption level
     /// - Returns: Processing result
+    /// - Throws: ProtocolViolation if a frame is not valid at the encryption level
     public func processFrames(
         _ frames: [Frame],
         level: EncryptionLevel
@@ -219,6 +220,14 @@ public final class QUICConnectionHandler: Sendable {
         var result = FrameProcessingResult()
 
         for frame in frames {
+            // RFC 9000 §12.4: Validate frame type is allowed at this encryption level
+            guard frame.isValid(at: level) else {
+                throw QUICError.frameNotAllowed(
+                    frameType: UInt64(frame.frameType.rawValue),
+                    packetType: "\(level)"
+                )
+            }
+
             switch frame {
             case .ack(let ackFrame):
                 try processAckFrame(ackFrame, level: level)
@@ -294,7 +303,8 @@ public final class QUICConnectionHandler: Sendable {
 
             case .newConnectionID(let frame):
                 // Process using ConnectionIDManager
-                connectionIDManager.handleNewConnectionID(frame)
+                // RFC 9000 §5.1.1: Validates duplicate sequence numbers and limit
+                try connectionIDManager.handleNewConnectionID(frame)
                 // Register the stateless reset token
                 statelessResetManager.registerReceivedToken(frame.statelessResetToken)
                 result.newConnectionIDs.append(frame)
@@ -830,6 +840,38 @@ public final class QUICConnectionHandler: Sendable {
     /// QUIC version
     public var version: QUICVersion {
         connectionState.withLock { $0.version }
+    }
+
+    // MARK: - Retry Handling
+
+    /// Updates the destination connection ID after receiving a Retry packet
+    ///
+    /// RFC 9000 Section 8.1.2: The client MUST use the value from the
+    /// Source Connection ID field of the Retry packet in the
+    /// Destination Connection ID field of subsequent packets.
+    ///
+    /// - Parameter newCID: The new destination connection ID
+    public func updateDestinationConnectionID(_ newCID: ConnectionID) {
+        connectionState.withLock { s in
+            // Replace the first (current) DCID with the new one
+            if s.destinationConnectionIDs.isEmpty {
+                s.destinationConnectionIDs = [newCID]
+            } else {
+                s.destinationConnectionIDs[0] = newCID
+            }
+        }
+    }
+
+    /// Gets the CRYPTO data for resending after a Retry packet
+    ///
+    /// RFC 9000 Section 8.1.2: After receiving a Retry packet, the client
+    /// MUST resend its Initial CRYPTO data with the retry token.
+    ///
+    /// - Parameter level: The encryption level (should be .initial)
+    /// - Returns: The accumulated CRYPTO data at this level
+    public func getCryptoDataForRetry(level: EncryptionLevel) -> Data {
+        // Get all unacknowledged CRYPTO data from the crypto stream manager
+        return cryptoStreamManager.getDataForRetry(level: level)
     }
 
     // MARK: - Connection Migration API

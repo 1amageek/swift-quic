@@ -329,6 +329,12 @@ public final class ManagedConnection: Sendable {
         // Record received bytes for anti-amplification limit
         amplificationLimiter.recordBytesReceived(UInt64(data.count))
 
+        // RFC 9001 §5.8: Check for Retry packet and verify integrity tag
+        // Retry packets use special handling - they don't use normal AEAD encryption
+        if RetryIntegrityTag.isRetryPacket(data) {
+            return try await processRetryPacket(data)
+        }
+
         // Decrypt the packet
         let parsed = try packetProcessor.decryptPacket(data)
 
@@ -365,6 +371,12 @@ public final class ManagedConnection: Sendable {
     public func processDatagram(_ datagram: Data) async throws -> [Data] {
         // Record received bytes for anti-amplification limit
         amplificationLimiter.recordBytesReceived(UInt64(datagram.count))
+
+        // RFC 9001 §5.8: Check for Retry packet and verify integrity tag
+        // Retry packets are never coalesced, but check the first packet anyway
+        if RetryIntegrityTag.isRetryPacket(datagram) {
+            return try await processRetryPacket(datagram)
+        }
 
         let parsedPackets = try packetProcessor.decryptDatagram(datagram)
 
@@ -428,6 +440,122 @@ public final class ManagedConnection: Sendable {
         }
 
         return allowedPackets
+    }
+
+    // MARK: - Retry Packet Processing
+
+    /// Processes a Retry packet from the server
+    ///
+    /// RFC 9001 Section 5.8: A client that receives a Retry packet MUST verify
+    /// the Retry Integrity Tag before processing the packet.
+    ///
+    /// RFC 9000 Section 8.1:
+    /// - A client MUST accept and process at most one Retry packet
+    /// - A client MUST discard a Retry packet if it has received a valid packet
+    /// - A client MUST discard a Retry packet with an invalid integrity tag
+    ///
+    /// - Parameter data: The Retry packet data
+    /// - Returns: New Initial packets to send with the retry token
+    private func processRetryPacket(_ data: Data) async throws -> [Data] {
+        // Only clients process Retry packets
+        let (role, hasProcessedRetry, hasReceivedValidPacket) = state.withLock { s in
+            (s.role, s.hasProcessedRetry, s.hasReceivedValidPacket)
+        }
+
+        guard role == .client else {
+            // Servers don't process Retry packets - silently discard
+            return []
+        }
+
+        // RFC 9000: A client MUST accept and process at most one Retry packet
+        guard !hasProcessedRetry else {
+            // Already processed a Retry - discard this one
+            return []
+        }
+
+        // RFC 9000: A client that has received and successfully processed a valid
+        // Initial or Handshake packet MUST discard subsequent Retry packets
+        guard !hasReceivedValidPacket else {
+            return []
+        }
+
+        // Parse the Retry packet
+        let (version, _, sourceCID, retryToken, integrityTag) =
+            try RetryIntegrityTag.parseRetryPacket(data)
+
+        // RFC 9001 §5.8: Verify the Retry Integrity Tag
+        // The tag is computed using the ORIGINAL destination connection ID
+        // (the one the client used in its first Initial packet)
+        let packetWithoutTag = RetryIntegrityTag.retryPacketWithoutTag(data)
+
+        let isValid = try RetryIntegrityTag.verify(
+            tag: integrityTag,
+            originalDCID: originalConnectionID,
+            retryPacketWithoutTag: packetWithoutTag,
+            version: version
+        )
+
+        guard isValid else {
+            // RFC 9001 §5.8: Discard Retry packet with invalid integrity tag
+            // Do NOT treat this as a connection error - just silently discard
+            return []
+        }
+
+        // RFC 9000: The client MUST use the value from the Source Connection ID
+        // field of the Retry packet in the Destination Connection ID field of
+        // subsequent packets
+        state.withLock { s in
+            s.hasProcessedRetry = true
+            s.retryToken = retryToken
+            s.destinationConnectionID = sourceCID
+        }
+
+        // RFC 9001: The client MUST discard Initial keys derived from the original
+        // Destination Connection ID and derive new Initial keys using the
+        // Source Connection ID from the Retry packet
+        packetProcessor.discardKeys(for: .initial)
+
+        // Derive new Initial keys using the server's SCID (our new DCID)
+        let (_, _) = try packetProcessor.deriveAndInstallInitialKeys(
+            connectionID: sourceCID,
+            isClient: true,
+            version: version
+        )
+
+        // Update the handler's destination CID
+        handler.updateDestinationConnectionID(sourceCID)
+
+        // RFC 9000 Section 8.1.2: Resend Initial packet with the retry token
+        // Get the current CRYPTO data to resend
+        let cryptoData = handler.getCryptoDataForRetry(level: .initial)
+
+        // Build and send new Initial packet with retry token
+        var initialPackets: [Data] = []
+        if !cryptoData.isEmpty {
+            let (scid, dcid) = state.withLock { ($0.sourceConnectionID, $0.destinationConnectionID) }
+            let pn = handler.getNextPacketNumber(for: .initial)
+
+            let header = LongHeader(
+                packetType: .initial,
+                version: version,
+                destinationConnectionID: dcid,
+                sourceConnectionID: scid,
+                token: retryToken,  // Include the retry token
+                packetNumber: pn
+            )
+
+            let frames: [Frame] = [.crypto(CryptoFrame(offset: 0, data: cryptoData))]
+
+            let encrypted = try packetProcessor.encryptLongHeaderPacket(
+                frames: frames,
+                header: header,
+                packetNumber: pn,
+                padToMinimum: true  // Initial packets must be padded to 1200 bytes
+            )
+            initialPackets.append(encrypted)
+        }
+
+        return applyAmplificationLimit(to: initialPackets)
     }
 
     /// Generates outbound packets ready to send
@@ -1402,6 +1530,15 @@ private struct ManagedConnectionState: Sendable {
     /// Whether we have received and successfully processed any valid packet
     /// RFC 9000 Section 6.2: Used to discard late Version Negotiation packets
     var hasReceivedValidPacket: Bool = false
+
+    // MARK: - Retry State (RFC 9000 Section 8.1)
+
+    /// Whether we have already processed a Retry packet
+    /// RFC 9000: A client MUST accept and process at most one Retry packet
+    var hasProcessedRetry: Bool = false
+
+    /// Retry token received from server (to include in subsequent Initial packets)
+    var retryToken: Data? = nil
 
     // MARK: - Connection Migration State
 

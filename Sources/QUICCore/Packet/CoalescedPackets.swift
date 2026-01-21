@@ -117,7 +117,7 @@ public struct CoalescedPacketParser: Sendable {
 
         while offset < datagram.endIndex {
             let firstByte = datagram[offset]
-            let isLongHeader = PacketHeader.isLongHeader(firstByte: firstByte)
+            let isLongHeader = (firstByte & 0x80) != 0
 
             // Determine packet length
             let packetLength: Int

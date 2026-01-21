@@ -14,6 +14,10 @@ public final class CryptoStreamManager: Sendable {
     /// Send offsets per encryption level
     private let sendOffsets: Mutex<[EncryptionLevel: UInt64]>
 
+    /// Sent data buffer per encryption level (for Retry handling)
+    /// RFC 9000 Section 8.1.2: Client needs to resend CRYPTO data after Retry
+    private let sentDataBuffers: Mutex<[EncryptionLevel: Data]>
+
     /// Maximum buffer size per stream
     private let maxBufferSize: UInt64
 
@@ -24,15 +28,18 @@ public final class CryptoStreamManager: Sendable {
 
         var streams: [EncryptionLevel: CryptoStream] = [:]
         var offsets: [EncryptionLevel: UInt64] = [:]
+        var sentBuffers: [EncryptionLevel: Data] = [:]
 
         // Initialize for levels that use CRYPTO frames
         for level in [EncryptionLevel.initial, .handshake, .application] {
             streams[level] = CryptoStream(maxBufferSize: maxBufferSize)
             offsets[level] = 0
+            sentBuffers[level] = Data()
         }
 
         self.receiveStreams = Mutex(streams)
         self.sendOffsets = Mutex(offsets)
+        self.sentDataBuffers = Mutex(sentBuffers)
     }
 
     /// Receive a CRYPTO frame at the specified level
@@ -102,7 +109,15 @@ public final class CryptoStreamManager: Sendable {
         at level: EncryptionLevel,
         maxFrameSize: Int = 1200
     ) -> [CryptoFrame] {
-        sendOffsets.withLock { offsets in
+        // Store the sent data for potential Retry handling
+        sentDataBuffers.withLock { buffers in
+            if buffers[level] == nil {
+                buffers[level] = Data()
+            }
+            buffers[level]!.append(data)
+        }
+
+        return sendOffsets.withLock { offsets in
             var frames: [CryptoFrame] = []
             var remaining = data
             var offset = offsets[level] ?? 0
@@ -130,6 +145,19 @@ public final class CryptoStreamManager: Sendable {
         }
     }
 
+    /// Gets sent CRYPTO data for Retry packet handling
+    ///
+    /// RFC 9000 Section 8.1.2: After receiving a Retry packet, the client
+    /// needs to resend its Initial CRYPTO data with the retry token.
+    ///
+    /// - Parameter level: The encryption level
+    /// - Returns: All CRYPTO data that has been sent at this level
+    public func getDataForRetry(level: EncryptionLevel) -> Data {
+        sentDataBuffers.withLock { buffers in
+            buffers[level] ?? Data()
+        }
+    }
+
     /// Discards the stream for a level (e.g., when encryption level is discarded)
     /// - Parameter level: The encryption level to discard
     public func discardLevel(_ level: EncryptionLevel) {
@@ -138,6 +166,9 @@ public final class CryptoStreamManager: Sendable {
         }
         sendOffsets.withLock { offsets in
             offsets[level] = 0
+        }
+        sentDataBuffers.withLock { buffers in
+            buffers[level] = Data()
         }
     }
 }

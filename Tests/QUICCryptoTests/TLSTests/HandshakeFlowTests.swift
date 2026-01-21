@@ -10,6 +10,10 @@ import Foundation
 @Suite("Handshake Flow Tests")
 struct HandshakeFlowTests {
 
+    // Shared test keys for server certificate
+    private static let testSigningKey = SigningKey.generateP256()
+    private static let testCertificateChain = [Data([0x30, 0x82, 0x01, 0x00])]
+
     // MARK: - TLS13Handler Tests
 
     @Test("TLS13Handler initializes in client mode")
@@ -172,14 +176,17 @@ struct HandshakeFlowTests {
 
     @Test("TLS13Handler client-to-server data flow")
     func tls13HandlerDataFlow() async throws {
-        let clientConfig = TLSConfiguration.client(
+        var clientConfig = TLSConfiguration.client(
             serverName: "localhost",
             alpnProtocols: ["h3"]
         )
+        clientConfig.expectedPeerPublicKey = Self.testSigningKey.publicKeyBytes
         let clientHandler = TLS13Handler(configuration: clientConfig)
 
         var serverConfig = TLSConfiguration()
         serverConfig.alpnProtocols = ["h3"]
+        serverConfig.signingKey = Self.testSigningKey
+        serverConfig.certificateChain = Self.testCertificateChain
         let serverHandler = TLS13Handler(configuration: serverConfig)
 
         // Set transport parameters

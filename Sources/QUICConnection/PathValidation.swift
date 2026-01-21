@@ -295,7 +295,12 @@ public final class ConnectionIDManager: Sendable {
 
     /// Errors related to connection ID operations
     public enum ConnectionIDError: Error, Sendable {
+        /// Invalid connection ID length
         case invalidLength(Int)
+        /// Duplicate sequence number with different CID or token (RFC 9000 §5.1.1)
+        case duplicateSequenceNumber(sequenceNumber: UInt64)
+        /// Exceeded active_connection_id_limit
+        case exceededConnectionIDLimit(limit: UInt64, current: Int)
     }
 
     /// Gets all active (non-retired) issued CIDs
@@ -309,12 +314,38 @@ public final class ConnectionIDManager: Sendable {
 
     /// Processes a NEW_CONNECTION_ID frame from peer
     /// - Parameter frame: The received frame
-    public func handleNewConnectionID(_ frame: NewConnectionIDFrame) {
-        state.withLock { s in
-            // Retire CIDs as requested
+    /// - Throws: ConnectionIDError if validation fails
+    public func handleNewConnectionID(_ frame: NewConnectionIDFrame) throws {
+        try state.withLock { s in
+            // RFC 9000 §5.1.1: Check for duplicate sequence number
+            // If same sequence but different CID or token, it's a PROTOCOL_VIOLATION
+            if let existing = s.peerCIDs[frame.sequenceNumber] {
+                // If CID and token match exactly, just ignore the duplicate
+                if existing.connectionID == frame.connectionID &&
+                   existing.statelessResetToken == frame.statelessResetToken {
+                    return  // Ignore exact duplicate
+                }
+                // Different CID or token with same sequence = PROTOCOL_VIOLATION
+                throw ConnectionIDError.duplicateSequenceNumber(
+                    sequenceNumber: frame.sequenceNumber
+                )
+            }
+
+            // Retire CIDs as requested by retire_prior_to
             for seq in 0..<frame.retirePriorTo {
                 s.peerCIDs.removeValue(forKey: seq)
                 s.retiredSequences.insert(seq)
+            }
+
+            // RFC 9000 §5.1.1: Enforce active_connection_id_limit
+            // Count active (non-retired) CIDs
+            let activeCIDCount = s.peerCIDs.count
+            if activeCIDCount >= Int(activeConnectionIDLimit) {
+                // We're at or over the limit - peer is violating our limit
+                throw ConnectionIDError.exceededConnectionIDLimit(
+                    limit: activeConnectionIDLimit,
+                    current: activeCIDCount + 1  // +1 for the new CID they're trying to add
+                )
             }
 
             // Store new CID

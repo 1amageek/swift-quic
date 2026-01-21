@@ -177,13 +177,16 @@ public final class PacketProcessor: Sendable {
         }
 
         let firstByte = data[data.startIndex]
-        let isLongHeader = PacketHeader.isLongHeader(firstByte: firstByte)
+        let isLongHeader = (firstByte & 0x80) != 0
 
+        // Determine encryption level from protected header
+        // For long headers, packet type (bits 5-4) is NOT protected, so we can read it safely
+        // For short headers, it's always application level
         let level: EncryptionLevel
         if isLongHeader {
-            // Parse header to get packet type
-            let (header, _) = try PacketHeader.parse(from: data)
-            level = header.packetType.encryptionLevel
+            // Parse protected header to get packet type (no validation of protected bits)
+            let (protectedHeader, _) = try ProtectedPacketHeader.parse(from: data)
+            level = protectedHeader.encryptionLevel
         } else {
             level = .application
         }
@@ -200,7 +203,7 @@ public final class PacketProcessor: Sendable {
         // Get DCID length (lock-free)
         let dcid = dcidLengthValue
 
-        // Decode packet
+        // Decode packet (validation happens inside, after HP removal)
         let parsed = try decoder.decodePacket(
             data: data,
             dcidLength: dcid,
@@ -371,7 +374,7 @@ public final class PacketProcessor: Sendable {
 
         let firstByte = data[data.startIndex]
 
-        if PacketHeader.isLongHeader(firstByte: firstByte) {
+        if (firstByte & 0x80) != 0 {
             // Long header: use fast path extraction
             return try extractLongHeaderDCIDFast(from: data)
         } else {
@@ -426,7 +429,7 @@ public final class PacketProcessor: Sendable {
 
         let firstByte = data[data.startIndex]
 
-        if PacketHeader.isLongHeader(firstByte: firstByte) {
+        if (firstByte & 0x80) != 0 {
             // Check for version negotiation first
             guard data.count >= 5 else {
                 throw PacketCodecError.insufficientData
@@ -480,7 +483,7 @@ public final class PacketProcessor: Sendable {
         let startIndex = data.startIndex
         let firstByte = data[startIndex]
 
-        if PacketHeader.isLongHeader(firstByte: firstByte) {
+        if (firstByte & 0x80) != 0 {
             return try extractLongHeaderInfo(from: data, firstByte: firstByte)
         } else {
             // Short header: 1-RTT packet

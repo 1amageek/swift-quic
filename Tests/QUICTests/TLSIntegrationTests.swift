@@ -242,10 +242,11 @@ struct TLSIntegrationTests {
         let originalDCID = ConnectionID.random(length: 8)!
 
         // Create client with h3 ALPN
-        let clientConfig = TLSConfiguration.client(
+        var clientConfig = TLSConfiguration.client(
             serverName: "localhost",
             alpnProtocols: ["h3", "h3-29"]
         )
+        clientConfig.expectedPeerPublicKey = Self.serverSigningKey.publicKeyBytes
         let clientTLS = TLS13Handler(configuration: clientConfig)
         let clientParams = TransportParameters(
             from: QUICConfiguration(),
@@ -264,6 +265,8 @@ struct TLSIntegrationTests {
         // Create server with h3 ALPN
         var serverConfig = TLSConfiguration()
         serverConfig.alpnProtocols = ["h3"]
+        serverConfig.signingKey = Self.serverSigningKey
+        serverConfig.certificateChain = Self.serverCertificateChain
         let serverTLS = TLS13Handler(configuration: serverConfig)
         let serverParams = TransportParameters(
             from: QUICConfiguration(),
@@ -393,14 +396,17 @@ struct TLSIntegrationTests {
     @Test("Key update after handshake", .timeLimit(.minutes(1)))
     func keyUpdateAfterHandshake() async throws {
         // Create TLS handlers directly
-        let clientConfig = TLSConfiguration.client(
+        var clientConfig = TLSConfiguration.client(
             serverName: "localhost",
             alpnProtocols: ["h3"]
         )
+        clientConfig.expectedPeerPublicKey = Self.serverSigningKey.publicKeyBytes
         let clientTLS = TLS13Handler(configuration: clientConfig)
 
         var serverConfig = TLSConfiguration()
         serverConfig.alpnProtocols = ["h3"]
+        serverConfig.signingKey = Self.serverSigningKey
+        serverConfig.certificateChain = Self.serverCertificateChain
         let serverTLS = TLS13Handler(configuration: serverConfig)
 
         // Set transport parameters
@@ -474,20 +480,28 @@ struct TLSIntegrationTests {
 @Suite("TLS13Handler Direct Tests")
 struct TLS13HandlerDirectTests {
 
+    /// Shared server signing key for direct TLS tests
+    private static let directTestSigningKey = SigningKey.generateP256()
+    /// Mock certificate chain for direct TLS tests
+    private static let directTestCertificateChain = [Data([0x30, 0x82, 0x01, 0x00])]
+
     @Test("Client and server complete handshake directly")
     func directHandshakeCompletion() async throws {
         // This test verifies the TLS layer directly without QUIC packet framing.
         // It tests the message flow: ClientHello -> ServerHello + EE + Finished -> client Finished
 
         // Create handlers with matching configs
-        let clientConfig = TLSConfiguration.client(
+        var clientConfig = TLSConfiguration.client(
             serverName: "localhost",
             alpnProtocols: ["h3"]
         )
+        clientConfig.expectedPeerPublicKey = Self.directTestSigningKey.publicKeyBytes
         let clientHandler = TLS13Handler(configuration: clientConfig)
 
         var serverConfig = TLSConfiguration()
         serverConfig.alpnProtocols = ["h3"]
+        serverConfig.signingKey = Self.directTestSigningKey
+        serverConfig.certificateChain = Self.directTestCertificateChain
         let serverHandler = TLS13Handler(configuration: serverConfig)
 
         // Set transport parameters
@@ -982,6 +996,8 @@ struct TLS13HandlerDirectTests {
         var serverConfig = TLSConfiguration()
         serverConfig.alpnProtocols = ["h3"]
         serverConfig.supportedGroups = [.x25519]
+        serverConfig.signingKey = Self.directTestSigningKey
+        serverConfig.certificateChain = Self.directTestCertificateChain
         let serverHandler = TLS13Handler(configuration: serverConfig)
 
         // Set transport parameters

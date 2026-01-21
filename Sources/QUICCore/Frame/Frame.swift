@@ -166,4 +166,39 @@ public enum Frame: Sendable, Hashable {
     public var isAckEliciting: Bool {
         frameType.isAckEliciting
     }
+
+    /// Validates if this frame is allowed at the given encryption level
+    ///
+    /// RFC 9000 Section 12.4 specifies frame types allowed at each level:
+    /// - Initial: PADDING, PING, ACK, CRYPTO, CONNECTION_CLOSE
+    /// - Handshake: PADDING, PING, ACK, CRYPTO, CONNECTION_CLOSE
+    /// - 0-RTT: All frames EXCEPT ACK, CRYPTO, HANDSHAKE_DONE, NEW_TOKEN, PATH_RESPONSE
+    /// - 1-RTT (Application): All frames
+    ///
+    /// - Parameter level: The encryption level
+    /// - Returns: `true` if the frame is valid at this level
+    public func isValid(at level: EncryptionLevel) -> Bool {
+        switch level {
+        case .initial:
+            return frameType.validInInitial
+        case .handshake:
+            return frameType.validInHandshake
+        case .zeroRTT:
+            // RFC 9000 §12.4: 0-RTT packets cannot contain:
+            // - ACK frames (would require decrypting 0-RTT packets first)
+            // - CRYPTO frames (0-RTT doesn't carry handshake data)
+            // - HANDSHAKE_DONE (server-only, post-handshake)
+            // - NEW_TOKEN (server-only, post-handshake)
+            // - PATH_RESPONSE (requires path validation, not possible in 0-RTT)
+            switch frameType {
+            case .ack, .ackECN, .crypto, .handshakeDone, .newToken, .pathResponse:
+                return false
+            default:
+                return true
+            }
+        case .application:
+            // All frames are valid at 1-RTT level
+            return true
+        }
+    }
 }

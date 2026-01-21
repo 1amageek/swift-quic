@@ -284,90 +284,101 @@ public struct ShortHeader: Sendable, Hashable {
         self.packetNumber = packetNumber
         self.packetNumberLength = packetNumberLength
     }
+
+    /// Creates a short header from parsed data (preserves original firstByte for validation)
+    /// - Parameters:
+    ///   - firstByte: The raw first byte from the packet (for validation)
+    ///   - destinationConnectionID: The destination connection ID
+    ///   - packetNumber: The packet number (0 if not yet decrypted)
+    ///   - packetNumberLength: The length of the packet number field (1-4 bytes)
+    internal init(
+        firstByte: UInt8,
+        destinationConnectionID: ConnectionID,
+        packetNumber: UInt64,
+        packetNumberLength: Int
+    ) {
+        self.firstByte = firstByte
+        self.destinationConnectionID = destinationConnectionID
+        self.packetNumber = packetNumber
+        self.packetNumberLength = packetNumberLength
+    }
 }
 
-// MARK: - Header Parsing
+// MARK: - Protected Long Header
 
-extension PacketHeader {
-    /// Errors that can occur during header parsing
+/// A protected long header (before header protection removal)
+///
+/// This type represents a long header that has been parsed from a protected packet.
+/// The `protectedFirstByte` contains bits that have been XORed with a mask and
+/// cannot be reliably validated until header protection is removed.
+///
+/// Use `unprotect()` after calling `removeHeaderProtection()` to create a
+/// validated `LongHeader`.
+public struct ProtectedLongHeader: Sendable, Hashable {
+    /// The protected first byte (contains XORed bits)
+    public let protectedFirstByte: UInt8
+
+    /// QUIC version
+    public let version: QUICVersion
+
+    /// Destination connection ID
+    public let destinationConnectionID: ConnectionID
+
+    /// Source connection ID
+    public let sourceConnectionID: ConnectionID
+
+    /// Token (for Initial and Retry packets)
+    public let token: Data?
+
+    /// Retry Integrity Tag (16 bytes, for Retry packets only)
+    public let retryIntegrityTag: Data?
+
+    /// Length field value (for Initial, Handshake, 0-RTT)
+    public let length: UInt64?
+
+    /// The packet type derived from the first byte
+    /// Note: Bits 5-4 are NOT protected, so this is reliable
+    public var packetType: LongPacketType {
+        if version.isNegotiation {
+            return .versionNegotiation
+        }
+        let typeValue = (protectedFirstByte >> 4) & 0x03
+        return LongPacketType(rawValue: typeValue) ?? .initial
+    }
+
+    /// Whether this packet type has a packet number
+    public var hasPacketNumber: Bool {
+        switch packetType {
+        case .initial, .zeroRTT, .handshake:
+            return true
+        case .retry, .versionNegotiation:
+            return false
+        }
+    }
+
+    /// Errors that can occur during parsing
     public enum ParseError: Error, Sendable {
         case insufficientData
         case invalidHeader
-        case unsupportedVersion(UInt32)
-        case validationFailed(HeaderValidationError)
     }
 
-    /// Determines if a packet has a long header by checking the first byte
-    public static func isLongHeader(firstByte: UInt8) -> Bool {
-        (firstByte & 0x80) != 0
-    }
-
-    /// Parses a packet header from data with optional validation
+    /// Parses a protected long header from data
     ///
-    /// - Parameters:
-    ///   - data: The packet data
-    ///   - dcidLength: For short headers, the expected DCID length (from connection state)
-    ///   - validate: Whether to validate the header after parsing (default: true)
-    ///   - strictValidation: Whether to check reserved bits (default: false)
-    /// - Returns: The parsed header and the number of bytes consumed
-    /// - Throws: ParseError if parsing or validation fails
-    ///
-    /// When `validate` is true (the default), the header is checked for:
-    /// - Fixed bit must be set to 1 (RFC 9000)
-    /// - Retry packets must have integrity tag (RFC 9001)
-    ///
-    /// When `strictValidation` is also true:
-    /// - Reserved bits must be zero
-    public static func parse(
-        from data: Data,
-        dcidLength: Int = 0,
-        validate: Bool = true,
-        strictValidation: Bool = false
-    ) throws -> (header: PacketHeader, headerLength: Int) {
+    /// This method only extracts header fields without validation of protected bits.
+    /// - Parameter data: The packet data
+    /// - Returns: The parsed protected header and the number of bytes consumed
+    public static func parse(from data: Data) throws -> (ProtectedLongHeader, Int) {
         var reader = DataReader(data)
+        let startPosition = reader.currentPosition
 
         guard let firstByte = reader.readByte() else {
             throw ParseError.insufficientData
         }
 
-        if isLongHeader(firstByte: firstByte) {
-            let (header, length) = try parseLongHeader(firstByte: firstByte, reader: &reader)
-
-            // Validate if requested
-            if validate {
-                do {
-                    try header.validate(strict: strictValidation)
-                } catch let error as HeaderValidationError {
-                    throw ParseError.validationFailed(error)
-                }
-            }
-
-            return (.long(header), length)
-        } else {
-            let (header, length) = try parseShortHeader(
-                firstByte: firstByte,
-                reader: &reader,
-                dcidLength: dcidLength
-            )
-
-            // Validate if requested
-            if validate {
-                do {
-                    try header.validate(strict: strictValidation)
-                } catch let error as HeaderValidationError {
-                    throw ParseError.validationFailed(error)
-                }
-            }
-
-            return (.short(header), length)
+        // Verify this is a long header
+        guard (firstByte & 0x80) != 0 else {
+            throw ParseError.invalidHeader
         }
-    }
-
-    private static func parseLongHeader(
-        firstByte: UInt8,
-        reader: inout DataReader
-    ) throws -> (LongHeader, Int) {
-        let startPosition = reader.currentPosition
 
         // Read version
         guard let version = QUICVersion.decode(from: &reader) else {
@@ -384,18 +395,19 @@ extension PacketHeader {
         var token: Data?
         var retryIntegrityTag: Data?
         var length: UInt64?
-        let packetNumber: UInt64 = 0  // Packet number is protected, decoded later
-        var packetNumberLength = Int((firstByte & 0x03) + 1)
 
         if version.isNegotiation {
             // Version Negotiation packet - no additional fields to parse here
-            let header = LongHeader(
-                packetType: .versionNegotiation,
+            let header = ProtectedLongHeader(
+                protectedFirstByte: firstByte,
                 version: version,
                 destinationConnectionID: dcid,
-                sourceConnectionID: scid
+                sourceConnectionID: scid,
+                token: nil,
+                retryIntegrityTag: nil,
+                length: nil
             )
-            return (header, 1 + reader.currentPosition - startPosition)
+            return (header, reader.currentPosition - startPosition)
         }
 
         let packetType = (firstByte >> 4) & 0x03
@@ -403,7 +415,6 @@ extension PacketHeader {
         switch packetType {
         case 0x00:  // Initial
             // Read token length and token
-            // Use readVarintValue() directly to avoid Varint object creation
             let tokenLengthValue = try reader.readVarintValue()
             if tokenLengthValue > 0 {
                 let safeTokenLength = try SafeConversions.toInt(
@@ -416,85 +427,259 @@ extension PacketHeader {
                 }
                 token = tokenData
             }
-            // Read Length field (packet number + payload length)
+            // Read Length field
             length = try reader.readVarintValue()
 
         case 0x01:  // 0-RTT
-            // Read Length field
             length = try reader.readVarintValue()
 
         case 0x02:  // Handshake
-            // Read Length field
             length = try reader.readVarintValue()
 
         case 0x03:  // Retry
-            // Retry packets have no packet number or length field
-            packetNumberLength = 0
             // RFC 9001 Section 5.8: Retry Token + 16-byte Retry Integrity Tag
-            // The remaining data after SCID contains both
             let remainingCount = reader.remainingCount
             if remainingCount >= ProtocolLimits.retryIntegrityTagLength {
-                // Safe subtraction: remainingCount >= 16 is verified above
                 let retryTokenLength = remainingCount - ProtocolLimits.retryIntegrityTagLength
                 if retryTokenLength > 0 {
                     token = reader.readBytes(retryTokenLength)
                 }
                 retryIntegrityTag = reader.readBytes(ProtocolLimits.retryIntegrityTagLength)
             }
-            // Note: If remainingCount < 16, the packet is malformed,
-            // but we allow parsing to complete and let validation catch it
 
         default:
             break
         }
 
-        // Determine the actual packet type for header creation
+        let header = ProtectedLongHeader(
+            protectedFirstByte: firstByte,
+            version: version,
+            destinationConnectionID: dcid,
+            sourceConnectionID: scid,
+            token: token,
+            retryIntegrityTag: retryIntegrityTag,
+            length: length
+        )
+
+        return (header, reader.currentPosition - startPosition)
+    }
+
+    /// Creates a validated LongHeader after header protection removal
+    ///
+    /// This method validates the unprotected first byte and creates a `LongHeader`.
+    /// - Parameters:
+    ///   - unprotectedFirstByte: The first byte after header protection removal
+    ///   - packetNumber: The decoded packet number
+    ///   - packetNumberLength: The length of the packet number field (1-4)
+    /// - Returns: A validated `LongHeader`
+    /// - Throws: `HeaderValidationError` if validation fails
+    public func unprotect(
+        unprotectedFirstByte: UInt8,
+        packetNumber: UInt64,
+        packetNumberLength: Int
+    ) throws -> LongHeader {
+        // Determine packet type from protected bits (bits 5-4 are not protected)
         let actualPacketType: PacketType
         switch packetType {
-        case 0x00: actualPacketType = .initial
-        case 0x01: actualPacketType = .zeroRTT
-        case 0x02: actualPacketType = .handshake
-        case 0x03: actualPacketType = .retry
-        default: actualPacketType = .initial
+        case .initial: actualPacketType = .initial
+        case .zeroRTT: actualPacketType = .zeroRTT
+        case .handshake: actualPacketType = .handshake
+        case .retry: actualPacketType = .retry
+        case .versionNegotiation: actualPacketType = .versionNegotiation
         }
 
         var header = LongHeader(
             packetType: actualPacketType,
             version: version,
-            destinationConnectionID: dcid,
-            sourceConnectionID: scid,
+            destinationConnectionID: destinationConnectionID,
+            sourceConnectionID: sourceConnectionID,
             token: token,
             retryIntegrityTag: retryIntegrityTag,
             length: length,
             packetNumber: packetNumber,
             packetNumberLength: packetNumberLength
         )
-        header.firstByte = firstByte
+        header.firstByte = unprotectedFirstByte
 
-        return (header, 1 + reader.currentPosition - startPosition)
+        // Validate with strict checking (reserved bits must be zero)
+        try header.validate(strict: true)
+
+        return header
+    }
+}
+
+// MARK: - Long Packet Type
+
+/// Long header packet type (RFC 9000 Section 17.2)
+public enum LongPacketType: UInt8, Sendable, Hashable {
+    case initial = 0x00
+    case zeroRTT = 0x01
+    case handshake = 0x02
+    case retry = 0x03
+    case versionNegotiation = 0xFF  // Special value, determined by version = 0
+
+    /// The encryption level for this packet type
+    public var encryptionLevel: EncryptionLevel {
+        switch self {
+        case .initial, .retry, .versionNegotiation:
+            return .initial
+        case .zeroRTT:
+            return .zeroRTT
+        case .handshake:
+            return .handshake
+        }
+    }
+}
+
+// MARK: - Protected Short Header
+
+/// A protected short header (before header protection removal)
+///
+/// This type represents a short header that has been parsed from a protected packet.
+/// For short headers, even the Fixed bit is protected, so no validation can occur
+/// until header protection is removed.
+///
+/// Use `unprotect()` after calling `removeHeaderProtection()` to create a
+/// validated `ShortHeader`.
+public struct ProtectedShortHeader: Sendable, Hashable {
+    /// The protected first byte (contains XORed bits)
+    public let protectedFirstByte: UInt8
+
+    /// Destination connection ID
+    public let destinationConnectionID: ConnectionID
+
+    /// Errors that can occur during parsing
+    public enum ParseError: Error, Sendable {
+        case insufficientData
+        case invalidHeader
     }
 
-    private static func parseShortHeader(
-        firstByte: UInt8,
-        reader: inout DataReader,
-        dcidLength: Int
-    ) throws -> (ShortHeader, Int) {
+    /// Parses a protected short header from data
+    ///
+    /// This method only extracts header fields without validation.
+    /// - Parameters:
+    ///   - data: The packet data
+    ///   - dcidLength: The expected DCID length (from connection state)
+    /// - Returns: The parsed protected header and the number of bytes consumed
+    public static func parse(from data: Data, dcidLength: Int) throws -> (ProtectedShortHeader, Int) {
+        var reader = DataReader(data)
+
+        guard let firstByte = reader.readByte() else {
+            throw ParseError.insufficientData
+        }
+
+        // Verify this is a short header
+        guard (firstByte & 0x80) == 0 else {
+            throw ParseError.invalidHeader
+        }
+
         // Read DCID (length is known from connection state)
         let dcid = try ConnectionID.decodeBytes(from: &reader, length: dcidLength)
 
-        let packetNumberLength = Int((firstByte & 0x03) + 1)
-
-        let header = ShortHeader(
-            destinationConnectionID: dcid,
-            packetNumber: 0,  // Will be decrypted later
-            packetNumberLength: packetNumberLength,
-            spinBit: (firstByte & 0x20) != 0,
-            keyPhase: (firstByte & 0x04) != 0
+        let header = ProtectedShortHeader(
+            protectedFirstByte: firstByte,
+            destinationConnectionID: dcid
         )
 
         // Header length = 1 (first byte) + dcidLength
-        // Packet number comes after but is protected
         return (header, 1 + dcidLength)
+    }
+
+    /// Creates a validated ShortHeader after header protection removal
+    ///
+    /// This method validates the unprotected first byte and creates a `ShortHeader`.
+    /// - Parameters:
+    ///   - unprotectedFirstByte: The first byte after header protection removal
+    ///   - packetNumber: The decoded packet number
+    ///   - packetNumberLength: The length of the packet number field (1-4)
+    /// - Returns: A validated `ShortHeader`
+    /// - Throws: `HeaderValidationError` if validation fails
+    public func unprotect(
+        unprotectedFirstByte: UInt8,
+        packetNumber: UInt64,
+        packetNumberLength: Int
+    ) throws -> ShortHeader {
+        // Use internal initializer to preserve the unprotected firstByte
+        let header = ShortHeader(
+            firstByte: unprotectedFirstByte,
+            destinationConnectionID: destinationConnectionID,
+            packetNumber: packetNumber,
+            packetNumberLength: packetNumberLength
+        )
+
+        // Validate with strict checking (fixed bit and reserved bits)
+        try header.validate(strict: true)
+
+        return header
+    }
+}
+
+// MARK: - Protected Packet Header
+
+/// A protected packet header (either long or short form)
+///
+/// This is a union type for protected headers before header protection removal.
+public enum ProtectedPacketHeader: Sendable, Hashable {
+    case long(ProtectedLongHeader)
+    case short(ProtectedShortHeader)
+
+    /// Errors that can occur during parsing
+    public enum ParseError: Error, Sendable {
+        case insufficientData
+        case invalidHeader
+    }
+
+    /// Parses a protected packet header from data
+    ///
+    /// This method automatically determines whether the packet has a long or short header.
+    /// - Parameters:
+    ///   - data: The packet data
+    ///   - dcidLength: For short headers, the expected DCID length (from connection state)
+    /// - Returns: The parsed protected header and the number of bytes consumed
+    public static func parse(from data: Data, dcidLength: Int = 0) throws -> (ProtectedPacketHeader, Int) {
+        guard !data.isEmpty else {
+            throw ParseError.insufficientData
+        }
+
+        let firstByte = data[data.startIndex]
+        let isLongHeader = (firstByte & 0x80) != 0
+
+        if isLongHeader {
+            let (header, length) = try ProtectedLongHeader.parse(from: data)
+            return (.long(header), length)
+        } else {
+            let (header, length) = try ProtectedShortHeader.parse(from: data, dcidLength: dcidLength)
+            return (.short(header), length)
+        }
+    }
+
+    /// The encryption level for this packet
+    ///
+    /// For long headers, this is derived from the packet type (bits 5-4, not protected).
+    /// For short headers, this is always `.application`.
+    public var encryptionLevel: EncryptionLevel {
+        switch self {
+        case .long(let header):
+            return header.packetType.encryptionLevel
+        case .short:
+            return .application
+        }
+    }
+
+    /// The destination connection ID
+    public var destinationConnectionID: ConnectionID {
+        switch self {
+        case .long(let header):
+            return header.destinationConnectionID
+        case .short(let header):
+            return header.destinationConnectionID
+        }
+    }
+
+    /// Whether this is a long header packet
+    public var isLongHeader: Bool {
+        if case .long = self { return true }
+        return false
     }
 }
 

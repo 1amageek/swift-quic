@@ -360,7 +360,7 @@ public struct PacketDecoder: Sendable {
         }
 
         let firstByte = data[data.startIndex]
-        let isLongHeader = PacketHeader.isLongHeader(firstByte: firstByte)
+        let isLongHeader = (firstByte & 0x80) != 0
 
         if isLongHeader {
             return try decodeLongHeaderPacket(data: data, opener: opener, largestPN: largestPN)
@@ -375,23 +375,48 @@ public struct PacketDecoder: Sendable {
         opener: (any PacketOpenerProtocol)?,
         largestPN: UInt64
     ) throws -> ParsedPacket {
-        // Parse header (without decryption)
-        let (header, headerLength) = try PacketHeader.parse(from: data, dcidLength: 0)
-
-        guard case .long(var longHeader) = header else {
-            throw PacketCodecError.invalidPacketFormat("Expected long header")
-        }
+        // Step 1: Parse protected header (no validation of protected bits)
+        let (protectedHeader, headerLength) = try ProtectedLongHeader.parse(from: data)
 
         // Handle special packets without encryption
-        if longHeader.packetType == .versionNegotiation || longHeader.packetType == .retry {
-            return try decodeUnprotectedPacket(data: data, header: header, headerLength: headerLength)
+        if protectedHeader.packetType == .versionNegotiation || protectedHeader.packetType == .retry {
+            // For unprotected packets, create header directly
+            let actualPacketType: PacketType
+            switch protectedHeader.packetType {
+            case .initial: actualPacketType = .initial
+            case .zeroRTT: actualPacketType = .zeroRTT
+            case .handshake: actualPacketType = .handshake
+            case .retry: actualPacketType = .retry
+            case .versionNegotiation: actualPacketType = .versionNegotiation
+            }
+
+            var header = LongHeader(
+                packetType: actualPacketType,
+                version: protectedHeader.version,
+                destinationConnectionID: protectedHeader.destinationConnectionID,
+                sourceConnectionID: protectedHeader.sourceConnectionID,
+                token: protectedHeader.token,
+                retryIntegrityTag: protectedHeader.retryIntegrityTag,
+                length: protectedHeader.length,
+                packetNumber: 0,
+                packetNumberLength: 0
+            )
+            header.firstByte = protectedHeader.protectedFirstByte
+
+            return ParsedPacket(
+                header: .long(header),
+                packetNumber: 0,
+                frames: [],
+                encryptionLevel: .initial,
+                packetSize: data.count
+            )
         }
 
         guard let opener = opener else {
             throw PacketCodecError.noOpener
         }
 
-        // Calculate offsets
+        // Step 2: Calculate offsets and extract sample
         let pnOffset = headerLength
         let sampleOffset = pnOffset + 4  // Sample starts 4 bytes after PN offset (RFC 9001 5.4.2)
 
@@ -405,21 +430,19 @@ public struct PacketDecoder: Sendable {
         let protectedPNBytesEnd = min(data.startIndex + pnOffset + maxPNLength, data.endIndex)
         let protectedPNBytes = data[(data.startIndex + pnOffset)..<protectedPNBytesEnd]
 
-        // Extract sample and protected first byte
+        // Extract sample
         let sample = data[(data.startIndex + sampleOffset)..<(data.startIndex + sampleOffset + 16)]
-        let protectedFirstByte = data[data.startIndex]
 
-        // Remove header protection (slices are already Data, no copy needed)
+        // Step 3: Remove header protection
         let (unprotectedFirstByte, unprotectedPNBytes) = try opener.removeHeaderProtection(
             sample: sample,
-            firstByte: protectedFirstByte,
+            firstByte: protectedHeader.protectedFirstByte,
             packetNumberBytes: protectedPNBytes
         )
 
-        // NOW we can get the actual packet number length from unprotected first byte
+        // Step 4: Decode packet number
         let actualPNLength = Int((unprotectedFirstByte & 0x03) + 1)
 
-        // Decode packet number using only the actual bytes needed
         var truncatedPN: UInt64 = 0
         for i in 0..<actualPNLength {
             truncatedPN = (truncatedPN << 8) | UInt64(unprotectedPNBytes[unprotectedPNBytes.startIndex + i])
@@ -430,19 +453,23 @@ public struct PacketDecoder: Sendable {
             largestPN: largestPN
         )
 
-        // Build AAD (header with unprotected first byte + actual PN bytes)
+        // Step 5: Create validated header (validation happens here, AFTER HP removal)
+        let longHeader = try protectedHeader.unprotect(
+            unprotectedFirstByte: unprotectedFirstByte,
+            packetNumber: packetNumber,
+            packetNumberLength: actualPNLength
+        )
+
+        // Step 6: Build AAD and decrypt payload
         var aad = Data()
         aad.append(unprotectedFirstByte)
         aad.append(data[(data.startIndex + 1)..<(data.startIndex + pnOffset)])
         aad.append(unprotectedPNBytes.prefix(actualPNLength))
 
         // RFC 9000 Section 17.2: Use Length field to determine ciphertext boundary
-        // Length = PN length + encrypted payload length (including AEAD tag)
         let ciphertextStart = data.startIndex + pnOffset + actualPNLength
         let ciphertextEnd: Data.Index
-        if let lengthValue = longHeader.length {
-            // Length field specifies: PN bytes + encrypted payload
-            // Safe conversion: validate lengthValue fits in Int and doesn't underflow
+        if let lengthValue = protectedHeader.length {
             let safeLengthValue = try SafeConversions.toInt(
                 lengthValue,
                 maxAllowed: ProtocolLimits.maxLongHeaderLength,
@@ -456,7 +483,6 @@ public struct PacketDecoder: Sendable {
                 )
             }
         } else {
-            // Fallback for packets without Length field (shouldn't happen for Initial/Handshake/0-RTT)
             ciphertextEnd = data.endIndex
         }
         let ciphertext = data[ciphertextStart..<ciphertextEnd]
@@ -468,13 +494,8 @@ public struct PacketDecoder: Sendable {
             header: aad
         )
 
-        // Decode frames
+        // Step 7: Decode frames
         let frames = try frameCodec.decodeFrames(from: plaintext)
-
-        // Update header with decoded values
-        longHeader.firstByte = unprotectedFirstByte
-        longHeader.packetNumber = packetNumber
-        longHeader.packetNumberLength = actualPNLength
 
         // Calculate actual packet size (header + PN + ciphertext)
         let actualPacketSize = pnOffset + actualPNLength + ciphertext.count
@@ -499,14 +520,14 @@ public struct PacketDecoder: Sendable {
             throw PacketCodecError.noOpener
         }
 
-        // Short header: 1 byte + DCID
-        let headerLength = 1 + dcidLength
+        // Step 1: Parse protected header (no validation of protected bits)
+        let (protectedHeader, headerLength) = try ProtectedShortHeader.parse(from: data, dcidLength: dcidLength)
 
         guard data.count >= headerLength + 4 + 16 else {  // header + max PN (4) + sample (16)
             throw PacketCodecError.insufficientData
         }
 
-        // Calculate offsets
+        // Step 2: Calculate offsets and extract sample
         let pnOffset = headerLength
         let sampleOffset = pnOffset + 4  // Sample starts 4 bytes after PN offset (RFC 9001 5.4.2)
 
@@ -515,26 +536,23 @@ public struct PacketDecoder: Sendable {
         }
 
         // RFC 9001 Section 5.4.1: ALWAYS read 4 PN bytes before header protection removal
-        // We cannot know the actual PN length until after unmasking the first byte
         let maxPNLength = 4
         let protectedPNBytesEnd = min(data.startIndex + pnOffset + maxPNLength, data.endIndex)
         let protectedPNBytes = data[(data.startIndex + pnOffset)..<protectedPNBytesEnd]
 
-        // Extract sample and protected first byte
+        // Extract sample
         let sample = data[(data.startIndex + sampleOffset)..<(data.startIndex + sampleOffset + 16)]
-        let protectedFirstByte = data[data.startIndex]
 
-        // Remove header protection (slices are already Data, no copy needed)
+        // Step 3: Remove header protection
         let (unprotectedFirstByte, unprotectedPNBytes) = try opener.removeHeaderProtection(
             sample: sample,
-            firstByte: protectedFirstByte,
+            firstByte: protectedHeader.protectedFirstByte,
             packetNumberBytes: protectedPNBytes
         )
 
-        // NOW we can get the actual packet number length from unprotected first byte
+        // Step 4: Decode packet number
         let actualPNLength = Int((unprotectedFirstByte & 0x03) + 1)
 
-        // Decode packet number using only the actual bytes needed
         var truncatedPN: UInt64 = 0
         for i in 0..<actualPNLength {
             truncatedPN = (truncatedPN << 8) | UInt64(unprotectedPNBytes[unprotectedPNBytes.startIndex + i])
@@ -545,15 +563,17 @@ public struct PacketDecoder: Sendable {
             largestPN: largestPN
         )
 
-        // Extract DCID
-        let dcidStart = data.startIndex + 1
-        let dcidBytes = data[dcidStart..<(dcidStart + dcidLength)]
-        let dcid = try ConnectionID(bytes: dcidBytes)  // Slice is already Data
+        // Step 5: Create validated header (validation happens here, AFTER HP removal)
+        let shortHeader = try protectedHeader.unprotect(
+            unprotectedFirstByte: unprotectedFirstByte,
+            packetNumber: packetNumber,
+            packetNumberLength: actualPNLength
+        )
 
-        // Build AAD
+        // Step 6: Build AAD and decrypt payload
         var aad = Data()
         aad.append(unprotectedFirstByte)
-        aad.append(dcidBytes)
+        aad.append(protectedHeader.destinationConnectionID.bytes)
         aad.append(unprotectedPNBytes.prefix(actualPNLength))
 
         // Get ciphertext (Short header packets have no Length field, consume rest of datagram)
@@ -567,17 +587,8 @@ public struct PacketDecoder: Sendable {
             header: aad
         )
 
-        // Decode frames
+        // Step 7: Decode frames
         let frames = try frameCodec.decodeFrames(from: plaintext)
-
-        // Build short header
-        let shortHeader = ShortHeader(
-            destinationConnectionID: dcid,
-            packetNumber: packetNumber,
-            packetNumberLength: actualPNLength,
-            spinBit: (unprotectedFirstByte & 0x20) != 0,
-            keyPhase: (unprotectedFirstByte & 0x04) != 0
-        )
 
         return ParsedPacket(
             header: .short(shortHeader),
@@ -588,26 +599,6 @@ public struct PacketDecoder: Sendable {
         )
     }
 
-    /// Decodes an unprotected packet (Version Negotiation, Retry)
-    private func decodeUnprotectedPacket(
-        data: Data,
-        header: PacketHeader,
-        headerLength: Int
-    ) throws -> ParsedPacket {
-        guard case .long = header else {
-            throw PacketCodecError.invalidPacketFormat("Expected long header")
-        }
-
-        // Version Negotiation and Retry don't have encrypted payloads
-        // They also don't carry frames in the normal sense
-        return ParsedPacket(
-            header: header,
-            packetNumber: 0,
-            frames: [],
-            encryptionLevel: .initial,
-            packetSize: data.count
-        )
-    }
 }
 
 // MARK: - Packet Size Utilities

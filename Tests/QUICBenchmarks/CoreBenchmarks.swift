@@ -241,7 +241,7 @@ struct CoreBenchmarks {
 
         let start = CFAbsoluteTimeGetCurrent()
         for _ in 0..<iterations {
-            _ = try PacketHeader.parse(from: packet)
+            _ = try ProtectedLongHeader.parse(from: packet)
         }
         let elapsed = CFAbsoluteTimeGetCurrent() - start
 
@@ -261,7 +261,7 @@ struct CoreBenchmarks {
 
         let start = CFAbsoluteTimeGetCurrent()
         for _ in 0..<iterations {
-            _ = try PacketHeader.parse(from: packet, dcidLength: 4)
+            _ = try ProtectedShortHeader.parse(from: packet, dcidLength: 4)
         }
         let elapsed = CFAbsoluteTimeGetCurrent() - start
 
