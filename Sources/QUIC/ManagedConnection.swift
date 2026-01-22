@@ -948,14 +948,6 @@ extension ManagedConnection: QUICConnectionProtocol {
         )
     }
 
-    public func acceptStream() async throws -> any QUICStreamProtocol {
-        // Wait for incoming stream via AsyncStream
-        for await stream in incomingStreams {
-            return stream
-        }
-        throw ManagedConnectionError.connectionClosed
-    }
-
     public var incomingStreams: AsyncStream<any QUICStreamProtocol> {
         incomingStreamState.withLock { state in
             // If shutdown, return existing finished stream or create a finished one

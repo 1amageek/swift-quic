@@ -24,10 +24,23 @@ public protocol QUICConnectionProtocol: Sendable {
     /// Opens a new unidirectional stream
     func openUniStream() async throws -> any QUICStreamProtocol
 
-    /// Accepts the next incoming stream
-    func acceptStream() async throws -> any QUICStreamProtocol
-
-    /// Stream of incoming streams
+    /// Stream of incoming streams from the remote peer.
+    ///
+    /// Use this to receive streams initiated by the remote peer.
+    ///
+    /// ## Usage
+    /// ```swift
+    /// // Process all incoming streams
+    /// for await stream in connection.incomingStreams {
+    ///     Task { await handleStream(stream) }
+    /// }
+    ///
+    /// // Accept a single stream
+    /// var iterator = connection.incomingStreams.makeAsyncIterator()
+    /// if let stream = await iterator.next() {
+    ///     // handle stream
+    /// }
+    /// ```
     var incomingStreams: AsyncStream<any QUICStreamProtocol> { get }
 
     /// Closes the connection

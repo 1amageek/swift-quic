@@ -415,25 +415,18 @@ struct ShutdownSafetyTests {
         )
     }
 
-    @Test("acceptStream() after shutdown() does not hang", .timeLimit(.minutes(1)))
-    func acceptStreamAfterShutdownDoesNotHang() async throws {
+    @Test("incomingStreams iterator after shutdown() returns nil", .timeLimit(.minutes(1)))
+    func incomingStreamsIteratorAfterShutdownReturnsNil() async throws {
         let connection = try createTestConnection()
         _ = try await connection.start()
 
         // Shutdown the connection
         connection.shutdown()
 
-        // acceptStream() should throw connectionClosed, NOT hang
-        do {
-            _ = try await connection.acceptStream()
-            Issue.record("Expected connectionClosed error")
-        } catch let error as ManagedConnectionError {
-            if case .connectionClosed = error {
-                // Expected
-            } else {
-                Issue.record("Expected connectionClosed but got \(error)")
-            }
-        }
+        // Iterator should return nil immediately, NOT hang
+        var iterator = connection.incomingStreams.makeAsyncIterator()
+        let stream = await iterator.next()
+        #expect(stream == nil, "Iterator should return nil after shutdown")
     }
 
     @Test("incomingStreams after shutdown() returns finished stream", .timeLimit(.minutes(1)))
@@ -492,25 +485,24 @@ struct ShutdownSafetyTests {
         }
     }
 
-    @Test("Multiple acceptStream() calls after shutdown() all complete", .timeLimit(.minutes(1)))
-    func multipleAcceptStreamAfterShutdown() async throws {
+    @Test("Multiple incomingStreams iterators after shutdown() all return nil", .timeLimit(.minutes(1)))
+    func multipleIncomingStreamsIteratorsAfterShutdown() async throws {
         let connection = try createTestConnection()
         _ = try await connection.start()
 
         // Shutdown the connection
         connection.shutdown()
 
-        // Multiple calls should all complete without hanging
-        var completedCount = 0
+        // Multiple iterators should all return nil without hanging
+        var nilCount = 0
         for _ in 0..<3 {
-            do {
-                _ = try await connection.acceptStream()
-            } catch {
-                completedCount += 1
+            var iterator = connection.incomingStreams.makeAsyncIterator()
+            if await iterator.next() == nil {
+                nilCount += 1
             }
         }
 
-        #expect(completedCount == 3, "All acceptStream calls should complete with error")
+        #expect(nilCount == 3, "All iterators should return nil after shutdown")
     }
 
     @Test("shutdown() resumes waiting readers", .timeLimit(.minutes(1)))
