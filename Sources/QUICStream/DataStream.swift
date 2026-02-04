@@ -384,6 +384,11 @@ public final class DataStream: Sendable {
             let pending = `internal`.sendBuffer.count - `internal`.sendBufferConsumed
             guard pending > 0 || (`internal`.finQueued && !`internal`.state.finSent) else { return [] }
 
+            let sendMaxData = `internal`.state.sendMaxData
+            let sendOffset = `internal`.state.sendOffset
+            let availableWindow = sendMaxData > sendOffset ? sendMaxData - sendOffset : 0
+            print("[DataStream \(id)] generateFrames: pending=\(pending), sendMaxData=\(sendMaxData), sendOffset=\(sendOffset), availableWindow=\(availableWindow)")
+
             var frames: [StreamFrame] = []
             var remainingBytes = maxBytes
 

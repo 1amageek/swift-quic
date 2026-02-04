@@ -240,6 +240,7 @@ public final class QUICConnectionHandler: Sendable {
                 result.connectionClosed = true
 
             case .handshakeDone:
+                print("[QUICConnectionHandler] Received HANDSHAKE_DONE frame")
                 processHandshakeDone()
                 result.handshakeComplete = true
 
@@ -302,6 +303,7 @@ public final class QUICConnectionHandler: Sendable {
                 result.pathResponseData.append(data)
 
             case .newConnectionID(let frame):
+                print("[QUICConnectionHandler] Received NEW_CONNECTION_ID: CID=\(frame.connectionID), seq=\(frame.sequenceNumber), retirePriorTo=\(frame.retirePriorTo)")
                 // Process using ConnectionIDManager
                 // RFC 9000 §5.1.1: Validates duplicate sequence numbers and limit
                 try connectionIDManager.handleNewConnectionID(frame)
@@ -599,6 +601,7 @@ public final class QUICConnectionHandler: Sendable {
     /// Queues CRYPTO frames to be sent
     public func queueCryptoData(_ data: Data, level: EncryptionLevel) {
         let frames = cryptoStreamManager.createFrames(for: data, at: level)
+        print("[QUICConnectionHandler] Queueing \(frames.count) CRYPTO frames (\(data.count) bytes) at \(level)")
         for frame in frames {
             queueFrame(.crypto(frame), level: level)
         }

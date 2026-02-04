@@ -104,6 +104,9 @@ public final class ConnectionRouter: Sendable {
         }
 
         // No existing connection found
+        print("[ConnectionRouter] Connection not found for DCID: \(dcid)")
+        print("[ConnectionRouter] Registered DCIDs: \(connections.withLock { Array($0.keys) })")
+
         // For servers, Initial packets create new connections
         if isServer && packetType == .initial {
             // Note: length 8 is always valid (0-20), so random() always succeeds
@@ -131,6 +134,7 @@ public final class ConnectionRouter: Sendable {
     ///   - connection: The connection to register
     ///   - connectionIDs: The connection IDs to associate with this connection
     public func register(_ connection: ManagedConnection, for connectionIDs: [ConnectionID]) {
+        print("[ConnectionRouter] Registering connection for CIDs: \(connectionIDs)")
         let connID = ObjectIdentifier(connection)
         connections.withLock { conns in
             for cid in connectionIDs {

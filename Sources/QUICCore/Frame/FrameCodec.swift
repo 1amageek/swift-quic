@@ -266,6 +266,11 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         if stream.hasLength { typeByte |= 0x02 }   // LEN bit
         if stream.fin { typeByte |= 0x01 }         // FIN bit
 
+        print("[FrameCodec] Encoding STREAM frame: streamID=\(stream.streamID), offset=\(stream.offset), dataLen=\(stream.data.count), fin=\(stream.fin), hasLength=\(stream.hasLength)")
+        print("[FrameCodec] Type byte: 0x\(String(format: "%02X", typeByte)) (OFF=\(hasOffset), LEN=\(stream.hasLength), FIN=\(stream.fin))")
+
+        let startSize = writer.count
+
         writer.writeByte(typeByte)
         writer.writeVarint(stream.streamID)
 
@@ -281,6 +286,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         }
 
         writer.writeBytes(stream.data)
+
+        let frameSize = writer.count - startSize
+        print("[FrameCodec] STREAM frame encoded: \(frameSize) bytes total")
     }
 
     /// CONNECTION_CLOSEフレームのエンコード

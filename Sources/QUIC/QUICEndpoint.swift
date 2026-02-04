@@ -347,6 +347,12 @@ public actor QUICEndpoint {
             remoteAddress: address
         )
 
+        // Set callback for NEW_CONNECTION_ID frames
+        connection.setNewConnectionIDCallback { [weak router, weak connection] cid in
+            guard let router = router, let connection = connection else { return }
+            router.register(connection, for: [cid])
+        }
+
         // Register connection
         router.register(connection)
         timerManager.register(connection)
@@ -929,11 +935,15 @@ public actor QUICEndpoint {
             do {
                 // Generate packets from pending stream data
                 let packets = try connection.generateOutboundPackets()
+                if !packets.isEmpty {
+                    print("[QUICEndpoint] Sending \(packets.count) packets (total \(packets.map(\.count).reduce(0, +)) bytes)")
+                }
 
                 // Send each packet
                 for packet in packets {
                     let nioAddress = try connection.remoteAddress.toNIOAddress()
                     try await socket.send(packet, to: nioAddress)
+                    print("[QUICEndpoint] Sent packet: \(packet.count) bytes")
                 }
             } catch {
                 // Log error but continue - don't break the loop for transient errors

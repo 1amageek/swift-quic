@@ -154,6 +154,8 @@ public final class StreamManager: Sendable {
             let sendLimit = getSendLimit(for: streamID, state: state)
             let recvLimit = getRecvLimit(for: streamID, state: state)
 
+            print("[StreamManager] Opening stream \(streamID): sendLimit=\(sendLimit), recvLimit=\(recvLimit)")
+
             let stream = DataStream(
                 id: streamID,
                 isClient: state.isClient,
@@ -399,6 +401,8 @@ public final class StreamManager: Sendable {
         uni: UInt64
     ) {
         state.withLock { state in
+            print("[StreamManager] Updating peer stream data limits: bidiLocal=\(bidiLocal), bidiRemote=\(bidiRemote), uni=\(uni)")
+            print("[StreamManager] Existing streams before update: \(state.streams.keys.sorted())")
             // Update initial values for new streams
             state.initialSendMaxDataBidiLocal = bidiLocal
             state.initialSendMaxDataBidiRemote = bidiRemote
@@ -408,6 +412,7 @@ public final class StreamManager: Sendable {
             // This is critical for streams opened before handshake completion
             for (streamID, stream) in state.streams {
                 let newLimit = getSendLimit(for: streamID, state: state)
+                print("[StreamManager] Updating stream \(streamID) send limit to \(newLimit)")
                 stream.updateSendMaxData(newLimit)
             }
         }
