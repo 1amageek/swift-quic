@@ -419,6 +419,7 @@ public final class QUICConnectionHandler: Sendable {
     ///
     /// This enables stream frame generation in getOutboundPackets().
     public func markHandshakeComplete() {
+        print("[QUICConnectionHandler] Marking handshake complete")
         handshakeComplete.withLock { $0 = true }
         connectionState.withLock { $0.status = .established }
         pnSpaceManager.handshakeConfirmed = true
@@ -563,6 +564,9 @@ public final class QUICConnectionHandler: Sendable {
         // Generate stream frames (only at application level)
         if handshakeComplete.withLock({ $0 }) {
             let streamFrames = streamManager.generateStreamFrames(maxBytes: 1200)
+            if !streamFrames.isEmpty {
+                print("[QUICConnectionHandler] Generated \(streamFrames.count) stream frames")
+            }
             for streamFrame in streamFrames {
                 queueFrame(.stream(streamFrame), level: .application)
             }
@@ -572,6 +576,8 @@ public final class QUICConnectionHandler: Sendable {
             for flowFrame in flowFrames {
                 queueFrame(flowFrame, level: .application)
             }
+        } else {
+            print("[QUICConnectionHandler] Handshake not complete, skipping stream frame generation")
         }
 
         // Get queued packets
