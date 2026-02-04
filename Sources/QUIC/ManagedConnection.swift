@@ -115,6 +115,10 @@ public final class ManagedConnection: Sendable {
     /// Remote address
     public let remoteAddress: SocketAddress
 
+    /// Closure called when a new connection ID is received
+    /// Used to register the CID with the ConnectionRouter
+    private let onNewConnectionID: Mutex<(@Sendable (ConnectionID) -> Void)?>
+
     // MARK: - Initialization
 
     /// Creates a new managed connection
@@ -159,6 +163,7 @@ public final class ManagedConnection: Sendable {
         // For servers, original DCID is the DCID from the client's Initial packet
         self.originalConnectionID = originalConnectionID ?? destinationConnectionID
         self.transportParameters = transportParameters
+        self.onNewConnectionID = Mutex(nil)  // Set later via setNewConnectionIDCallback
         var initialState = ManagedConnectionState(
             role: role,
             sourceConnectionID: sourceConnectionID,
@@ -172,6 +177,14 @@ public final class ManagedConnection: Sendable {
 
         // Set TLS provider on handler
         handler.setTLSProvider(tlsProvider)
+    }
+
+    // MARK: - Connection ID Management
+
+    /// Sets the callback for new connection IDs
+    /// - Parameter callback: Closure to call when a NEW_CONNECTION_ID frame is received
+    public func setNewConnectionIDCallback(_ callback: (@Sendable (ConnectionID) -> Void)?) {
+        onNewConnectionID.withLock { $0 = callback }
     }
 
     // MARK: - Connection Lifecycle
@@ -338,6 +351,25 @@ public final class ManagedConnection: Sendable {
         // Decrypt the packet
         let parsed = try packetProcessor.decryptPacket(data)
 
+        // RFC 9000 Section 7.2: Client MUST update DCID to server's SCID from first Initial packet
+        // This is critical for QUIC handshake: client uses server's SCID as DCID in all subsequent packets
+        if parsed.encryptionLevel == .initial, case .long(let longHeader) = parsed.header {
+            let (role, currentDCID) = state.withLock { ($0.role, $0.destinationConnectionID) }
+
+            if role == .client {
+                let serverSCID = longHeader.sourceConnectionID
+                // Only update on first Initial packet (when DCIDs differ)
+                if currentDCID != serverSCID {
+                    print("[ManagedConnection] Client updating DCID from \(currentDCID) to server's SCID \(serverSCID)")
+                    state.withLock { state in
+                        state.destinationConnectionID = serverSCID
+                    }
+                    // Update PacketProcessor's DCID length for short header parsing
+                    packetProcessor.setDCIDLength(serverSCID.bytes.count)
+                }
+            }
+        }
+
         // RFC 9000 Section 8.1: Server validates client address upon receiving Handshake packet
         if parsed.encryptionLevel == .handshake {
             amplificationLimiter.validateAddress()
@@ -389,6 +421,25 @@ public final class ManagedConnection: Sendable {
         var allOutbound: [Data] = []
 
         for parsed in parsedPackets {
+            // RFC 9000 Section 7.2: Client MUST update DCID to server's SCID from first Initial packet
+            // This is critical for QUIC handshake: client uses server's SCID as DCID in all subsequent packets
+            if parsed.encryptionLevel == .initial, case .long(let longHeader) = parsed.header {
+                let (role, currentDCID) = state.withLock { ($0.role, $0.destinationConnectionID) }
+
+                if role == .client {
+                    let serverSCID = longHeader.sourceConnectionID
+                    // Only update on first Initial packet (when DCIDs differ)
+                    if currentDCID != serverSCID {
+                        print("[ManagedConnection] Client updating DCID from \(currentDCID) to server's SCID \(serverSCID)")
+                        state.withLock { state in
+                            state.destinationConnectionID = serverSCID
+                        }
+                        // Update PacketProcessor's DCID length for short header parsing
+                        packetProcessor.setDCIDLength(serverSCID.bytes.count)
+                    }
+                }
+            }
+
             // RFC 9000 Section 8.1: Server validates client address upon receiving Handshake packet
             if parsed.encryptionLevel == .handshake {
                 amplificationLimiter.validateAddress()
@@ -671,6 +722,8 @@ public final class ManagedConnection: Sendable {
             case .handshakeData(let data, let level):
                 // Queue CRYPTO frames
                 handler.queueCryptoData(data, level: level)
+                // Signal that packets need to be sent
+                signalNeedsSend()
 
             case .keysAvailable(let info):
                 // Install keys via PacketProcessor (single source of truth for crypto)
@@ -682,21 +735,32 @@ public final class ManagedConnection: Sendable {
 
                 // Parse peer transport parameters
                 if let peerParams = tlsProvider.getPeerTransportParameters() {
+                    print("[ManagedConnection] Received peer transport parameters: \(peerParams.count) bytes")
                     if let params = decodeTransportParameters(peerParams) {
+                        print("[ManagedConnection] Decoded peer params: maxData=\(params.initialMaxData), bidiLocal=\(params.initialMaxStreamDataBidiLocal), bidiRemote=\(params.initialMaxStreamDataBidiRemote)")
                         handler.setPeerTransportParameters(params)
+                    } else {
+                        print("[ManagedConnection] ERROR: Failed to decode transport parameters!")
                     }
+                } else {
+                    print("[ManagedConnection] ERROR: No peer transport parameters received from TLS!")
                 }
 
                 // RFC 9000 Section 8.1: Lift amplification limit when handshake is confirmed
                 amplificationLimiter.confirmHandshake()
 
-                // Server: Send HANDSHAKE_DONE and mark handler handshake complete
-                // Client will set handshakeComplete when it receives HANDSHAKE_DONE frame
+                // RFC 9001 Section 4.1.1: Handshake is complete when TLS reports completion
+                // Both client and server can send 1-RTT data immediately after handshake completes
+                // HANDSHAKE_DONE frame is for "handshake confirmation", not a requirement to start sending data
+                handler.markHandshakeComplete()
+                print("[ManagedConnection] TLS handshake complete - enabling 1-RTT data transmission")
+
+                // Server: Send HANDSHAKE_DONE frame to client (RFC 9001 Section 4.1.2)
                 let role = state.withLock { $0.role }
                 if role == .server {
                     handler.queueFrame(.handshakeDone, level: .application)
-                    // Server must mark handshake complete here since it won't receive HANDSHAKE_DONE
-                    handler.markHandshakeComplete()
+                    print("[ManagedConnection] Server queued HANDSHAKE_DONE frame")
+                    signalNeedsSend()
                 }
 
                 // Mark handshake as established but don't discard keys yet
@@ -834,6 +898,14 @@ public final class ManagedConnection: Sendable {
             shutdown()  // Finish async streams to prevent hanging for-await loops
         }
 
+        // Handle new connection IDs - register them with the router
+        for frame in result.newConnectionIDs {
+            print("[ManagedConnection] Registering NEW_CONNECTION_ID: \(frame.connectionID)")
+            onNewConnectionID.withLock { callback in
+                callback?(frame.connectionID)
+            }
+        }
+
         return outboundPackets
     }
 
@@ -845,6 +917,7 @@ public final class ManagedConnection: Sendable {
 
         switch level {
         case .initial:
+            print("[ManagedConnection] Building Initial packet: SCID=\(scid), DCID=\(dcid)")
             let longHeader = LongHeader(
                 packetType: .initial,
                 version: version,
@@ -855,6 +928,7 @@ public final class ManagedConnection: Sendable {
             return .long(longHeader)
 
         case .handshake:
+            print("[ManagedConnection] Building Handshake packet: SCID=\(scid), DCID=\(dcid)")
             let longHeader = LongHeader(
                 packetType: .handshake,
                 version: version,
@@ -865,6 +939,7 @@ public final class ManagedConnection: Sendable {
             return .long(longHeader)
 
         case .application:
+            print("[ManagedConnection] Building Application packet (1-RTT): SCID=\(scid), DCID=\(dcid)")
             let shortHeader = ShortHeader(
                 destinationConnectionID: dcid,
                 spinBit: false,
