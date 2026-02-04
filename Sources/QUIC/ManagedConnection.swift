@@ -768,6 +768,9 @@ public final class ManagedConnection: Sendable {
             packetProcessor.discardKeys(for: .handshake)
             handler.discardLevel(.initial)
             handler.discardLevel(.handshake)
+
+            // CRITICAL: Mark handshake complete to enable stream frame generation
+            handler.markHandshakeComplete()
         }
         // Server already discarded keys in processTLSOutputs()
     }
