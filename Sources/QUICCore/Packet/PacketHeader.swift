@@ -501,8 +501,9 @@ public struct ProtectedLongHeader: Sendable, Hashable {
         )
         header.firstByte = unprotectedFirstByte
 
-        // Validate with strict checking (reserved bits must be zero)
-        try header.validate(strict: true)
+        // Validate with non-strict checking (RFC 8701 Greasing: accept non-zero reserved bits)
+        // RFC 8701 allows senders to set reserved bits to prevent ossification
+        try header.validate(strict: false)
 
         return header
     }
@@ -607,8 +608,9 @@ public struct ProtectedShortHeader: Sendable, Hashable {
             packetNumberLength: packetNumberLength
         )
 
-        // Validate with strict checking (fixed bit and reserved bits)
-        try header.validate(strict: true)
+        // Validate with non-strict checking (RFC 8701 Greasing: accept non-zero reserved bits)
+        // RFC 8701 allows senders to set reserved bits to prevent ossification
+        try header.validate(strict: false)
 
         return header
     }
