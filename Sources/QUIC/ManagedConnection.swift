@@ -364,8 +364,9 @@ public final class ManagedConnection: Sendable {
                     state.withLock { state in
                         state.destinationConnectionID = serverSCID
                     }
-                    // Update PacketProcessor's DCID length for short header parsing
-                    packetProcessor.setDCIDLength(serverSCID.bytes.count)
+                    // Note: Do NOT update PacketProcessor's DCID length here.
+                    // For Short Header packets we receive, the DCID is OUR sourceConnectionID,
+                    // not the server's SCID. PacketProcessor was initialized with our SCID length.
                 }
             }
         }
@@ -434,8 +435,9 @@ public final class ManagedConnection: Sendable {
                         state.withLock { state in
                             state.destinationConnectionID = serverSCID
                         }
-                        // Update PacketProcessor's DCID length for short header parsing
-                        packetProcessor.setDCIDLength(serverSCID.bytes.count)
+                        // Note: Do NOT update PacketProcessor's DCID length here.
+                        // For Short Header packets we receive, the DCID is OUR sourceConnectionID,
+                        // not the server's SCID. PacketProcessor was initialized with our SCID length.
                     }
                 }
             }
@@ -900,7 +902,10 @@ public final class ManagedConnection: Sendable {
 
         // Handle new connection IDs - register them with the router
         for frame in result.newConnectionIDs {
-            print("[ManagedConnection] Registering NEW_CONNECTION_ID: \(frame.connectionID)")
+            // Note: Do NOT update PacketProcessor's DCID length here.
+            // NEW_CONNECTION_ID provides alternative CIDs for future use, but the peer
+            // may continue using the current DCID. Updating length prematurely causes
+            // decryption failures. PacketProcessor uses sourceConnectionID length.
             onNewConnectionID.withLock { callback in
                 callback?(frame.connectionID)
             }

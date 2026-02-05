@@ -200,7 +200,7 @@ public final class PacketProcessor: Sendable {
         // Get largest PN for this level
         let largestPN = largestReceivedPN.withLock { $0[level] ?? 0 }
 
-        // Get DCID length (lock-free)
+        // Get DCID length
         let dcid = dcidLengthValue
 
         // Decode packet (validation happens inside, after HP removal)
