@@ -46,7 +46,7 @@ let package = Package(
         packageDependency(
             localPath: localSwiftNIOUDPPackage,
             remoteURL: "https://github.com/1amageek/swift-nio-udp.git",
-            from: "1.0.0"
+            from: "1.1.0"
         ),
 
         // Cryptography
