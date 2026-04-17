@@ -282,7 +282,7 @@ public final class LossDetector: Sendable {
                 guard range.rangeLength <= current else { break }
                 rangeStart = current - range.rangeLength
             } else {
-                let gapOffset = range.gap + 1
+                let gapOffset = range.gap + 2
                 guard gapOffset <= current else { break }
                 current = current - gapOffset
                 rangeEnd = current

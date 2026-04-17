@@ -400,4 +400,14 @@ struct StatelessResetTokenRFCTests {
         #expect(frame2.statelessResetToken.count == 16)
         #expect(frame3.statelessResetToken.count == 16)
     }
+
+    @Test("Stateless reset token extraction preserves fixed token length")
+    func statelessResetTokenExtractionLength() throws {
+        let token = StatelessResetToken.generate()
+        let packet = StatelessResetPacket(token: token)
+
+        let extracted = try #require(StatelessResetPacket.extractToken(from: packet.encode()))
+        #expect(extracted.data.count == 16)
+        #expect(extracted == token)
+    }
 }

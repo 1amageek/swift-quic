@@ -360,7 +360,6 @@ public final class ManagedConnection: Sendable {
                 let serverSCID = longHeader.sourceConnectionID
                 // Only update on first Initial packet (when DCIDs differ)
                 if currentDCID != serverSCID {
-                    print("[ManagedConnection] Client updating DCID from \(currentDCID) to server's SCID \(serverSCID)")
                     state.withLock { state in
                         state.destinationConnectionID = serverSCID
                     }
@@ -431,7 +430,6 @@ public final class ManagedConnection: Sendable {
                     let serverSCID = longHeader.sourceConnectionID
                     // Only update on first Initial packet (when DCIDs differ)
                     if currentDCID != serverSCID {
-                        print("[ManagedConnection] Client updating DCID from \(currentDCID) to server's SCID \(serverSCID)")
                         state.withLock { state in
                             state.destinationConnectionID = serverSCID
                         }
@@ -736,17 +734,11 @@ public final class ManagedConnection: Sendable {
                 state.withLock { $0.negotiatedALPN = info.alpn }
 
                 // Parse peer transport parameters
-                if let peerParams = tlsProvider.getPeerTransportParameters() {
-                    print("[ManagedConnection] Received peer transport parameters: \(peerParams.count) bytes")
-                    if let params = decodeTransportParameters(peerParams) {
-                        print("[ManagedConnection] Decoded peer params: maxData=\(params.initialMaxData), bidiLocal=\(params.initialMaxStreamDataBidiLocal), bidiRemote=\(params.initialMaxStreamDataBidiRemote)")
-                        handler.setPeerTransportParameters(params)
-                    } else {
-                        print("[ManagedConnection] ERROR: Failed to decode transport parameters!")
-                    }
-                } else {
-                    print("[ManagedConnection] ERROR: No peer transport parameters received from TLS!")
+                guard let peerParams = tlsProvider.getPeerTransportParameters() else {
+                    throw ManagedConnectionError.invalidState("Missing peer transport parameters")
                 }
+                let params = try decodeTransportParameters(peerParams)
+                handler.setPeerTransportParameters(params)
 
                 // RFC 9000 Section 8.1: Lift amplification limit when handshake is confirmed
                 amplificationLimiter.confirmHandshake()
@@ -755,13 +747,11 @@ public final class ManagedConnection: Sendable {
                 // Both client and server can send 1-RTT data immediately after handshake completes
                 // HANDSHAKE_DONE frame is for "handshake confirmation", not a requirement to start sending data
                 handler.markHandshakeComplete()
-                print("[ManagedConnection] TLS handshake complete - enabling 1-RTT data transmission")
 
                 // Server: Send HANDSHAKE_DONE frame to client (RFC 9001 Section 4.1.2)
                 let role = state.withLock { $0.role }
                 if role == .server {
                     handler.queueFrame(.handshakeDone, level: .application)
-                    print("[ManagedConnection] Server queued HANDSHAKE_DONE frame")
                     signalNeedsSend()
                 }
 
@@ -922,7 +912,6 @@ public final class ManagedConnection: Sendable {
 
         switch level {
         case .initial:
-            print("[ManagedConnection] Building Initial packet: SCID=\(scid), DCID=\(dcid)")
             let longHeader = LongHeader(
                 packetType: .initial,
                 version: version,
@@ -933,7 +922,6 @@ public final class ManagedConnection: Sendable {
             return .long(longHeader)
 
         case .handshake:
-            print("[ManagedConnection] Building Handshake packet: SCID=\(scid), DCID=\(dcid)")
             let longHeader = LongHeader(
                 packetType: .handshake,
                 version: version,
@@ -944,7 +932,6 @@ public final class ManagedConnection: Sendable {
             return .long(longHeader)
 
         case .application:
-            print("[ManagedConnection] Building Application packet (1-RTT): SCID=\(scid), DCID=\(dcid)")
             let shortHeader = ShortHeader(
                 destinationConnectionID: dcid,
                 spinBit: false,
@@ -1000,9 +987,15 @@ public final class ManagedConnection: Sendable {
     }
 
     /// Decodes transport parameters from wire format
-    private func decodeTransportParameters(_ data: Data) -> TransportParameters? {
+    private func decodeTransportParameters(_ data: Data) throws -> TransportParameters {
         // Use proper TransportParameterCodec for RFC 9000 compliant decoding
-        return try? TransportParameterCodec.decode(data)
+        do {
+            return try TransportParameterCodec.decode(data)
+        } catch {
+            throw ManagedConnectionError.invalidState(
+                "Invalid peer transport parameters: \(error)"
+            )
+        }
     }
 }
 

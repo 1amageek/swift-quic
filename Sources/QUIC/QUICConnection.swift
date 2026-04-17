@@ -12,8 +12,12 @@ public protocol QUICConnectionProtocol: Sendable {
     /// The local address
     var localAddress: SocketAddress? { get }
 
-    /// The remote address
+    /// The initial remote address (set at connection creation).
     var remoteAddress: SocketAddress { get }
+
+    /// The current remote address, which may differ from `remoteAddress`
+    /// after connection migration (RFC 9000 Section 9).
+    var currentRemoteAddress: SocketAddress { get }
 
     /// Whether the connection is established
     var isEstablished: Bool { get }

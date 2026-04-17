@@ -13,6 +13,12 @@ import QUICCore
 
 #if DEBUG
 
+private let mockClientHelloMarker = Data("MOCK_CLIENT_HELLO".utf8)
+private let mockEncryptedExtensionsMarker = Data("MOCK_ENCRYPTED_EXTENSIONS".utf8)
+private let mockCertificateMarker = Data("MOCK_CERTIFICATE".utf8)
+private let mockCertVerifyMarker = Data("MOCK_CERT_VERIFY".utf8)
+private let mockFinishedMarker = Data("MOCK_FINISHED".utf8)
+
 // MARK: - Mock TLS Provider
 
 /// Mock TLS provider for testing QUIC handshake flow
@@ -92,8 +98,9 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
                     serverSecret: appServerSecret
                 )))
 
-                // Set mock peer transport parameters
-                state.peerTransportParameters = generateMockPeerTransportParameters()
+                if state.peerTransportParameters == nil {
+                    state.peerTransportParameters = generateMockPeerTransportParameters()
+                }
                 state.negotiatedALPN = configuration.alpnProtocols.first
 
                 outputs.append(.handshakeComplete(HandshakeCompleteInfo(
@@ -389,12 +396,10 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
     }
 
     private func generateMockClientHello(localParams: Data?) -> Data {
-        // Mock ClientHello with marker
-        var data = Data("MOCK_CLIENT_HELLO".utf8)
-        if let params = localParams {
-            data.append(params)
-        }
-        return data
+        embedTransportParameters(
+            localParams ?? Data(),
+            after: mockClientHelloMarker
+        )
     }
 
     private func generateMockServerHello() -> Data {
@@ -402,13 +407,13 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
     }
 
     private func generateMockServerHandshakeMessages(localParams: Data?) -> Data {
-        var data = Data("MOCK_ENCRYPTED_EXTENSIONS".utf8)
-        if let params = localParams {
-            data.append(params)
-        }
-        data.append(Data("MOCK_CERTIFICATE".utf8))
-        data.append(Data("MOCK_CERT_VERIFY".utf8))
-        data.append(Data("MOCK_FINISHED".utf8))
+        var data = embedTransportParameters(
+            localParams ?? Data(),
+            after: mockEncryptedExtensionsMarker
+        )
+        data.append(mockCertificateMarker)
+        data.append(mockCertVerifyMarker)
+        data.append(mockFinishedMarker)
         return data
     }
 
@@ -417,11 +422,20 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
     }
 
     private func extractMockTransportParameters(from data: Data) -> Data {
-        // In a real scenario, parse from TLS extension
-        // For mock, just return any embedded parameters
-        if data.count > 20 {
-            return Data(data.suffix(from: 17))  // Skip mock header
+        if let params = decodeEmbeddedTransportParameters(
+            from: data,
+            marker: mockClientHelloMarker
+        ) {
+            return params
         }
+
+        if let params = decodeEmbeddedTransportParameters(
+            from: data,
+            marker: mockEncryptedExtensionsMarker
+        ) {
+            return params
+        }
+
         return Data()
     }
 
@@ -431,6 +445,40 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
         // by ManagedConnection when processing handshake completion
         let params = TransportParameters()  // Uses default values with stream limits
         return TransportParameterCodec.encode(params)
+    }
+
+    private func embedTransportParameters(_ params: Data, after marker: Data) -> Data {
+        var data = marker
+        var length = UInt32(params.count).bigEndian
+        withUnsafeBytes(of: &length) { bytes in
+            data.append(contentsOf: bytes)
+        }
+        data.append(params)
+        return data
+    }
+
+    private func decodeEmbeddedTransportParameters(from data: Data, marker: Data) -> Data? {
+        let lengthFieldSize = MemoryLayout<UInt32>.size
+        let headerSize = marker.count + lengthFieldSize
+
+        guard data.starts(with: marker), data.count >= headerSize else {
+            return nil
+        }
+
+        let lengthRange = marker.count..<(marker.count + lengthFieldSize)
+        let lengthBytes = Array(data[lengthRange])
+        let length =
+            (Int(lengthBytes[0]) << 24) |
+            (Int(lengthBytes[1]) << 16) |
+            (Int(lengthBytes[2]) << 8) |
+            Int(lengthBytes[3])
+        let payloadStart = headerSize
+        let payloadEnd = payloadStart + length
+        guard payloadEnd <= data.count else {
+            return Data()
+        }
+
+        return Data(data[payloadStart..<payloadEnd])
     }
 
     private func generateDeterministicSecret(label: String) -> SymmetricKey {

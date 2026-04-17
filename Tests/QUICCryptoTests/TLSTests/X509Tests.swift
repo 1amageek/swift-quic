@@ -248,11 +248,7 @@ struct X509Tests {
     func hostnameMatchExact() throws {
         // Create a minimal test using internal logic
         let validator = X509Validator(options: X509ValidationOptions(allowSelfSigned: true))
-
-        // Test the hostname matching logic by reflection
-        // Since matchHostname is private, we test through the public API indirectly
-        // For now, just verify the validator is created correctly
-        #expect(validator != nil)
+        _ = validator
     }
 
     @Test("X509ValidationOptions default values")
@@ -269,13 +265,13 @@ struct X509Tests {
 
     @Test("CertificateStore adds and retrieves certificates")
     func certificateStore() throws {
-        var store = CertificateStore()
+        let store = CertificateStore()
         #expect(store.all.isEmpty)
 
         // We can't easily test adding certificates without a real certificate,
         // but we can verify the store is properly initialized
         let validator = store.validator()
-        #expect(validator != nil)
+        _ = validator
     }
 
     // MARK: - VerificationKey Extension Tests

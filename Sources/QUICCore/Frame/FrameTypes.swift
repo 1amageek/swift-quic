@@ -36,7 +36,10 @@ public struct AckFrame: Sendable, Hashable {
 
 /// A range of acknowledged packet numbers
 public struct AckRange: Sendable, Hashable {
-    /// Gap before this range (number of unacknowledged packets)
+    /// Encoded gap before this range.
+    ///
+    /// Per RFC 9000 Section 19.3.1, the actual number of unacknowledged packets
+    /// between the previous range and this range is `gap + 1`.
     public let gap: UInt64
 
     /// Length of this acknowledged range
@@ -101,7 +104,7 @@ public struct StreamFrame: Sendable, Hashable {
     public var frameTypeByte: UInt8 {
         var byte: UInt8 = 0x08
         if offset > 0 { byte |= 0x04 }  // OFF bit
-        if true { byte |= 0x02 }         // LEN bit (always include length)
+        if hasLength { byte |= 0x02 }    // LEN bit
         if fin { byte |= 0x01 }          // FIN bit
         return byte
     }

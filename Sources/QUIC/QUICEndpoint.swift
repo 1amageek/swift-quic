@@ -305,7 +305,10 @@ public actor QUICEndpoint {
         while !connection.isEstablished {
             if ContinuousClock.now >= deadline {
                 runTask.cancel()
-                await socket.stop()
+                do {
+                    try await socket.shutdown()
+                } catch {
+                }
                 throw QUICEndpointError.handshakeTimeout
             }
             try await Task.sleep(for: .milliseconds(10))
@@ -381,6 +384,70 @@ public actor QUICEndpoint {
 
         // Wait for handshake completion (simplified - in real impl, use packet loop)
         // For now, return immediately and let the caller drive the packet loop
+
+        return connection
+    }
+
+    // MARK: - Hole Punch API
+
+    /// Connects to a remote address reusing the server's listener socket.
+    ///
+    /// Unlike `connect(to:)`, this method does NOT require a client-only endpoint.
+    /// It reuses the existing listener socket to send Initial packets from the
+    /// same UDP port, creating a NAT mapping for hole punching.
+    ///
+    /// - Parameters:
+    ///   - address: The remote address to connect to.
+    ///   - timeout: Maximum time to wait for handshake. Default: 30 seconds.
+    /// - Returns: The established connection.
+    /// - Throws: `QUICEndpointError` if no socket is available.
+    public func dialFromListener(
+        to address: SocketAddress,
+        timeout: Duration = .seconds(30)
+    ) async throws -> any QUICConnectionProtocol {
+        guard let socket = self.socket else {
+            throw QUICEndpointError.notRunning
+        }
+
+        guard let sourceConnectionID = ConnectionID.random(length: 8),
+              let destinationConnectionID = ConnectionID.random(length: 8) else {
+            throw QUICError.internalError("Failed to generate connection IDs")
+        }
+
+        let tlsProvider = try createTLSProvider(isClient: true)
+        let transportParameters = TransportParameters(from: configuration, sourceConnectionID: sourceConnectionID)
+
+        let connection = ManagedConnection(
+            role: .client,
+            version: configuration.version,
+            sourceConnectionID: sourceConnectionID,
+            destinationConnectionID: destinationConnectionID,
+            transportParameters: transportParameters,
+            tlsProvider: tlsProvider,
+            localAddress: _localAddress,
+            remoteAddress: address
+        )
+
+        connection.setNewConnectionIDCallback { [weak router, weak connection] cid in
+            guard let router = router, let connection = connection else { return }
+            router.register(connection, for: [cid])
+        }
+
+        router.register(connection)
+        timerManager.register(connection)
+
+        let sendSignal = connection.sendSignal
+
+        Task { [weak self] in
+            guard let self = self else { return }
+            await self.outboundSendLoop(connection: connection, sendSignal: sendSignal, socket: socket)
+        }
+
+        let initialPackets = try await connection.start()
+
+        for packet in initialPackets {
+            try await send(packet, to: address)
+        }
 
         return connection
     }
@@ -535,11 +602,26 @@ public actor QUICEndpoint {
         // Route the packet
         switch router.route(data: data, from: remoteAddress) {
         case .routed(let connection):
+            // Detect address change for connection migration (RFC 9000 Section 9)
+            // Only migrate on short header (1-RTT) packets - long header packets
+            // (Initial, Handshake) are ignored for migration purposes.
+            let isShortHeader = !data.isEmpty && (data[data.startIndex] & 0x80) == 0
+            if isServer && isShortHeader && connection.currentRemoteAddress != remoteAddress {
+                let migrationResponses = try await connection.handleAddressChange(
+                    packet: data,
+                    newAddress: remoteAddress
+                )
+                // Send migration responses (PATH_CHALLENGE) to the new address
+                for response in migrationResponses {
+                    try await send(response, to: remoteAddress)
+                }
+            }
+
             // Process packet through the connection
             timerManager.recordActivity(for: connection)
             let responses = try await connection.processDatagram(data)
 
-            // Send responses
+            // Send responses to the address the packet came from
             for response in responses {
                 try await send(response, to: remoteAddress)
             }
@@ -751,7 +833,7 @@ public actor QUICEndpoint {
                 }
             } catch {
                 // Log error but continue processing
-                print("Error processing packet: \(error)")
+                logger.warning("Failed to process packet batch item", metadata: ["error": "\(error)"])
             }
         }
 
@@ -813,14 +895,20 @@ public actor QUICEndpoint {
         } onCancel: {
             // When the task is cancelled, stop the socket to unblock the I/O loops
             Task { [socket] in
-                await socket.stop()
+                do {
+                    try await socket.shutdown()
+                } catch {
+                }
             }
         }
 
         // Cleanup
         if !shouldStop {
             // Only stop socket if not already stopped by stop()
-            await socket.stop()
+            do {
+                try await socket.shutdown()
+            } catch {
+            }
         }
         self.socket = nil
         self.isRunning = false
@@ -857,23 +945,29 @@ public actor QUICEndpoint {
         } onCancel: {
             // When the task is cancelled, stop the socket to unblock the I/O loops
             Task { [socket] in
-                await socket.stop()
+                do {
+                    try await socket.shutdown()
+                } catch {
+                }
             }
         }
 
         // Cleanup
         if !shouldStop {
-            await socket.stop()
+            do {
+                try await socket.shutdown()
+            } catch {
+            }
         }
         self.socket = nil
         self.isRunning = false
     }
 
-    /// Stops the I/O loop
+    /// Shuts down the I/O loop
     ///
     /// This method signals the I/O tasks to stop and finishes the socket's
     /// incoming stream, allowing the packet receive loop to exit gracefully.
-    public func stop() async {
+    public func shutdown() async throws {
         guard isRunning else { return }
         shouldStop = true
 
@@ -884,7 +978,7 @@ public actor QUICEndpoint {
         // Stop the socket to finish its AsyncStream
         // This will cause the packetReceiveLoop's for-await to exit
         if let socket = socket {
-            await socket.stop()
+            try await socket.shutdown()
         }
     }
 
@@ -905,7 +999,13 @@ public actor QUICEndpoint {
                 }
             } catch {
                 // Log error for debugging
-                print("[QUICEndpoint] Error processing packet from \(remoteAddress): \(error)")
+                logger.warning(
+                    "Failed to process incoming packet",
+                    metadata: [
+                        "error": "\(error)",
+                        "remoteAddress": "\(remoteAddress)"
+                    ]
+                )
             }
         }
     }
@@ -935,15 +1035,11 @@ public actor QUICEndpoint {
             do {
                 // Generate packets from pending stream data
                 let packets = try connection.generateOutboundPackets()
-                if !packets.isEmpty {
-                    print("[QUICEndpoint] Sending \(packets.count) packets (total \(packets.map(\.count).reduce(0, +)) bytes)")
-                }
 
                 // Send each packet
                 for packet in packets {
                     let nioAddress = try connection.remoteAddress.toNIOAddress()
                     try await socket.send(packet, to: nioAddress)
-                    print("[QUICEndpoint] Sent packet: \(packet.count) bytes")
                 }
             } catch {
                 // Log error but continue - don't break the loop for transient errors

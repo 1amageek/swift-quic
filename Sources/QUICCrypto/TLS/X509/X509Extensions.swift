@@ -12,37 +12,65 @@ import SwiftASN1
 extension X509Certificate {
     /// Gets the basic constraints extension
     public var basicConstraints: BasicConstraints? {
-        try? certificate.extensions.basicConstraints
+        do {
+            return try certificate.extensions.basicConstraints
+        } catch {
+            return nil
+        }
     }
 
     /// Gets the key usage extension
     public var keyUsage: X509.KeyUsage? {
-        try? certificate.extensions.keyUsage
+        do {
+            return try certificate.extensions.keyUsage
+        } catch {
+            return nil
+        }
     }
 
     /// Gets the extended key usage extension
     public var extendedKeyUsage: ExtendedKeyUsage? {
-        try? certificate.extensions.extendedKeyUsage
+        do {
+            return try certificate.extensions.extendedKeyUsage
+        } catch {
+            return nil
+        }
     }
 
     /// Gets the subject alternative names extension
     public var subjectAlternativeNames: SubjectAlternativeNames? {
-        try? certificate.extensions.subjectAlternativeNames
+        do {
+            return try certificate.extensions.subjectAlternativeNames
+        } catch {
+            return nil
+        }
     }
 
     /// Gets the authority key identifier extension
     public var authorityKeyIdentifier: AuthorityKeyIdentifier? {
-        try? certificate.extensions.authorityKeyIdentifier
+        do {
+            return try certificate.extensions.authorityKeyIdentifier
+        } catch {
+            return nil
+        }
     }
 
     /// Gets the subject key identifier extension
     public var subjectKeyIdentifier: SubjectKeyIdentifier? {
-        try? certificate.extensions.subjectKeyIdentifier
+        do {
+            return try certificate.extensions.subjectKeyIdentifier
+        } catch {
+            return nil
+        }
     }
 
     /// Gets the name constraints extension
     public var nameConstraints: X509.NameConstraints? {
-        try? certificate.extensions.nameConstraints
+        do {
+            return try certificate.extensions.nameConstraints
+        } catch {
+            return nil
+        }
     }
 }
 
@@ -168,7 +196,10 @@ extension X509Certificate {
     /// - Parameter oid: The OID to search for (e.g., "1.3.6.1.4.1.53594.1.1" for libp2p)
     /// - Returns: The raw extension value if found, nil otherwise
     public func extensionValue(for oid: String) -> Data? {
-        guard let targetOID = try? ASN1ObjectIdentifier(dotRepresentation: oid) else {
+        let targetOID: ASN1ObjectIdentifier
+        do {
+            targetOID = try ASN1ObjectIdentifier(dotRepresentation: oid)
+        } catch {
             return nil
         }
         return extensionValue(for: targetOID)
@@ -224,7 +255,10 @@ extension X509Certificate {
     /// - Parameter oid: The OID to search for
     /// - Returns: The raw extension if found, nil otherwise
     public func rawExtension(for oid: String) -> RawExtension? {
-        guard let targetOID = try? ASN1ObjectIdentifier(dotRepresentation: oid) else {
+        let targetOID: ASN1ObjectIdentifier
+        do {
+            targetOID = try ASN1ObjectIdentifier(dotRepresentation: oid)
+        } catch {
             return nil
         }
 

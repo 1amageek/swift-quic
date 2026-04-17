@@ -220,7 +220,10 @@ public final class SessionTicketStore: Sendable {
         keySchedule.deriveEarlySecret(psk: psk)
 
         // Derive binder key
-        guard let binderKey = try? keySchedule.deriveBinderKey(isResumption: true) else {
+        let binderKey: SymmetricKey
+        do {
+            binderKey = try keySchedule.deriveBinderKey(isResumption: true)
+        } catch {
             return false
         }
 

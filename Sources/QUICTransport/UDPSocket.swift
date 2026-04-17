@@ -26,8 +26,8 @@ public protocol QUICSocket: Sendable {
     /// Starts the socket
     func start() async throws
 
-    /// Stops the socket
-    func stop() async
+    /// Shuts down the socket
+    func shutdown() async throws
 }
 
 /// An incoming QUIC packet
@@ -98,12 +98,12 @@ public final class NIOQUICSocket: QUICSocket, Sendable {
         }
     }
 
-    /// Stops the socket
+    /// Shuts down the socket
     ///
-    /// This method stops the underlying transport and finishes the incoming
+    /// This method shuts down the underlying transport and finishes the incoming
     /// packets AsyncStream, allowing any `for await` loops to exit gracefully.
-    public func stop() async {
-        await transport.stop()
+    public func shutdown() async throws {
+        try await transport.shutdown()
         // Finish the incoming stream to unblock any waiting consumers
         incomingContinuation.finish()
     }

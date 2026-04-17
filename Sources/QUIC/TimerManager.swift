@@ -178,7 +178,14 @@ public final class TimerManager: Sendable {
     public func waitForNextTimer() async -> [TimerEvent] {
         guard let deadline = nextDeadline() else {
             // No timers pending, wait indefinitely (or could return empty)
-            try? await Task.sleep(for: .seconds(1))
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch is CancellationError {
+                return []
+            } catch {
+                assertionFailure("TimerManager.waitForNextTimer() unexpected sleep failure: \(error)")
+                return []
+            }
             return []
         }
 
@@ -190,7 +197,14 @@ public final class TimerManager: Sendable {
 
         // Wait until deadline
         let waitDuration = deadline - now
-        try? await Task.sleep(for: waitDuration)
+        do {
+            try await Task.sleep(for: waitDuration)
+        } catch is CancellationError {
+            return []
+        } catch {
+            assertionFailure("TimerManager.waitForNextTimer() unexpected timed sleep failure: \(error)")
+            return []
+        }
 
         return processTimers()
     }

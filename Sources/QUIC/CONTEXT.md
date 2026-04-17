@@ -47,7 +47,7 @@ public func run(socket: any QUICSocket) async throws {
     }
 }
 
-public func stop() async {
+public func shutdown() async {
     shouldStop = true
     ioTask?.cancel()  // ← ioTask は nil、意味がない
 }
@@ -65,15 +65,15 @@ public func run(socket: any QUICSocket) async throws {
             await group.waitForAll()
         }
     } onCancel: {
-        Task { await socket.stop() }
+        Task { await socket.shutdown() }
     }
 }
 
-public func stop() async {
+public func shutdown() async {
     shouldStop = true
-    // socket.stop() で AsyncStream が finish される
+    // socket.shutdown() で AsyncStream が finish される
     if let socket = socket {
-        await socket.stop()
+        await socket.shutdown()
     }
 }
 ```
@@ -82,8 +82,8 @@ public func stop() async {
 
 ```swift
 // QUICSocket 実装は stop() で continuation を finish する必要がある
-public func stop() async {
-    await transport.stop()
+public func shutdown() async {
+    await transport.shutdown()
     incomingContinuation.finish()  // ← 必須: これがないと for await が終了しない
 }
 ```

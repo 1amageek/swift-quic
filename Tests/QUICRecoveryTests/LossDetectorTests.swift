@@ -172,19 +172,19 @@ struct LossDetectorTests {
         }
 
         // ACK ranges: 15-19, 10-12, 5-7, 0-2
-        // RFC 9000 Section 19.3.1: gap = smallest_prev - 1 - largest_current
+        // RFC 9000 Section 19.3.1: largest_ack = smallest_prev - gap - 2
         // Range 15-19: rangeLength=4 (5 packets: 19-4=15 to 19)
-        // Range 10-12: largest=12, smallest_prev=15, gap = 15 - 1 - 12 = 2, rangeLength=2
-        // Range 5-7: largest=7, smallest_prev=10, gap = 10 - 1 - 7 = 2, rangeLength=2
-        // Range 0-2: largest=2, smallest_prev=5, gap = 5 - 1 - 2 = 2, rangeLength=2
+        // Range 10-12: largest=12, smallest_prev=15, gap = 15 - 12 - 2 = 1, rangeLength=2
+        // Range 5-7: largest=7, smallest_prev=10, gap = 10 - 7 - 2 = 1, rangeLength=2
+        // Range 0-2: largest=2, smallest_prev=5, gap = 5 - 2 - 2 = 1, rangeLength=2
         let ackFrame = AckFrame(
             largestAcknowledged: 19,
             ackDelay: 1000,
             ackRanges: [
                 AckRange(gap: 0, rangeLength: 4),   // 15-19
-                AckRange(gap: 2, rangeLength: 2),   // 10-12
-                AckRange(gap: 2, rangeLength: 2),   // 5-7
-                AckRange(gap: 2, rangeLength: 2)    // 0-2
+                AckRange(gap: 1, rangeLength: 2),   // 10-12
+                AckRange(gap: 1, rangeLength: 2),   // 5-7
+                AckRange(gap: 1, rangeLength: 2)    // 0-2
             ],
             ecnCounts: nil
         )
@@ -471,7 +471,7 @@ struct LossDetectorTests {
             ackDelay: 1000,
             ackRanges: [
                 AckRange(gap: 0, rangeLength: 0),  // 7
-                AckRange(gap: 2, rangeLength: 0)   // 3 (gap=2 means skip 5,6)
+                AckRange(gap: 2, rangeLength: 0)   // 3 (gap=2 means skip 4,5,6)
             ],
             ecnCounts: nil
         )
@@ -684,14 +684,14 @@ struct LossDetectorTests {
 
         // ACK with gaps (RFC 9000 Section 19.3.1):
         // Range 1: 15-19 (rangeLength=4 means 5 packets: largest - rangeLength to largest)
-        // Gap: 5 (means 5 unacknowledged packets: 14, 13, 12, 11, 10)
+        // Gap field: 4 (means 5 unacknowledged packets: 14, 13, 12, 11, 10)
         // Range 2: 5-9 (rangeLength=4 means 5 packets)
         let gappedAck = AckFrame(
             largestAcknowledged: 19,
             ackDelay: 0,
             ackRanges: [
                 AckRange(gap: 0, rangeLength: 4),   // 15-19
-                AckRange(gap: 5, rangeLength: 4)    // 5-9
+                AckRange(gap: 4, rangeLength: 4)    // 5-9
             ],
             ecnCounts: nil
         )

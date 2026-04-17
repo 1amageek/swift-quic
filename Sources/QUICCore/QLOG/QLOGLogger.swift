@@ -172,25 +172,35 @@ public final class QLOGLogger: Sendable {
         for event in events {
             // Wrap in type-erased container for encoding
             let wrapper = AnyQLOGEvent(event: event)
-            if let data = try? encoder.encode(wrapper) {
+            do {
+                let data = try encoder.encode(wrapper)
                 lines.append(data)
                 lines.append(Data("\n".utf8))
+            } catch {
+                assertionFailure("QLOGLogger failed to encode event: \(error)")
             }
         }
 
         // Append to file or create new
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: url.path) {
-            if let handle = try? FileHandle(forWritingTo: url) {
+            do {
+                let handle = try FileHandle(forWritingTo: url)
                 handle.seekToEndOfFile()
                 handle.write(lines)
-                try? handle.close()
+                try handle.close()
+            } catch {
+                assertionFailure("QLOGLogger failed to append QLOG file at \(url.path): \(error)")
             }
         } else {
             // Create directory if needed
             let directory = url.deletingLastPathComponent()
-            try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-            try? lines.write(to: url)
+            do {
+                try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+                try lines.write(to: url)
+            } catch {
+                assertionFailure("QLOGLogger failed to create QLOG file at \(url.path): \(error)")
+            }
         }
     }
 }

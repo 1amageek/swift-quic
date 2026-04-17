@@ -207,6 +207,19 @@ struct FrameCodecTests {
         }
     }
 
+    @Test("STREAM frame type omits LEN bit when hasLength is false")
+    func streamFrameWithoutLengthBit() {
+        let streamFrame = StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data([0x11, 0x22]),
+            fin: false,
+            hasLength: false
+        )
+
+        #expect(streamFrame.frameTypeByte == 0x08)
+    }
+
     // MARK: - RESET_STREAM Frame
 
     @Test("Encode and decode RESET_STREAM frame")

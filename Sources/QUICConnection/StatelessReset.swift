@@ -21,6 +21,10 @@ public struct StatelessResetToken: Sendable, Hashable {
     /// The raw token data (16 bytes)
     public let data: Data
 
+    fileprivate init(validatedData data: Data) {
+        self.data = data
+    }
+
     /// Creates a stateless reset token from raw data
     /// - Parameter data: 16 bytes of token data
     /// - Throws: If data is not exactly 16 bytes
@@ -37,8 +41,7 @@ public struct StatelessResetToken: Sendable, Hashable {
         tokenData.withUnsafeMutableBytes { ptr in
             _ = SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
         }
-        // Force try is safe because we know the length is 16
-        return try! StatelessResetToken(data: tokenData)
+        return StatelessResetToken(validatedData: tokenData)
     }
 
     /// Generates a deterministic stateless reset token from a static key and connection ID
@@ -52,8 +55,7 @@ public struct StatelessResetToken: Sendable, Hashable {
         var hmac = HMAC<SHA256>(key: SymmetricKey(data: staticKey))
         hmac.update(data: connectionID.bytes)
         let fullDigest = Data(hmac.finalize())
-        // Force try is safe because we take exactly 16 bytes
-        return try! StatelessResetToken(data: fullDigest.prefix(16))
+        return StatelessResetToken(validatedData: Data(fullDigest.prefix(16)))
     }
 }
 
@@ -129,7 +131,7 @@ public struct StatelessResetPacket: Sendable {
 
         // Extract last 16 bytes as potential token
         let tokenData = data.suffix(16)
-        return try? StatelessResetToken(data: Data(tokenData))
+        return StatelessResetToken(validatedData: Data(tokenData))
     }
 }
 

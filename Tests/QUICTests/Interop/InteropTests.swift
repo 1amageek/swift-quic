@@ -870,12 +870,12 @@ struct QuinnInteropTests {
             print("Handshake completed after \(handshakeAttempts * 100)ms")
 
             // Clean up
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
             // Clean up on error
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -932,11 +932,11 @@ struct QuinnInteropTests {
             #expect(connection.isEstablished, "TLS 1.3 handshake should complete successfully")
             print("Version negotiation handshake completed after \(handshakeAttempts * 100)ms")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -995,11 +995,11 @@ struct QuinnInteropTests {
             // Note: Stream operations are future work - for now just verify handshake
             print("Stream test - Connection established: \(connection)")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1055,11 +1055,11 @@ struct QuinnInteropTests {
             #expect(connection.isEstablished, "TLS 1.3 handshake should complete (handling Retry if sent)")
             print("Retry test - Handshake completed after \(handshakeAttempts * 100)ms")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1134,11 +1134,11 @@ struct QuinnInteropTests {
             // 4. Verifying early data acceptance
             // This tests the prerequisite (session establishment) for now
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1208,11 +1208,11 @@ struct QuinnInteropTests {
             // The connection should remain established
             #expect(connection.isEstablished, "Connection should remain established")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1280,11 +1280,11 @@ struct Ngtcp2InteropTests {
             #expect(connection.isEstablished, "TLS 1.3 handshake with ngtcp2 should complete")
             print("ngtcp2 - Handshake completed after \(attempts * 100)ms")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1335,11 +1335,11 @@ struct Ngtcp2InteropTests {
             #expect(connection.isEstablished, "Version negotiation with ngtcp2 should succeed")
             print("ngtcp2 version negotiation - Completed after \(attempts * 100)ms")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1391,11 +1391,11 @@ struct Ngtcp2InteropTests {
             // Note: Stream operations require ManagedConnection stream API
             // For now, validate connection establishment
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1472,11 +1472,11 @@ struct StreamDataExchangeTests {
             // The test verifies we can successfully send data on a bidirectional stream
             print("Stream echo - Successfully sent data, skipping read (server may not echo)")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1545,11 +1545,11 @@ struct StreamDataExchangeTests {
 
             print("Multiple streams - Sent data on all \(streams.count) streams")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }
@@ -1609,11 +1609,11 @@ struct StreamDataExchangeTests {
 
             print("Unidirectional - Sent \(testData.count) bytes")
 
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
 
         } catch {
-            await endpoint.stop()
+            try await endpoint.shutdown()
             ioTask.cancel()
             throw error
         }

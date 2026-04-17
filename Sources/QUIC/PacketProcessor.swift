@@ -244,13 +244,10 @@ public final class PacketProcessor: Sendable {
                 // This is normal for coalesced datagrams during handshake
                 continue
             } catch PacketCodecError.decryptionFailed {
-                print("[PacketProcessor] PacketCodecError.decryptionFailed - packet skipped")
                 continue
             } catch QUICError.decryptionFailed {
-                print("[PacketProcessor] QUICError.decryptionFailed - authentication tag mismatch, packet skipped")
                 continue
             } catch {
-                print("[PacketProcessor] Unexpected error during packet decryption: \(error)")
                 throw error
             }
         }

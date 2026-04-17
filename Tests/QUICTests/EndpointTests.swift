@@ -318,6 +318,34 @@ struct EndpointTests {
         #expect(connection.handshakeState == .connecting)
     }
 
+    @Test("ManagedConnection rejects invalid peer transport parameters")
+    func managedConnectionRejectsInvalidPeerTransportParameters() async throws {
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let config = QUICConfiguration()
+        let params = TransportParameters(from: config, sourceConnectionID: scid)
+        let tlsProvider = MockTLSProvider()
+        tlsProvider.setPeerTransportParameters(Data([0xff, 0xff, 0xff]))
+        tlsProvider.forceComplete()
+        let address = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+
+        let connection = ManagedConnection(
+            role: .client,
+            version: .v1,
+            sourceConnectionID: scid,
+            destinationConnectionID: dcid,
+            transportParameters: params,
+            tlsProvider: tlsProvider,
+            remoteAddress: address
+        )
+
+        await #expect(throws: ManagedConnectionError.self) {
+            _ = try await connection.start()
+        }
+
+        #expect(connection.handshakeState == .connecting)
+    }
+
     // MARK: - Managed Stream Tests
 
     @Test("ManagedStream read/write operations")

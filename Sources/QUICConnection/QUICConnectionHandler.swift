@@ -240,7 +240,6 @@ public final class QUICConnectionHandler: Sendable {
                 result.connectionClosed = true
 
             case .handshakeDone:
-                print("[QUICConnectionHandler] Received HANDSHAKE_DONE frame")
                 processHandshakeDone()
                 result.handshakeComplete = true
 
@@ -303,7 +302,6 @@ public final class QUICConnectionHandler: Sendable {
                 result.pathResponseData.append(data)
 
             case .newConnectionID(let frame):
-                print("[QUICConnectionHandler] Received NEW_CONNECTION_ID: CID=\(frame.connectionID), seq=\(frame.sequenceNumber), retirePriorTo=\(frame.retirePriorTo)")
                 // Process using ConnectionIDManager
                 // RFC 9000 §5.1.1: Validates duplicate sequence numbers and limit
                 try connectionIDManager.handleNewConnectionID(frame)
@@ -421,7 +419,6 @@ public final class QUICConnectionHandler: Sendable {
     ///
     /// This enables stream frame generation in getOutboundPackets().
     public func markHandshakeComplete() {
-        print("[QUICConnectionHandler] Marking handshake complete")
         handshakeComplete.withLock { $0 = true }
         connectionState.withLock { $0.status = .established }
         pnSpaceManager.handshakeConfirmed = true
@@ -518,22 +515,22 @@ public final class QUICConnectionHandler: Sendable {
         }
 
         // Update key schedule
-        keySchedule.withLock { schedule in
-            switch info.level {
-            case .handshake:
-                _ = try? schedule.setHandshakeSecrets(
-                    clientSecret: clientSecret,
-                    serverSecret: serverSecret
-                )
-            case .application:
-                _ = try? schedule.setApplicationSecrets(
-                    clientSecret: clientSecret,
-                    serverSecret: serverSecret
-                )
-            default:
-                break
-            }
+        var updatedSchedule = keySchedule.withLock { $0 }
+        switch info.level {
+        case .handshake:
+            _ = try updatedSchedule.setHandshakeSecrets(
+                clientSecret: clientSecret,
+                serverSecret: serverSecret
+            )
+        case .application:
+            _ = try updatedSchedule.setApplicationSecrets(
+                clientSecret: clientSecret,
+                serverSecret: serverSecret
+            )
+        default:
+            break
         }
+        keySchedule.withLock { $0 = updatedSchedule }
     }
 
     /// Gets the crypto context for an encryption level
@@ -566,9 +563,6 @@ public final class QUICConnectionHandler: Sendable {
         // Generate stream frames (only at application level)
         if handshakeComplete.withLock({ $0 }) {
             let streamFrames = streamManager.generateStreamFrames(maxBytes: 1200)
-            if !streamFrames.isEmpty {
-                print("[QUICConnectionHandler] Generated \(streamFrames.count) stream frames")
-            }
             for streamFrame in streamFrames {
                 queueFrame(.stream(streamFrame), level: .application)
             }
@@ -578,8 +572,6 @@ public final class QUICConnectionHandler: Sendable {
             for flowFrame in flowFrames {
                 queueFrame(flowFrame, level: .application)
             }
-        } else {
-            print("[QUICConnectionHandler] Handshake not complete, skipping stream frame generation")
         }
 
         // Get queued packets
@@ -601,7 +593,6 @@ public final class QUICConnectionHandler: Sendable {
     /// Queues CRYPTO frames to be sent
     public func queueCryptoData(_ data: Data, level: EncryptionLevel) {
         let frames = cryptoStreamManager.createFrames(for: data, at: level)
-        print("[QUICConnectionHandler] Queueing \(frames.count) CRYPTO frames (\(data.count) bytes) at \(level)")
         for frame in frames {
             queueFrame(.crypto(frame), level: level)
         }

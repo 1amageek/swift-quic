@@ -107,7 +107,7 @@ public struct X509Certificate: Sendable {
 
     /// Whether this is a CA certificate (based on BasicConstraints)
     public var isCA: Bool {
-        guard let bc = try? certificate.extensions.basicConstraints else {
+        guard let bc = basicConstraints else {
             return false
         }
         switch bc {
@@ -120,7 +120,7 @@ public struct X509Certificate: Sendable {
 
     /// Path length constraint (if any)
     public var pathLengthConstraint: Int? {
-        guard let bc = try? certificate.extensions.basicConstraints else {
+        guard let bc = basicConstraints else {
             return nil
         }
         switch bc {

@@ -254,7 +254,7 @@ struct RecoveryBenchmarkTests {
         var ranges: [AckRange] = []
         ranges.append(AckRange(gap: 0, rangeLength: 9)) // 490-499
         for _ in 1..<25 {
-            ranges.append(AckRange(gap: 8, rangeLength: 9)) // gap=8 means 10 missing
+            ranges.append(AckRange(gap: 9, rangeLength: 9)) // gap=9 means 10 missing
         }
 
         let ackFrame = AckFrame(
