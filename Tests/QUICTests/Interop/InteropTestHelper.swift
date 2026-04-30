@@ -140,7 +140,7 @@ extension Tag {
 }
 
 /// Trait that enables test only when Docker is running
-struct DockerRequired: TestTrait {
+struct DockerRequired: SuiteTrait, TestTrait {
     static var isRecursive: Bool { false }
 
     var isEnabled: Bool {

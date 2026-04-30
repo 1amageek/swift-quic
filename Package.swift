@@ -25,7 +25,7 @@ let package = Package(
     ],
     dependencies: [
         // UDP transport
-        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.0"),
+        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.1"),
 
         // Cryptography
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
@@ -72,6 +72,7 @@ let package = Package(
                 "QUICCrypto",
                 "QUICStream",
                 "QUICRecovery",
+                .product(name: "Crypto", package: "swift-crypto"),
             ],
             path: "Sources/QUICConnection",
             exclude: ["CONTEXT.md"]

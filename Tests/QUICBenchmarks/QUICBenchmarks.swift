@@ -33,11 +33,11 @@ struct QUICBenchmarks {
         )
 
         let remoteAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = router.route(data: testPacket, from: remoteAddress)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("ConnectionRouter lookup: \(Int(opsPerSecond)) ops/sec")
@@ -58,11 +58,11 @@ struct QUICBenchmarks {
 
         let iterations = 100_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try processor.extractDestinationConnectionID(from: shortHeaderPacket)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("DCID extraction (short header): \(Int(opsPerSecond)) ops/sec")
@@ -80,11 +80,11 @@ struct QUICBenchmarks {
 
         let iterations = 100_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try processor.extractDestinationConnectionID(from: longHeaderPacket)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("DCID extraction (long header): \(Int(opsPerSecond)) ops/sec")
@@ -98,7 +98,7 @@ struct QUICBenchmarks {
         let connectionID = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
         let iterations = 1_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             let processor = PacketProcessor(dcidLength: 8)
             _ = try processor.deriveAndInstallInitialKeys(
@@ -107,7 +107,7 @@ struct QUICBenchmarks {
                 version: .v1
             )
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("Initial key derivation: \(Int(opsPerSecond)) ops/sec (\(elapsed * 1000 / Double(iterations)) ms/op)")
@@ -128,13 +128,13 @@ struct QUICBenchmarks {
 
         let iterations = 100_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for packet in packets {
                 _ = try processor.extractPacketType(from: packet)
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * packets.count
         let opsPerSecond = Double(totalOps) / elapsed
@@ -151,11 +151,11 @@ struct QUICBenchmarks {
         let secret = SymmetricKey(data: secretData)
         let iterations = 5_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try KeyMaterial.derive(from: secret)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("KeyMaterial derivation: \(Int(opsPerSecond)) ops/sec")
@@ -169,11 +169,11 @@ struct QUICBenchmarks {
         let keyMaterial = try KeyMaterial.derive(from: secret)
         let iterations = 10_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try AES128GCMSealer(keyMaterial: keyMaterial)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("AES-GCM Sealer creation: \(Int(opsPerSecond)) ops/sec")
@@ -186,11 +186,11 @@ struct QUICBenchmarks {
     func connectionIDRandomGenerationPerformance() throws {
         let iterations = 50_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = ConnectionID.random(length: 8)!
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("ConnectionID random: \(Int(opsPerSecond)) ops/sec")
@@ -204,13 +204,13 @@ struct QUICBenchmarks {
         }
         let iterations = 100_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for cid in cids {
                 _ = cid.hashValue
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * cids.count
         let opsPerSecond = Double(totalOps) / elapsed
@@ -236,13 +236,13 @@ struct QUICBenchmarks {
         let lookupCids = cids.shuffled()
         let iterations = 10_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for cid in lookupCids {
                 _ = dict[cid]
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * lookupCids.count
         let opsPerSecond = Double(totalOps) / elapsed

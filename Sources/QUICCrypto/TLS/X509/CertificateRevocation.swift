@@ -4,6 +4,9 @@
 /// Designed for QUIC/TLS where online checking may impact handshake latency.
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Crypto
 @preconcurrency import X509
 import SwiftASN1

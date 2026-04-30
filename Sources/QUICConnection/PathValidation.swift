@@ -202,11 +202,7 @@ public final class PathValidationManager: Sendable {
 
     /// Generates random 8-byte challenge data
     private func generateChallengeData() -> Data {
-        var data = Data(count: 8)
-        data.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 8, ptr.baseAddress!)
-        }
-        return data
+        ConnectionSecureRandom.bytes(count: 8)
     }
 }
 
@@ -422,10 +418,6 @@ public final class ConnectionIDManager: Sendable {
 
     /// Generates a random 16-byte stateless reset token
     private func generateStatelessResetToken() -> Data {
-        var token = Data(count: 16)
-        token.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
-        }
-        return token
+        ConnectionSecureRandom.bytes(count: 16)
     }
 }

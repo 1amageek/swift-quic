@@ -20,13 +20,13 @@ struct CoreBenchmarks {
         let values: [UInt64] = [0, 63, 16383, 1073741823, 4611686018427387903]
         let iterations = 10_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for value in values {
                 _ = Varint(value).encode()
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * values.count
         let opsPerSecond = Double(totalOps) / elapsed
@@ -45,14 +45,14 @@ struct CoreBenchmarks {
         ]
         let iterations = 10_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for encoded in encodedValues {
                 var reader = DataReader(encoded)
                 _ = try reader.readVarint()
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * encodedValues.count
         let opsPerSecond = Double(totalOps) / elapsed
@@ -66,14 +66,14 @@ struct CoreBenchmarks {
         let oneByteValues = (0..<64).map { Varint(UInt64($0)).encode() }
         let iterations = 50_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for encoded in oneByteValues {
                 var reader = DataReader(encoded)
                 _ = try reader.readVarintValue()
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * oneByteValues.count
         let opsPerSecond = Double(totalOps) / elapsed
@@ -87,12 +87,12 @@ struct CoreBenchmarks {
     func connectionIDCreationPerformance() throws {
         let iterations = 100_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for i in 0..<iterations {
             let bytes = Data([UInt8(i & 0xFF), 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07])
             _ = try ConnectionID(bytes: bytes)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("ConnectionID creation: \(Int(opsPerSecond)) ops/sec")
@@ -105,11 +105,11 @@ struct CoreBenchmarks {
         let cid2 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
         let iterations = 1_000_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = cid1 == cid2
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("ConnectionID equality: \(Int(opsPerSecond)) ops/sec")
@@ -124,11 +124,11 @@ struct CoreBenchmarks {
         let frame = Frame.ping
         let iterations = 100_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try codec.encode(frame)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("PING frame encoding: \(Int(opsPerSecond)) ops/sec")
@@ -145,11 +145,11 @@ struct CoreBenchmarks {
         ))
         let iterations = 50_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try codec.encode(frame)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("ACK frame encoding: \(Int(opsPerSecond)) ops/sec")
@@ -168,11 +168,11 @@ struct CoreBenchmarks {
         ))
         let iterations = 10_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try codec.encode(frame)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("STREAM frame encoding: \(Int(opsPerSecond)) ops/sec")
@@ -187,12 +187,12 @@ struct CoreBenchmarks {
         let encoded = try codec.encode(.ping)
         let iterations = 100_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             var reader = DataReader(encoded)
             _ = try codec.decode(from: &reader)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("PING frame decoding: \(Int(opsPerSecond)) ops/sec")
@@ -210,12 +210,12 @@ struct CoreBenchmarks {
         let encoded = try codec.encode(frame)
         let iterations = 50_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             var reader = DataReader(encoded)
             _ = try codec.decode(from: &reader)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("ACK frame decoding: \(Int(opsPerSecond)) ops/sec")
@@ -239,11 +239,11 @@ struct CoreBenchmarks {
 
         let iterations = 50_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try ProtectedLongHeader.parse(from: packet)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("Long header parsing: \(Int(opsPerSecond)) ops/sec")
@@ -259,11 +259,11 @@ struct CoreBenchmarks {
 
         let iterations = 100_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try ProtectedShortHeader.parse(from: packet, dcidLength: 4)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("Short header parsing: \(Int(opsPerSecond)) ops/sec")
@@ -277,13 +277,13 @@ struct CoreBenchmarks {
         let packetNumbers: [UInt64] = [0, 100, 10000, 1000000, 100000000]
         let iterations = 50_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for pn in packetNumbers {
                 _ = PacketNumberEncoding.encode(fullPacketNumber: pn, largestAcked: pn > 0 ? pn - 1 : nil)
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * packetNumbers.count
         let opsPerSecond = Double(totalOps) / elapsed
@@ -300,7 +300,7 @@ struct CoreBenchmarks {
         ]
         let iterations = 50_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for tc in testCases {
                 _ = PacketNumberEncoding.decode(
@@ -310,7 +310,7 @@ struct CoreBenchmarks {
                 )
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * testCases.count
         let opsPerSecond = Double(totalOps) / elapsed
@@ -327,7 +327,7 @@ struct CoreBenchmarks {
         let packet3 = Data(repeating: 0xCC, count: 300)
         let iterations = 50_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             var builder = CoalescedPacketBuilder(maxDatagramSize: 1200)
             _ = builder.addPacket(packet1)
@@ -335,7 +335,7 @@ struct CoreBenchmarks {
             _ = builder.addPacket(packet3)
             _ = builder.build()
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("Coalesced packet building: \(Int(opsPerSecond)) ops/sec")
@@ -372,11 +372,11 @@ struct CoreBenchmarks {
 
         let iterations = 20_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             _ = try CoalescedPacketParser.parse(datagram: datagram, dcidLength: 2)
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let opsPerSecond = Double(iterations) / elapsed
         print("Coalesced packet parsing: \(Int(opsPerSecond)) ops/sec")
@@ -396,7 +396,7 @@ struct CoreBenchmarks {
         ]
         let iterations = 10_000
 
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for frame in frames {
                 let encoded = try codec.encode(frame)
@@ -404,7 +404,7 @@ struct CoreBenchmarks {
                 _ = try codec.decode(from: &reader)
             }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
         let totalOps = iterations * frames.count
         let opsPerSecond = Double(totalOps) / elapsed

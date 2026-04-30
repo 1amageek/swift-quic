@@ -51,10 +51,7 @@ public struct ClientHello: Sendable {
         cipherSuites: [CipherSuite] = [.tls_aes_128_gcm_sha256],
         extensions: [TLSExtension]
     ) {
-        var random = Data(count: TLSConstants.randomLength)
-        random.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, TLSConstants.randomLength, ptr.baseAddress!)
-        }
+        let random = SecureRandom.bytes(count: TLSConstants.randomLength)
         self.init(random: random, legacySessionID: legacySessionID, cipherSuites: cipherSuites, extensions: extensions)
     }
 

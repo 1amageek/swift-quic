@@ -37,10 +37,7 @@ public struct StatelessResetToken: Sendable, Hashable {
 
     /// Generates a new random stateless reset token
     public static func generate() -> StatelessResetToken {
-        var tokenData = Data(count: 16)
-        tokenData.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
-        }
+        let tokenData = ConnectionSecureRandom.bytes(count: 16)
         return StatelessResetToken(validatedData: tokenData)
     }
 
@@ -90,10 +87,7 @@ public struct StatelessResetPacket: Sendable {
 
         // Random bytes = total size - 16 (token) - 1 (fixed bits byte)
         let randomSize = max(minimumSize - 16 - 1, 4)
-        var random = Data(count: randomSize)
-        random.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, randomSize, ptr.baseAddress!)
-        }
+        let random = ConnectionSecureRandom.bytes(count: randomSize)
         self.randomBytes = random
     }
 

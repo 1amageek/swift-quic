@@ -1151,10 +1151,7 @@ public final class ServerStateMachine: Sendable {
             }
 
             // Generate random ticket_age_add
-            var ticketAgeAdd: UInt32 = 0
-            withUnsafeMutableBytes(of: &ticketAgeAdd) { ptr in
-                _ = SecRandomCopyBytes(kSecRandomDefault, 4, ptr.baseAddress!)
-            }
+            let ticketAgeAdd = SecureRandom.uint32()
 
             // Create stored session
             let session = SessionTicketStore.StoredSession(

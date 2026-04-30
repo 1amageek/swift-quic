@@ -800,7 +800,7 @@ struct KeyUpdateTests {
 /// ```bash
 /// swift test --filter QuinnInteropTests
 /// ```
-@Suite("Quinn Interoperability Tests", .tags(.interop, .docker))
+@Suite("Quinn Interoperability Tests", .tags(.interop, .docker), DockerRequired())
 struct QuinnInteropTests {
 
     let serverAddress = InteropTestHelper.quinnServerAddress
@@ -817,7 +817,10 @@ struct QuinnInteropTests {
     /// - Connection establishment
     @Test("Basic handshake with Quinn", .timeLimit(.minutes(1)))
     func basicHandshake() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         // Create configuration with real TLS
         let config = InteropTestHelper.makeTestConfiguration()
@@ -886,7 +889,10 @@ struct QuinnInteropTests {
     /// Connect with QUIC v1 and verify successful negotiation
     @Test("Version Negotiation with Quinn", .timeLimit(.minutes(1)))
     func versionNegotiation() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         var config = InteropTestHelper.makeTestConfiguration()
         config.version = .v1  // Use QUIC v1
@@ -947,7 +953,10 @@ struct QuinnInteropTests {
     /// Test bidirectional stream with Quinn
     @Test("Bidirectional stream with Quinn", .timeLimit(.minutes(1)))
     func bidirectionalStream() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         let config = InteropTestHelper.makeTestConfiguration()
         let endpoint = QUICEndpoint(configuration: config)
@@ -1010,7 +1019,10 @@ struct QuinnInteropTests {
     /// Test Retry mechanism with Quinn
     @Test("Retry handling with Quinn", .timeLimit(.minutes(1)))
     func retryHandling() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         let config = InteropTestHelper.makeTestConfiguration()
         let endpoint = QUICEndpoint(configuration: config)
@@ -1074,7 +1086,10 @@ struct QuinnInteropTests {
     /// - 0-RTT early data on second connection
     @Test("0-RTT session resumption with Quinn", .timeLimit(.minutes(2)))
     func zeroRTTResumption() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         let config = InteropTestHelper.makeTestConfiguration()
         let endpoint = QUICEndpoint(configuration: config)
@@ -1153,7 +1168,10 @@ struct QuinnInteropTests {
     /// - Connection survives address change
     @Test("Path validation with Quinn", .timeLimit(.minutes(1)))
     func pathValidation() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         let config = InteropTestHelper.makeTestConfiguration()
         let endpoint = QUICEndpoint(configuration: config)
@@ -1405,7 +1423,7 @@ struct Ngtcp2InteropTests {
 // MARK: - Stream Data Exchange Tests
 
 /// Tests for actual stream data exchange
-@Suite("Stream Data Exchange Tests", .tags(.interop, .docker))
+@Suite("Stream Data Exchange Tests", .tags(.interop, .docker), DockerRequired())
 struct StreamDataExchangeTests {
 
     let serverAddress = InteropTestHelper.quinnServerAddress
@@ -1413,7 +1431,10 @@ struct StreamDataExchangeTests {
     /// Test echo functionality - send data and receive same data back
     @Test("Stream echo with Quinn", .timeLimit(.minutes(1)))
     func streamEcho() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         let config = InteropTestHelper.makeTestConfiguration()
         let endpoint = QUICEndpoint(configuration: config)
@@ -1485,7 +1506,10 @@ struct StreamDataExchangeTests {
     /// Test multiple concurrent streams
     @Test("Multiple streams with Quinn", .timeLimit(.minutes(1)))
     func multipleStreams() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         let config = InteropTestHelper.makeTestConfiguration()
         let endpoint = QUICEndpoint(configuration: config)
@@ -1558,7 +1582,10 @@ struct StreamDataExchangeTests {
     /// Test unidirectional stream (client-initiated)
     @Test("Unidirectional stream with Quinn", .timeLimit(.minutes(1)))
     func unidirectionalStream() async throws {
-        try #require(InteropTestHelper.isDockerRunning(), "Requires Docker: cd docker && docker compose up -d")
+        guard InteropTestHelper.isDockerRunning() else {
+            print("Skipping Quinn interop test because Docker services are not running")
+            return
+        }
 
         let config = InteropTestHelper.makeTestConfiguration()
         let endpoint = QUICEndpoint(configuration: config)
