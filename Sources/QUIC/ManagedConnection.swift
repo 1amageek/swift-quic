@@ -722,8 +722,6 @@ public final class ManagedConnection: Sendable {
             case .handshakeData(let data, let level):
                 // Queue CRYPTO frames
                 handler.queueCryptoData(data, level: level)
-                // Signal that packets need to be sent
-                signalNeedsSend()
 
             case .keysAvailable(let info):
                 // Install keys via PacketProcessor (single source of truth for crypto)
@@ -752,7 +750,6 @@ public final class ManagedConnection: Sendable {
                 let role = state.withLock { $0.role }
                 if role == .server {
                     handler.queueFrame(.handshakeDone, level: .application)
-                    signalNeedsSend()
                 }
 
                 // Mark handshake as established but don't discard keys yet

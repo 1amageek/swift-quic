@@ -66,7 +66,7 @@ public actor QUICEndpoint {
     private var socket: (any QUICSocket)?
 
     /// Task running the main I/O loop
-    private var ioTask: Task<Void, Never>?
+    private var ioTask: Task<Void, Error>?
 
     /// Local address
     private var _localAddress: SocketAddress?
@@ -227,6 +227,7 @@ public actor QUICEndpoint {
         let runTask = Task {
             try await endpoint.run(socket: socket)
         }
+        await endpoint.setIOTask(runTask)
 
         // Wait briefly for the socket to start and get the address
         try await Task.sleep(for: .milliseconds(10))
@@ -241,6 +242,11 @@ public actor QUICEndpoint {
     /// Sets the local address (internal)
     private func setLocalAddress(_ address: SocketAddress) {
         _localAddress = address
+    }
+
+    /// Stores the endpoint I/O task so shutdown can wait for packet-loop completion.
+    private func setIOTask(_ task: Task<Void, Error>) {
+        ioTask = task
     }
 
     /// The local address this endpoint is bound to
@@ -296,6 +302,7 @@ public actor QUICEndpoint {
         let runTask = Task { [self] in
             try await runPacketLoop(socket: socket)
         }
+        self.ioTask = runTask
 
         // Connect (this returns immediately, handshake not complete)
         let connection = try await connect(to: address)
@@ -970,6 +977,8 @@ public actor QUICEndpoint {
     public func shutdown() async throws {
         guard isRunning else { return }
         shouldStop = true
+        let task = ioTask
+        ioTask = nil
 
         // Finish the incoming connections stream
         incomingConnectionContinuation?.finish()
@@ -979,6 +988,17 @@ public actor QUICEndpoint {
         // This will cause the packetReceiveLoop's for-await to exit
         if let socket = socket {
             try await socket.shutdown()
+        }
+
+        if let task {
+            do {
+                _ = try await task.value
+            } catch {
+                logger.debug(
+                    "Endpoint I/O task ended during shutdown",
+                    metadata: ["error": "\(error)"]
+                )
+            }
         }
     }
 
