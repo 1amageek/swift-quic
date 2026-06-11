@@ -217,6 +217,18 @@ struct X509Tests {
         #expect(encoded == Data([0x02, 0x02, 0x00, 0x80]))
     }
 
+    @Test("ASN1Builder strips redundant leading zeros")
+    func buildIntegerStripsLeadingZeros() throws {
+        // Regression: the strip loop used to trap because Data.removeFirst()
+        // shifts startIndex while the loop kept subscripting from zero.
+        #expect(ASN1Builder.integer(Data([0x00, 0x2A])) == Data([0x02, 0x01, 0x2A]))
+        #expect(ASN1Builder.integer(Data([0x00, 0x00, 0x01])) == Data([0x02, 0x01, 0x01]))
+        // A zero needed for sign must be preserved
+        #expect(ASN1Builder.integer(Data([0x00, 0x80])) == Data([0x02, 0x02, 0x00, 0x80]))
+        // All-zero input collapses to a single zero octet
+        #expect(ASN1Builder.integer(Data([0x00, 0x00])) == Data([0x02, 0x01, 0x00]))
+    }
+
     @Test("ASN1Builder builds SEQUENCE")
     func buildSequence() throws {
         let int1 = ASN1Builder.integer(Data([0x01]))

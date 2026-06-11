@@ -241,16 +241,18 @@ public struct ASN1Builder: Sendable {
 
     /// Encodes an INTEGER
     public static func integer(_ value: Data) -> Data {
-        var content = value
+        // Operate on [UInt8]: Data.removeFirst() shifts startIndex, so the
+        // zero-based subscripts below would trap on the next iteration.
+        var bytes = [UInt8](value)
         // Add leading zero if high bit is set (to keep it positive)
-        if let first = content.first, first & 0x80 != 0 {
-            content.insert(0x00, at: 0)
+        if let first = bytes.first, first & 0x80 != 0 {
+            bytes.insert(0x00, at: 0)
         }
         // Remove leading zeros (except if needed for sign)
-        while content.count > 1 && content[0] == 0x00 && content[1] & 0x80 == 0 {
-            content.removeFirst()
+        while bytes.count > 1 && bytes[0] == 0x00 && bytes[1] & 0x80 == 0 {
+            bytes.removeFirst()
         }
-        return encode(tag: .integer, content: content)
+        return encode(tag: .integer, content: Data(bytes))
     }
 
     /// Encodes an OBJECT IDENTIFIER
