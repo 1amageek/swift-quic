@@ -5,6 +5,12 @@
 import Foundation
 import QUICCore
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Error thrown by TransportParameterCodec
 public enum TransportParameterError: Error, Sendable {
     /// Duplicate parameter ID encountered
@@ -36,6 +42,16 @@ public struct TransportParameterCodec: Sendable {
 
     /// Minimum value for active_connection_id_limit
     public static let minActiveConnectionIDLimit: UInt64 = 2
+
+    /// Maximum value we will honor for active_connection_id_limit.
+    ///
+    /// RFC 9000 §18.2 does not bound this parameter, but it directly sizes the number of
+    /// peer connection IDs we are willing to store. An unbounded value would let a peer flood
+    /// us with NEW_CONNECTION_ID frames and exhaust memory. We therefore cap the effective
+    /// limit to a small, practical maximum (a single migration rarely needs more than a
+    /// handful of CIDs). This is a local resource bound on a control parameter, not an error:
+    /// a peer advertising a larger willingness is simply honored up to this ceiling.
+    public static let maxActiveConnectionIDLimit: UInt64 = 8
 
     // MARK: - Encoding
 
@@ -222,10 +238,20 @@ public struct TransportParameterCodec: Sendable {
             valueWriter.writeUInt16(0)
         }
 
-        // IPv6 address (16 bytes) + port (2 bytes)
-        // Simplified: write zeros for IPv6 (not fully implemented)
-        for _ in 0..<16 { valueWriter.writeByte(0) }
-        valueWriter.writeUInt16(addr.ipv6Port ?? 0)
+        // IPv6 address (16 bytes) + port (2 bytes).
+        // RFC 9000 §18.2: omitting an address family is signaled by all-zero bytes and a zero
+        // port. We fully serialize a present IPv6 address; absence is encoded as zeros.
+        if let ipv6 = addr.ipv6Address, let port = addr.ipv6Port,
+           let bytes = Self.parseIPv6(ipv6) {
+            valueWriter.writeBytes(Data(bytes))
+            valueWriter.writeUInt16(port)
+        } else {
+            // A non-parseable IPv6 string is a caller error (PreferredAddress should hold a
+            // valid address). Flag it in debug; we never emit a partial/garbage address.
+            assert(addr.ipv6Address == nil, "PreferredAddress.ipv6Address must be a valid IPv6 literal")
+            for _ in 0..<16 { valueWriter.writeByte(0) }
+            valueWriter.writeUInt16(0)
+        }
 
         // Connection ID length (1 byte) + Connection ID
         valueWriter.writeByte(UInt8(addr.connectionID.length))
@@ -334,7 +360,10 @@ public struct TransportParameterCodec: Sendable {
                     reason: "Must be >= \(minActiveConnectionIDLimit), got \(limit)"
                 )
             }
-            params.activeConnectionIDLimit = limit
+            // Cap the effective limit to bound peer-CID storage (see maxActiveConnectionIDLimit).
+            // A value beyond the ceiling is honored up to the ceiling rather than rejected,
+            // because this parameter is a resource control rather than a correctness invariant.
+            params.activeConnectionIDLimit = min(limit, maxActiveConnectionIDLimit)
 
         case .initialSourceConnectionID:
             params.initialSourceConnectionID = try ConnectionID(bytes: value)
@@ -359,8 +388,8 @@ public struct TransportParameterCodec: Sendable {
         }
 
         // IPv6: 16 bytes address + 2 bytes port
-        guard let _ = reader.readBytes(16),
-              let ipv6Port = reader.readUInt16() else {
+        guard let ipv6Bytes = reader.readBytes(16),
+              let ipv6PortValue = reader.readUInt16() else {
             throw TransportParameterError.decodeError("Invalid preferred address IPv6")
         }
 
@@ -382,16 +411,65 @@ public struct TransportParameterCodec: Sendable {
             throw TransportParameterError.decodeError("Invalid preferred address reset token")
         }
 
-        // Parse IPv4 address string
-        let ipv4Address = ipv4Bytes.map { String($0) }.joined(separator: ".")
+        // RFC 9000 §18.2: an address family that is not offered is encoded as all-zero address
+        // bytes and a zero port. Decode an all-zero family as "absent" (nil) rather than as the
+        // wildcard literal, which would be an unusable migration target.
+        let ipv4AllZero = ipv4Bytes.allSatisfy { $0 == 0 } && ipv4Port == 0
+        let ipv4Address = ipv4AllZero ? nil : ipv4Bytes.map { String($0) }.joined(separator: ".")
+        let ipv4PortDecoded: UInt16? = ipv4AllZero ? nil : ipv4Port
+
+        let ipv6AllZero = ipv6Bytes.allSatisfy { $0 == 0 } && ipv6PortValue == 0
+        let ipv6Address: String?
+        let ipv6PortDecoded: UInt16?
+        if ipv6AllZero {
+            ipv6Address = nil
+            ipv6PortDecoded = nil
+        } else {
+            // Fully parse the 16-byte IPv6 address into its canonical textual form so the
+            // migration target is actually usable (no silent zero/discard).
+            guard let formatted = Self.formatIPv6([UInt8](ipv6Bytes)) else {
+                throw TransportParameterError.decodeError("Invalid preferred address IPv6 bytes")
+            }
+            ipv6Address = formatted
+            ipv6PortDecoded = ipv6PortValue
+        }
 
         return PreferredAddress(
             ipv4Address: ipv4Address,
-            ipv4Port: ipv4Port,
-            ipv6Address: nil,  // IPv6 parsing simplified
-            ipv6Port: ipv6Port,
+            ipv4Port: ipv4PortDecoded,
+            ipv6Address: ipv6Address,
+            ipv6Port: ipv6PortDecoded,
             connectionID: try ConnectionID(bytes: cidBytes),
             statelessResetToken: resetToken
         )
+    }
+
+    // MARK: - IPv6 Address Helpers
+
+    /// Parses an IPv6 textual address into its 16-byte network representation.
+    /// - Returns: 16 bytes, or `nil` if the string is not a valid IPv6 literal.
+    static func parseIPv6(_ string: String) -> [UInt8]? {
+        var addr = in6_addr()
+        let result = string.withCString { cString in
+            inet_pton(AF_INET6, cString, &addr)
+        }
+        guard result == 1 else { return nil }
+        return withUnsafeBytes(of: &addr) { Array($0) }
+    }
+
+    /// Formats a 16-byte IPv6 network representation into its canonical textual form.
+    /// - Returns: The textual address, or `nil` if the byte count is wrong or formatting fails.
+    static func formatIPv6(_ bytes: [UInt8]) -> String? {
+        guard bytes.count == 16 else { return nil }
+        var addr = in6_addr()
+        withUnsafeMutableBytes(of: &addr) { raw in
+            bytes.withUnsafeBytes { src in
+                raw.copyMemory(from: src)
+            }
+        }
+        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        let result = inet_ntop(AF_INET6, &addr, &buffer, socklen_t(INET6_ADDRSTRLEN))
+        guard result != nil else { return nil }
+        return String(cString: buffer)
     }
 }

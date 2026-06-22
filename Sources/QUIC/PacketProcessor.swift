@@ -5,6 +5,7 @@
 /// convenient packet processing.
 
 import Foundation
+import Crypto
 import QUICCore
 import QUICCrypto
 import Synchronization
@@ -38,6 +39,22 @@ public final class PacketProcessor: Sendable {
     /// Largest packet numbers received per level (for PN decoding)
     private let largestReceivedPN: Mutex<[EncryptionLevel: UInt64]>
 
+    /// 1-RTT key update state (RFC 9001 §6). `nil` until application keys are installed.
+    ///
+    /// Holds the key-phase manager (current/previous/next openers and current sealer per phase)
+    /// and the AEAD usage limit tracker. Both are individually `Sendable` and thread-safe; the
+    /// `Mutex` only guards installation/replacement so the decrypt and encrypt paths read a
+    /// consistent snapshot.
+    private let keyPhaseState: Mutex<ApplicationKeyPhase?>
+
+    /// Bundles the 1-RTT key update managers installed once application keys are available.
+    private struct ApplicationKeyPhase: Sendable {
+        /// Manages key-phase openers/sealers and key derivation (RFC 9001 §6).
+        let phaseManager: KeyPhaseManager
+        /// Tracks AEAD confidentiality/integrity limits to decide when to rotate (RFC 9001 §6.6).
+        let updateManager: KeyUpdateManager
+    }
+
     /// Current DCID length (lock-free read)
     @inline(__always)
     public var dcidLengthValue: Int {
@@ -57,6 +74,7 @@ public final class PacketProcessor: Sendable {
         self.contexts = Mutex([:])
         self._dcidLength = Atomic(validLength)
         self.largestReceivedPN = Mutex([:])
+        self.keyPhaseState = Mutex(nil)
     }
 
     // MARK: - Crypto Context Management
@@ -145,6 +163,112 @@ public final class PacketProcessor: Sendable {
         // Install the crypto context
         let context = CryptoContext(opener: opener, sealer: sealer)
         installContext(context, for: info.level)
+
+        // RFC 9001 §6: for 1-RTT (application) keys, also stand up the key update machinery so the
+        // connection can rotate keys. The key-phase manager is seeded with a KeySchedule that
+        // carries the application secrets (required for "quic ku" derivation) and the negotiated
+        // cipher suite, so updates derive keys for the correct AEAD rather than a hardcoded one.
+        if info.level == .application {
+            try installApplicationKeyPhase(
+                clientSecret: clientSecret,
+                serverSecret: serverSecret,
+                cipherSuite: cipherSuite,
+                opener: opener,
+                sealer: sealer,
+                isClient: isClient
+            )
+        }
+    }
+
+    // MARK: - Key Update (RFC 9001 §6)
+
+    /// Installs the 1-RTT key update machinery once application keys are available.
+    ///
+    /// Builds a `KeySchedule` holding the application secrets and negotiated cipher suite (so
+    /// `updateKeys` can derive next-generation keys for the correct AEAD), wraps it in a
+    /// `KeyPhaseManager` seeded with the freshly installed opener/sealer at key phase 0, and a
+    /// `KeyUpdateManager` to track AEAD usage limits.
+    private func installApplicationKeyPhase(
+        clientSecret: SymmetricKey,
+        serverSecret: SymmetricKey,
+        cipherSuite: QUICCipherSuite,
+        opener: any PacketOpener,
+        sealer: any PacketSealer,
+        isClient: Bool
+    ) throws {
+        var schedule = KeySchedule()
+        _ = try schedule.setApplicationSecrets(
+            clientSecret: clientSecret,
+            serverSecret: serverSecret,
+            cipherSuite: cipherSuite
+        )
+        let phaseManager = KeyPhaseManager(keySchedule: schedule, isClient: isClient)
+        phaseManager.setInitialContext(KeyPhaseContext(opener: opener, sealer: sealer))
+        let updateManager = KeyUpdateManager(cipherSuite: cipherSuite)
+
+        keyPhaseState.withLock {
+            $0 = ApplicationKeyPhase(phaseManager: phaseManager, updateManager: updateManager)
+        }
+    }
+
+    /// Whether 1-RTT key update is wired (application keys installed).
+    public var isKeyUpdateWired: Bool {
+        keyPhaseState.withLock { $0 != nil }
+    }
+
+    /// The current 1-RTT send key phase (0 or 1), or `nil` if key update is not wired.
+    public var currentApplicationKeyPhase: UInt8? {
+        keyPhaseState.withLock { $0?.phaseManager.currentPhase }
+    }
+
+    /// Whether a local key update should be initiated based on AEAD usage limits (RFC 9001 §6.6).
+    ///
+    /// Returns `true` when the AEAD confidentiality limit is approaching or the integrity limit
+    /// has been exceeded, and the manager allows initiating an update.
+    public var shouldInitiateApplicationKeyUpdate: Bool {
+        keyPhaseState.withLock {
+            guard let state = $0 else { return false }
+            return state.updateManager.shouldInitiateKeyUpdate
+                && state.phaseManager.canInitiateKeyUpdate
+        }
+    }
+
+    /// Initiates a local 1-RTT key update (RFC 9001 §6.1).
+    ///
+    /// Derives the next-generation keys, toggles the send key phase, and retains the previous
+    /// opener so reordered packets sent under the old keys still decrypt. Subsequent outgoing
+    /// 1-RTT packets are sealed with the new keys and carry the toggled phase bit.
+    ///
+    /// - Returns: The new send key phase (0 or 1).
+    /// - Throws: `KeyPhaseError` if no application keys are present or an update is not allowed.
+    @discardableResult
+    public func initiateApplicationKeyUpdate() throws -> UInt8 {
+        try keyPhaseState.withLock {
+            guard let state = $0 else {
+                throw KeyPhaseError.noApplicationKeys
+            }
+            let newContext = try state.phaseManager.initiateKeyUpdate()
+            // Mirror the state into the usage tracker: mark initiated, then complete with the new
+            // phase so its usage counters reset for the new key generation.
+            state.updateManager.initiateKeyUpdate()
+            state.updateManager.keyUpdateComplete(newKeyPhase: newContext.currentPhase)
+            return newContext.currentPhase
+        }
+    }
+
+    /// Re-enables local key updates after the previous update's packets are acknowledged.
+    ///
+    /// RFC 9001 §6.1: an endpoint MUST NOT initiate a subsequent key update until it has received
+    /// an acknowledgement for a packet sent with the current keys.
+    public func allowApplicationKeyUpdate() {
+        keyPhaseState.withLock { $0?.phaseManager.enableKeyUpdate() }
+    }
+
+    /// Drives the application AEAD encryption counter forward, for tests that need to reach the
+    /// confidentiality limit without sealing millions of packets. Has no effect if key update is
+    /// not wired. Internal so it is reachable only via `@testable import`.
+    internal func forceApplicationAEADUsageForTesting(packetsEncrypted: UInt64) {
+        keyPhaseState.withLock { $0?.updateManager.recordEncryptions(packetsEncrypted) }
     }
 
     /// Discards keys for an encryption level
@@ -191,6 +315,13 @@ public final class PacketProcessor: Sendable {
             level = .application
         }
 
+        // RFC 9001 §6: short-header (1-RTT) packets go through the key-phase-aware path when key
+        // update is wired (application keys installed). Long-header packets never carry a key
+        // phase bit and keep the simple single-opener path.
+        if !isLongHeader, let appKeyPhase = keyPhaseState.withLock({ $0 }) {
+            return try decryptApplicationPacket(data, appKeyPhase: appKeyPhase)
+        }
+
         // Get opener for this level
         guard let ctx = contexts.withLock({ $0[level] }),
               let opener = ctx.opener else {
@@ -214,6 +345,67 @@ public final class PacketProcessor: Sendable {
         // Update largest PN if this is larger
         if parsed.packetNumber > largestPN {
             largestReceivedPN.withLock { $0[level] = parsed.packetNumber }
+        }
+
+        return parsed
+    }
+
+    /// Decrypts a 1-RTT (short header) packet using the key-phase manager (RFC 9001 §6).
+    ///
+    /// Header protection is removed using the current opener (HP key is phase-independent), the
+    /// Key Phase bit is read, and the AEAD opener is selected for that phase via the key-phase
+    /// manager. Critically, a key update is COMMITTED only after the AEAD successfully opens the
+    /// packet: a forged packet with a flipped phase bit fails AEAD and leaves committed keys
+    /// unchanged (RFC 9001 §6.3). The previous-phase opener is retained by the manager to handle
+    /// reordered packets across a key update.
+    private func decryptApplicationPacket(
+        _ data: Data,
+        appKeyPhase: ApplicationKeyPhase
+    ) throws -> ParsedPacket {
+        let phaseManager = appKeyPhase.phaseManager
+        let updateManager = appKeyPhase.updateManager
+
+        // Snapshot the committed phase and current opener (for header protection removal).
+        guard let context = phaseManager.context else {
+            throw PacketCodecError.noOpener
+        }
+        let committedPhase = context.currentPhase
+        let hpOpener = context.currentOpener
+
+        let largestPN = largestReceivedPN.withLock { $0[.application] ?? 0 }
+        let dcid = dcidLengthValue
+
+        let parsed: ParsedPacket
+        do {
+            parsed = try decoder.decodePacket(
+                data: data,
+                dcidLength: dcid,
+                longHeaderOpener: nil,  // short header path only
+                headerProtectionOpener: hpOpener,
+                // Selector runs after HP removal, when the phase bit is known. For a flipped phase
+                // it speculatively derives the next opener (without committing); for the committed
+                // phase or a reordered previous-phase packet it returns the existing opener.
+                shortHeaderOpenerSelector: { phase in
+                    try phaseManager.handleReceivedKeyPhase(phase)
+                },
+                largestPN: largestPN
+            )
+        } catch {
+            // RFC 9001 §6.6: a failed AEAD open counts toward the integrity limit. The key state
+            // is left untouched (no commit), so a forged packet cannot trigger a key update.
+            updateManager.recordDecryptionFailure()
+            throw error
+        }
+
+        // AEAD succeeded. If the packet's phase differs from the committed phase, the peer
+        // initiated a key update: commit it now (promotes the speculatively derived next keys).
+        if let packetPhase = parsed.keyPhase, packetPhase != committedPhase {
+            phaseManager.confirmKeyUpdate(phase: packetPhase)
+            updateManager.keyUpdateComplete(newKeyPhase: packetPhase)
+        }
+
+        if parsed.packetNumber > largestPN {
+            largestReceivedPN.withLock { $0[.application] = parsed.packetNumber }
         }
 
         return parsed
@@ -298,6 +490,31 @@ public final class PacketProcessor: Sendable {
         header: ShortHeader,
         packetNumber: UInt64
     ) throws -> Data {
+        // RFC 9001 §6: when key update is wired, the outgoing sealer and the Key Phase bit MUST
+        // come from the same source so they cannot disagree. Take both from the key-phase manager:
+        // the current sealer and the current send phase, rebuilding the header's phase bit.
+        if let appKeyPhase = keyPhaseState.withLock({ $0 }) {
+            guard let context = appKeyPhase.phaseManager.context else {
+                throw PacketCodecError.noSealer
+            }
+            // Record one encryption against the AEAD confidentiality limit (RFC 9001 §6.6).
+            appKeyPhase.updateManager.recordEncryption()
+
+            let phaseHeader = ShortHeader(
+                destinationConnectionID: header.destinationConnectionID,
+                packetNumber: packetNumber,
+                packetNumberLength: header.packetNumberLength,
+                spinBit: header.spinBit,
+                keyPhase: context.currentPhase == 1
+            )
+            return try encoder.encodeShortHeaderPacket(
+                frames: frames,
+                header: phaseHeader,
+                packetNumber: packetNumber,
+                sealer: context.currentSealer
+            )
+        }
+
         guard let ctx = contexts.withLock({ $0[.application] }),
               let sealer = ctx.sealer else {
             throw PacketCodecError.noSealer

@@ -85,6 +85,23 @@ public final class QUICConnectionHandler: Sendable {
     /// Stateless reset manager
     private let statelessResetManager: StatelessResetManager
 
+    /// Provides the remaining anti-amplification budget (bytes) for the current path, and
+    /// whether the current path is validated. Injected by the owning connection, which holds
+    /// the AntiAmplificationLimiter. Defaults to an unlimited, validated path so that callers
+    /// without an amplification context behave as before.
+    ///
+    /// RFC 9000 §8.2.1: a PATH_RESPONSE for an unvalidated path is charged against this budget.
+    private let amplificationContextProvider:
+        Mutex<@Sendable () -> (remainingBudget: UInt64, currentPath: NetworkPath?, isValidated: Bool)>
+        = Mutex({ (UInt64.max, nil, true) })
+
+    /// Sets the amplification-context provider used to gate PATH_RESPONSE emission.
+    public func setAmplificationContextProvider(
+        _ provider: @escaping @Sendable () -> (remainingBudget: UInt64, currentPath: NetworkPath?, isValidated: Bool)
+    ) {
+        amplificationContextProvider.withLock { $0 = provider }
+    }
+
     // MARK: - Initialization
 
     /// Creates a new connection handler
@@ -288,10 +305,27 @@ public final class QUICConnectionHandler: Sendable {
             // MARK: - Connection Migration Frames
 
             case .pathChallenge(let data):
-                // Handle challenge using PathValidationManager
-                // Queue PATH_RESPONSE frame to send back
-                let responseFrame = pathValidationManager.handleChallenge(data)
-                queueFrame(responseFrame, level: level)
+                // RFC 9000 §8.2.1: respond on the path the PATH_CHALLENGE arrived on, and for an
+                // unvalidated path charge the PATH_RESPONSE against the anti-amplification budget.
+                let amplification = amplificationContextProvider.withLock { $0() }
+                let responseFrame: Frame?
+                if let currentPath = amplification.currentPath {
+                    responseFrame = pathValidationManager.handleChallenge(
+                        data,
+                        on: currentPath,
+                        remainingAmplificationBudget: amplification.isValidated
+                            ? UInt64.max
+                            : amplification.remainingBudget
+                    )
+                } else {
+                    // No path context available: fall back to the unconditional response.
+                    responseFrame = pathValidationManager.handleChallenge(data)
+                }
+                // Only queue when the budget permitted a response now; otherwise it was recorded
+                // as pending and will be re-attempted once more amplification credit is available.
+                if let responseFrame {
+                    queueFrame(responseFrame, level: level)
+                }
                 result.pathChallengeData.append(data)
 
             case .pathResponse(let data):
@@ -525,7 +559,8 @@ public final class QUICConnectionHandler: Sendable {
         case .application:
             _ = try updatedSchedule.setApplicationSecrets(
                 clientSecret: clientSecret,
-                serverSecret: serverSecret
+                serverSecret: serverSecret,
+                cipherSuite: cipherSuite
             )
         default:
             break

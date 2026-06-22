@@ -787,4 +787,130 @@ struct FrameCodecTests {
             Issue.record("Second frame should be DATAGRAM")
         }
     }
+
+    // MARK: - NEW_CONNECTION_ID retire_prior_to bound (RFC 9000 §19.15)
+
+    /// Builds a NEW_CONNECTION_ID frame body on the wire.
+    private func encodeNewConnectionIDWire(
+        sequenceNumber: UInt64,
+        retirePriorTo: UInt64,
+        cid: [UInt8],
+        token: [UInt8]
+    ) -> Data {
+        var data = Data()
+        data.append(0x18)  // NEW_CONNECTION_ID type
+        Varint(sequenceNumber).encode(to: &data)
+        Varint(retirePriorTo).encode(to: &data)
+        data.append(UInt8(cid.count))
+        data.append(contentsOf: cid)
+        data.append(contentsOf: token)
+        return data
+    }
+
+    @Test("Hostile NEW_CONNECTION_ID with retire_prior_to > sequence_number is rejected at decode")
+    func newConnectionIDRetirePriorToExceedingSequenceRejected() throws {
+        // RFC 9000 §19.15: retire_prior_to MUST NOT exceed sequence_number.
+        // A hostile value (here the varint maximum) must be rejected at decode time,
+        // before any retirement loop can execute.
+        let token = Array(repeating: UInt8(0xAB), count: 16)
+        let hostile = encodeNewConnectionIDWire(
+            sequenceNumber: 1,
+            retirePriorTo: (1 << 62) - 1,  // 2^62-1, far greater than sequence number
+            cid: [0x01, 0x02, 0x03, 0x04],
+            token: token
+        )
+
+        var reader = DataReader(hostile)
+        #expect(throws: FrameCodecError.self) {
+            _ = try codec.decode(from: &reader)
+        }
+    }
+
+    @Test("NEW_CONNECTION_ID with retire_prior_to == sequence_number is accepted")
+    func newConnectionIDRetirePriorToEqualSequenceAccepted() throws {
+        let token = Array(repeating: UInt8(0xCD), count: 16)
+        let wire = encodeNewConnectionIDWire(
+            sequenceNumber: 5,
+            retirePriorTo: 5,
+            cid: [0x0A, 0x0B],
+            token: token
+        )
+
+        var reader = DataReader(wire)
+        let decoded = try codec.decode(from: &reader)
+        guard case .newConnectionID(let frame) = decoded else {
+            Issue.record("Expected NEW_CONNECTION_ID frame")
+            return
+        }
+        #expect(frame.sequenceNumber == 5)
+        #expect(frame.retirePriorTo == 5)
+    }
+
+    @Test("NewConnectionIDFrame init rejects retire_prior_to > sequence_number")
+    func newConnectionIDFrameInitRejectsOutOfRange() throws {
+        let token = Data(repeating: 0x11, count: 16)
+        let cid = try ConnectionID(bytes: Data([0x01, 0x02]))
+        #expect(throws: FrameError.retirePriorToExceedsSequenceNumber(retirePriorTo: 10, sequenceNumber: 3)) {
+            _ = try NewConnectionIDFrame(
+                sequenceNumber: 3,
+                retirePriorTo: 10,
+                connectionID: cid,
+                statelessResetToken: token
+            )
+        }
+    }
+
+    // MARK: - STREAM / CRYPTO final offset bound (RFC 9000 §4.5)
+
+    @Test("STREAM frame whose offset + length exceeds 2^62-1 is rejected at decode")
+    func streamFinalOffsetExceedsVarintMaxRejected() throws {
+        // RFC 9000 §4.5: the final offset (offset + length) must stay within 2^62-1.
+        let maxVarint: UInt64 = (1 << 62) - 1
+        var data = Data()
+        data.append(0x0E)  // STREAM with OFF (0x04) | LEN (0x02) bits set
+        Varint(0).encode(to: &data)           // Stream ID
+        Varint(maxVarint - 1).encode(to: &data)  // offset near the maximum
+        Varint(8).encode(to: &data)           // small length passes the data-length cap
+        data.append(contentsOf: Array(repeating: UInt8(0xFF), count: 8))
+
+        var reader = DataReader(data)
+        #expect(throws: FrameCodecError.self) {
+            _ = try codec.decode(from: &reader)
+        }
+    }
+
+    @Test("CRYPTO frame whose offset + length exceeds 2^62-1 is rejected at decode")
+    func cryptoFinalOffsetExceedsVarintMaxRejected() throws {
+        let maxVarint: UInt64 = (1 << 62) - 1
+        var data = Data()
+        data.append(0x06)  // CRYPTO type
+        Varint(maxVarint - 1).encode(to: &data)  // offset near the maximum
+        Varint(8).encode(to: &data)           // length pushes end offset past the max
+        data.append(contentsOf: Array(repeating: UInt8(0xEE), count: 8))
+
+        var reader = DataReader(data)
+        #expect(throws: FrameCodecError.self) {
+            _ = try codec.decode(from: &reader)
+        }
+    }
+
+    @Test("STREAM frame with valid offset + length near the maximum is accepted")
+    func streamFinalOffsetWithinRangeAccepted() throws {
+        let maxVarint: UInt64 = (1 << 62) - 1
+        var data = Data()
+        data.append(0x0E)  // STREAM with OFF | LEN
+        Varint(0).encode(to: &data)
+        Varint(maxVarint - 4).encode(to: &data)  // offset
+        Varint(4).encode(to: &data)              // length: end offset == max, valid
+        data.append(contentsOf: Array(repeating: UInt8(0x01), count: 4))
+
+        var reader = DataReader(data)
+        let decoded = try codec.decode(from: &reader)
+        guard case .stream(let frame) = decoded else {
+            Issue.record("Expected STREAM frame")
+            return
+        }
+        #expect(frame.offset == maxVarint - 4)
+        #expect(frame.data.count == 4)
+    }
 }

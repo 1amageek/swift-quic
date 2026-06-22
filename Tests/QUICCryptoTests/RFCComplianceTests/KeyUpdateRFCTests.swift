@@ -256,3 +256,119 @@ struct CryptoStateKeyPhaseRFCTests {
         // Documentation test - actual implementation should track this
     }
 }
+
+// MARK: - Key Update Cipher Suite Correctness (RFC 9001 §6)
+
+@Suite("RFC 9001 §6 - Key Update Cipher Suite Correctness")
+struct KeyUpdateCipherSuiteTests {
+
+    /// Builds a KeySchedule with application secrets installed under the given cipher suite.
+    private func makeSchedule(cipherSuite: QUICCipherSuite) throws -> KeySchedule {
+        var schedule = KeySchedule()
+        // Distinct, deterministic 32-byte secrets for client and server.
+        let clientSecret = SymmetricKey(data: Data(repeating: 0x11, count: 32))
+        let serverSecret = SymmetricKey(data: Data(repeating: 0x22, count: 32))
+        _ = try schedule.setApplicationSecrets(
+            clientSecret: clientSecret,
+            serverSecret: serverSecret,
+            cipherSuite: cipherSuite
+        )
+        return schedule
+    }
+
+    @Test("updateKeys preserves the negotiated cipher suite (ChaCha20-Poly1305)")
+    func updateKeysPreservesCipherSuite() throws {
+        var schedule = try makeSchedule(cipherSuite: .chacha20Poly1305Sha256)
+        let (clientKey, serverKey) = try schedule.updateKeys()
+        #expect(clientKey.cipherSuite == .chacha20Poly1305Sha256)
+        #expect(serverKey.cipherSuite == .chacha20Poly1305Sha256)
+        // ChaCha20 uses a 256-bit packet protection key.
+        #expect(clientKey.key.bitCount == 256)
+        #expect(serverKey.key.bitCount == 256)
+    }
+
+    @Test("updateKeys retains the header protection key (RFC 9001 §6.1)")
+    func updateKeysRetainsHeaderProtectionKey() throws {
+        var schedule = try makeSchedule(cipherSuite: .aes128GcmSha256)
+        let clientBefore = try #require(schedule.clientKeyMaterial(for: .application))
+        let serverBefore = try #require(schedule.serverKeyMaterial(for: .application))
+
+        let (clientAfter, serverAfter) = try schedule.updateKeys()
+
+        // RFC 9001 §6.1: the header protection key is NOT updated.
+        #expect(clientAfter.hp == clientBefore.hp)
+        #expect(serverAfter.hp == serverBefore.hp)
+        // The packet protection key and IV, by contrast, MUST change.
+        #expect(clientAfter.iv != clientBefore.iv)
+        #expect(serverAfter.iv != serverBefore.iv)
+    }
+
+    @Test("Key update under ChaCha20-Poly1305 produces usable keys (round-trip)")
+    func chaCha20KeyUpdateRoundTrips() throws {
+        var schedule = try makeSchedule(cipherSuite: .chacha20Poly1305Sha256)
+
+        // Build a KeyPhaseManager seeded with the current application keys (client perspective).
+        let clientKeysBefore = try #require(schedule.clientKeyMaterial(for: .application))
+        let serverKeysBefore = try #require(schedule.serverKeyMaterial(for: .application))
+        let (initialOpener, _) = try serverKeysBefore.createCrypto()  // client reads server keys
+        let (_, initialSealer) = try clientKeysBefore.createCrypto()  // client writes client keys
+
+        let manager = KeyPhaseManager(keySchedule: schedule, isClient: true)
+        manager.setInitialContext(KeyPhaseContext(opener: initialOpener, sealer: initialSealer))
+        #expect(manager.currentPhase == 0)
+
+        // Initiate a key update: the new sealer must be ChaCha20-Poly1305 and produce ciphertext
+        // a matching opener (derived from the same updated secret) can decrypt.
+        let newContext = try manager.initiateKeyUpdate()
+        #expect(newContext.currentPhase == 1)
+
+        // Derive the peer's opener for the new phase from the same updated schedule to confirm
+        // the negotiated AEAD is used end-to-end (a hardcoded AES opener would fail to open).
+        var verifySchedule = try makeSchedule(cipherSuite: .chacha20Poly1305Sha256)
+        let (updatedClient, _) = try verifySchedule.updateKeys()
+        let (peerOpener, _) = try updatedClient.createCrypto()
+
+        let plaintext = Data("key-update payload".utf8)
+        let pn: UInt64 = 42
+        let aad = Data([0x45, 0xAA, 0xBB])  // arbitrary header bytes
+        let ciphertext = try newContext.currentSealer.seal(plaintext: plaintext, packetNumber: pn, header: aad)
+        let recovered = try peerOpener.open(ciphertext: ciphertext, packetNumber: pn, header: aad)
+        #expect(recovered == plaintext)
+    }
+
+    @Test("Peer-initiated key update keeps the connection decrypting")
+    func peerInitiatedKeyUpdateDecrypts() throws {
+        // Server perspective: the peer (client) initiates a key update by sending a packet at the
+        // toggled phase. The manager must derive the next opener and confirm the update so that
+        // decryption continues to succeed.
+        let cipherSuite: QUICCipherSuite = .chacha20Poly1305Sha256
+
+        // Server's KeyPhaseManager seeded with current keys.
+        var serverSchedule = try makeSchedule(cipherSuite: cipherSuite)
+        let serverClientKeys = try #require(serverSchedule.clientKeyMaterial(for: .application))
+        let serverServerKeys = try #require(serverSchedule.serverKeyMaterial(for: .application))
+        let (serverOpener, _) = try serverClientKeys.createCrypto()   // server reads client keys
+        let (_, serverSealer) = try serverServerKeys.createCrypto()   // server writes server keys
+        let serverManager = KeyPhaseManager(keySchedule: serverSchedule, isClient: false)
+        serverManager.setInitialContext(KeyPhaseContext(opener: serverOpener, sealer: serverSealer))
+
+        // The client updates its keys and sends a packet sealed with its new (phase 1) client key.
+        var clientSchedule = try makeSchedule(cipherSuite: cipherSuite)
+        let (updatedClientKeys, _) = try clientSchedule.updateKeys()
+        let (_, clientNewSealer) = try updatedClientKeys.createCrypto()
+
+        let plaintext = Data("post-update from client".utf8)
+        let pn: UInt64 = 7
+        let aad = Data([0x45, 0x01, 0x02])
+        let ciphertext = try clientNewSealer.seal(plaintext: plaintext, packetNumber: pn, header: aad)
+
+        // Server observes the toggled phase (1) and derives the next opener.
+        let nextOpener = try serverManager.handleReceivedKeyPhase(1)
+        let recovered = try nextOpener.open(ciphertext: ciphertext, packetNumber: pn, header: aad)
+        #expect(recovered == plaintext)
+
+        // After a successful decrypt at the new phase, confirm the update.
+        serverManager.confirmKeyUpdate(phase: 1)
+        #expect(serverManager.currentPhase == 1)
+    }
+}

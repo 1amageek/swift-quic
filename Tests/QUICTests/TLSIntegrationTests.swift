@@ -1226,3 +1226,144 @@ struct TLS13HandlerDirectTests {
         }
     }
 }
+
+// MARK: - Transport Parameter CID Cross-Validation (RFC 9000 §7.3)
+
+@Suite("RFC 9000 §7.3 - Transport Parameter CID Cross-Validation")
+struct TransportParameterCIDValidationTests {
+
+    private static let serverSigningKey = SigningKey.generateP256()
+    private static let serverCertificateChain = [Data([0x30, 0x82, 0x01, 0x00])]
+
+    /// Creates a client ManagedConnection backed by the real TLS13Handler.
+    private func makeClient(dcid: ConnectionID, scid: ConnectionID) -> ManagedConnection {
+        let config = QUICConfiguration()
+        let params = TransportParameters(from: config, sourceConnectionID: scid)
+        var tlsConfig = TLSConfiguration.client(serverName: "localhost", alpnProtocols: ["h3"])
+        tlsConfig.expectedPeerPublicKey = Self.serverSigningKey.publicKeyBytes
+        let tlsProvider = TLS13Handler(configuration: tlsConfig)
+        return ManagedConnection(
+            role: .client,
+            version: .v1,
+            sourceConnectionID: scid,
+            destinationConnectionID: dcid,
+            transportParameters: params,
+            tlsProvider: tlsProvider,
+            remoteAddress: SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+        )
+    }
+
+    /// Creates a server ManagedConnection whose advertised initial_source_connection_id
+    /// can be tampered (set independently of the SCID actually used on the wire).
+    private func makeServer(
+        dcid: ConnectionID,
+        scid: ConnectionID,
+        originalDCID: ConnectionID,
+        advertisedISCID: ConnectionID
+    ) -> ManagedConnection {
+        let config = QUICConfiguration()
+        var params = TransportParameters(from: config, sourceConnectionID: scid)
+        // Tamper: advertise a different initial_source_connection_id than the wire SCID.
+        params.initialSourceConnectionID = advertisedISCID
+        var tlsConfig = TLSConfiguration()
+        tlsConfig.alpnProtocols = ["h3"]
+        tlsConfig.signingKey = Self.serverSigningKey
+        tlsConfig.certificateChain = Self.serverCertificateChain
+        let tlsProvider = TLS13Handler(configuration: tlsConfig)
+        return ManagedConnection(
+            role: .server,
+            version: .v1,
+            sourceConnectionID: scid,
+            destinationConnectionID: dcid,
+            originalConnectionID: originalDCID,
+            transportParameters: params,
+            tlsProvider: tlsProvider,
+            remoteAddress: SocketAddress(ipAddress: "127.0.0.1", port: 54321)
+        )
+    }
+
+    @Test("Tampered initial_source_connection_id is rejected with TRANSPORT_PARAMETER_ERROR",
+          .timeLimit(.minutes(1)))
+    func tamperedInitialSourceConnectionIDRejected() async throws {
+        let clientSCID = ConnectionID.random(length: 8)!
+        let serverSCID = ConnectionID.random(length: 8)!
+        let originalDCID = ConnectionID.random(length: 8)!
+        // A bogus SCID the server falsely advertises but never uses on the wire.
+        let bogusISCID = ConnectionID.random(length: 8)!
+
+        let client = makeClient(dcid: originalDCID, scid: clientSCID)
+        let server = makeServer(
+            dcid: clientSCID,
+            scid: serverSCID,
+            originalDCID: originalDCID,
+            advertisedISCID: bogusISCID  // != serverSCID
+        )
+
+        let clientInitial = try await client.start()
+        _ = try await server.start()
+
+        var serverResponse: [Data] = []
+        for packet in clientInitial {
+            serverResponse.append(contentsOf: try await server.processDatagram(packet))
+        }
+        #expect(!serverResponse.isEmpty)
+
+        // The client observes serverSCID in the Initial header but the advertised
+        // initial_source_connection_id is bogusISCID -> TRANSPORT_PARAMETER_ERROR.
+        var caught: Error?
+        for packet in serverResponse {
+            do {
+                _ = try await client.processDatagram(packet)
+            } catch {
+                caught = error
+                break
+            }
+        }
+
+        let error = try #require(caught, "Client must reject the tampered initial_source_connection_id")
+        guard let managedError = error as? ManagedConnectionError,
+              case .transportParameterCIDMismatch(let parameter, _, _) = managedError else {
+            Issue.record("Expected transportParameterCIDMismatch, got: \(error)")
+            client.shutdown(); server.shutdown()
+            return
+        }
+        #expect(parameter == "initial_source_connection_id")
+        #expect(managedError.transportErrorCodeValue == TransportErrorCode.transportParameterError.rawValue)
+
+        client.shutdown()
+        server.shutdown()
+    }
+
+    @Test("Honest initial_source_connection_id passes validation", .timeLimit(.minutes(1)))
+    func honestInitialSourceConnectionIDAccepted() async throws {
+        let clientSCID = ConnectionID.random(length: 8)!
+        let serverSCID = ConnectionID.random(length: 8)!
+        let originalDCID = ConnectionID.random(length: 8)!
+
+        let client = makeClient(dcid: originalDCID, scid: clientSCID)
+        // Honest server: advertised ISCID == actual SCID.
+        let server = makeServer(
+            dcid: clientSCID,
+            scid: serverSCID,
+            originalDCID: originalDCID,
+            advertisedISCID: serverSCID
+        )
+
+        let clientInitial = try await client.start()
+        _ = try await server.start()
+
+        var serverResponse: [Data] = []
+        for packet in clientInitial {
+            serverResponse.append(contentsOf: try await server.processDatagram(packet))
+        }
+
+        // Should complete without a CID mismatch error.
+        for packet in serverResponse {
+            _ = try await client.processDatagram(packet)
+        }
+        #expect(client.isEstablished)
+
+        client.shutdown()
+        server.shutdown()
+    }
+}

@@ -290,12 +290,16 @@ public final class KeyPhaseManager: Sendable {
 
     // MARK: - Private Helpers
 
+    /// Builds an opener for the negotiated cipher suite. `KeyMaterial.createCrypto()` dispatches
+    /// on the cipher suite carried in the key material, so a connection negotiated with
+    /// ChaCha20-Poly1305 (or any other supported suite) uses the correct AEAD rather than a
+    /// hardcoded AES-128-GCM, which would mis-decrypt under a different suite.
     private func createOpener(from keys: KeyMaterial) throws -> any PacketOpener {
-        try AES128GCMOpener(keyMaterial: keys)
+        try keys.createCrypto().opener
     }
 
     private func createSealer(from keys: KeyMaterial) throws -> any PacketSealer {
-        try AES128GCMSealer(keyMaterial: keys)
+        try keys.createCrypto().sealer
     }
 }
 

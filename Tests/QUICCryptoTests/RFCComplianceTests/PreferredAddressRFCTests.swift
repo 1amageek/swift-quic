@@ -92,11 +92,80 @@ struct PreferredAddressRFCTests {
         let encoded = TransportParameterCodec.encode(params)
         let decoded = try TransportParameterCodec.decode(encoded)
 
-        // TODO: Current implementation may encode IPv6 as zeros
-        // This test documents the expected behavior that IPv6 SHOULD be preserved
-
+        // IPv6 is now fully implemented: the address MUST round-trip, not be silently zeroed.
         #expect(decoded.preferredAddress != nil)
         #expect(decoded.preferredAddress?.ipv4Address != nil)
+        #expect(decoded.preferredAddress?.ipv6Address != nil, "IPv6 address MUST be preserved")
+        // Canonical form of "2001:db8::1" is "2001:db8::1".
+        #expect(decoded.preferredAddress?.ipv6Address == "2001:db8::1")
+        #expect(decoded.preferredAddress?.ipv6Port == 8443)
+    }
+
+    // MARK: - IPv6 Full Round-Trip (RFC 9000 §18.2)
+
+    @Test("IPv6 preferred address round-trips through encode/decode")
+    func ipv6PreferredAddressRoundTrip() throws {
+        var params = TransportParameters()
+        let token = Data(repeating: 0x5A, count: 16)
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: nil,
+            ipv4Port: nil,
+            ipv6Address: "2001:db8:85a3::8a2e:370:7334",
+            ipv6Port: 8443,
+            connectionID: try ConnectionID(bytes: Data([0xAA, 0xBB, 0xCC, 0xDD])),
+            statelessResetToken: token
+        )
+
+        let encoded = TransportParameterCodec.encode(params)
+        let decoded = try TransportParameterCodec.decode(encoded)
+
+        let addr = try #require(decoded.preferredAddress)
+        // IPv4 family was absent -> decodes back to nil (not "0.0.0.0").
+        #expect(addr.ipv4Address == nil)
+        #expect(addr.ipv4Port == nil)
+        // IPv6 is preserved in canonical form and is usable.
+        #expect(addr.ipv6Address == "2001:db8:85a3::8a2e:370:7334")
+        #expect(addr.ipv6Port == 8443)
+        #expect(addr.connectionID.bytes == Data([0xAA, 0xBB, 0xCC, 0xDD]))
+        #expect(addr.statelessResetToken == token)
+    }
+
+    @Test("Dual-stack preferred address round-trips both families")
+    func dualStackPreferredAddressRoundTrip() throws {
+        var params = TransportParameters()
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: "203.0.113.7",
+            ipv4Port: 443,
+            ipv6Address: "::1",
+            ipv6Port: 4433,
+            connectionID: try ConnectionID(bytes: Data([0x01, 0x02])),
+            statelessResetToken: Data(repeating: 0x00, count: 16)
+        )
+
+        let decoded = try TransportParameterCodec.decode(TransportParameterCodec.encode(params))
+        let addr = try #require(decoded.preferredAddress)
+        #expect(addr.ipv4Address == "203.0.113.7")
+        #expect(addr.ipv4Port == 443)
+        #expect(addr.ipv6Address == "::1")
+        #expect(addr.ipv6Port == 4433)
+    }
+
+    @Test("parseIPv6/formatIPv6 are inverse for canonical literals")
+    func ipv6ParseFormatRoundTrip() throws {
+        let literals = ["::1", "2001:db8::1", "fe80::1", "2001:db8:85a3::8a2e:370:7334"]
+        for literal in literals {
+            let bytes = try #require(TransportParameterCodec.parseIPv6(literal), "parse \(literal)")
+            #expect(bytes.count == 16)
+            let formatted = try #require(TransportParameterCodec.formatIPv6(bytes), "format \(literal)")
+            // Re-parse to compare in byte space (avoids textual canonicalization differences).
+            #expect(TransportParameterCodec.parseIPv6(formatted) == bytes)
+        }
+    }
+
+    @Test("Invalid IPv6 literal fails to parse")
+    func invalidIPv6FailsToParse() {
+        #expect(TransportParameterCodec.parseIPv6("not-an-address") == nil)
+        #expect(TransportParameterCodec.parseIPv6("12345::xyz") == nil)
     }
 
     // MARK: - Client-Only Requirement
@@ -233,5 +302,47 @@ struct PreferredAddressRFCTests {
 
         #expect(preferred.ipv4Address != nil)
         #expect(preferred.ipv6Address == nil)
+    }
+}
+
+// MARK: - active_connection_id_limit Upper Bound (RFC 9000 §18.2)
+
+@Suite("RFC 9000 §18.2 - active_connection_id_limit bounds")
+struct ActiveConnectionIDLimitBoundTests {
+
+    /// Encodes a single active_connection_id_limit transport parameter on the wire.
+    private func encodeActiveConnectionIDLimit(_ value: UInt64) -> Data {
+        var body = Data()
+        // Parameter id 0x0e = active_connection_id_limit
+        Varint(0x0e).encode(to: &body)
+        var valueBytes = Data()
+        Varint(value).encode(to: &valueBytes)
+        Varint(UInt64(valueBytes.count)).encode(to: &body)
+        body.append(valueBytes)
+        return body
+    }
+
+    @Test("Huge active_connection_id_limit is clamped to the ceiling")
+    func hugeActiveConnectionIDLimitClamped() throws {
+        // A peer advertising an absurd active_connection_id_limit must not relax our
+        // peer-CID storage cap without bound. The decoded value is clamped to the ceiling.
+        let wire = encodeActiveConnectionIDLimit((1 << 62) - 1)
+        let decoded = try TransportParameterCodec.decode(wire)
+        #expect(decoded.activeConnectionIDLimit == TransportParameterCodec.maxActiveConnectionIDLimit)
+    }
+
+    @Test("In-range active_connection_id_limit is preserved")
+    func inRangeActiveConnectionIDLimitPreserved() throws {
+        let wire = encodeActiveConnectionIDLimit(4)
+        let decoded = try TransportParameterCodec.decode(wire)
+        #expect(decoded.activeConnectionIDLimit == 4)
+    }
+
+    @Test("active_connection_id_limit below the minimum is rejected")
+    func belowMinimumRejected() throws {
+        let wire = encodeActiveConnectionIDLimit(1)
+        #expect(throws: TransportParameterError.self) {
+            _ = try TransportParameterCodec.decode(wire)
+        }
     }
 }

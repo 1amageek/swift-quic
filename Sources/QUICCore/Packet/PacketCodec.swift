@@ -46,20 +46,43 @@ public struct ParsedPacket: Sendable {
     /// Total size of the packet in bytes
     public let packetSize: Int
 
+    /// The Key Phase bit of a 1-RTT (short header) packet (RFC 9001 §6).
+    ///
+    /// `nil` for long-header packets, which do not carry a Key Phase bit. For 1-RTT packets this
+    /// reflects the phase bit read from the protected header after header protection removal, and
+    /// is used by the connection layer to detect peer-initiated key updates.
+    public let keyPhase: UInt8?
+
     public init(
         header: PacketHeader,
         packetNumber: UInt64,
         frames: [Frame],
         encryptionLevel: EncryptionLevel,
-        packetSize: Int
+        packetSize: Int,
+        keyPhase: UInt8? = nil
     ) {
         self.header = header
         self.packetNumber = packetNumber
         self.frames = frames
         self.encryptionLevel = encryptionLevel
         self.packetSize = packetSize
+        self.keyPhase = keyPhase
     }
 }
+
+// MARK: - Short Header Opener Selection (RFC 9001 §6)
+
+/// Selects the opener to use for a 1-RTT (short header) packet based on its Key Phase bit.
+///
+/// RFC 9001 §6: the Key Phase bit lives in the protected first byte, so it only becomes
+/// available AFTER header protection is removed and BEFORE the AEAD opens the packet. The
+/// decoder therefore removes header protection first, reads the phase bit, and then asks this
+/// selector which opener to use. The selector MUST NOT mutate any committed key state: a key
+/// update is only committed once the returned opener has successfully opened the packet
+/// (the codec never accepts a forged packet, see RFC 9001 §6.3). Returning `nil` causes the
+/// decode to fail with `PacketCodecError.noOpener`.
+public typealias ShortHeaderOpenerSelector =
+    (_ keyPhase: UInt8) throws -> (any PacketOpenerProtocol)?
 
 // MARK: - Packet Opener Protocol
 
@@ -365,7 +388,64 @@ public struct PacketDecoder: Sendable {
         if isLongHeader {
             return try decodeLongHeaderPacket(data: data, opener: opener, largestPN: largestPN)
         } else {
-            return try decodeShortHeaderPacket(data: data, dcidLength: dcidLength, opener: opener, largestPN: largestPN)
+            // Single fixed opener regardless of key phase: the legacy 1-RTT path with no key
+            // update wiring. The same opener removes header protection and AEAD-opens; the
+            // selector ignores the phase bit and always returns this opener.
+            return try decodeShortHeaderPacket(
+                data: data,
+                dcidLength: dcidLength,
+                largestPN: largestPN,
+                headerProtectionOpener: opener,
+                openerSelector: { _ in opener }
+            )
+        }
+    }
+
+    /// Decodes a packet, selecting the 1-RTT opener by Key Phase bit (RFC 9001 §6).
+    ///
+    /// For long-header packets this behaves exactly like the single-opener `decodePacket` using
+    /// `longHeaderOpener`. For short-header (1-RTT) packets, header protection is removed first
+    /// (using `headerProtectionOpener`, whose HP key is phase-independent per RFC 9001 §6.1) so the
+    /// Key Phase bit can be read, then `shortHeaderOpenerSelector` is consulted to choose the AEAD
+    /// opener for that phase, and only then is the AEAD applied. This keeps opener selection
+    /// decoupled from header-protection removal so a key update can supply phase-specific keys
+    /// without the codec ever committing a key update on a forged packet.
+    ///
+    /// - Parameters:
+    ///   - data: The raw packet data
+    ///   - dcidLength: Expected DCID length (for short headers)
+    ///   - longHeaderOpener: Opener for long-header packets (nil for unprotected packets)
+    ///   - headerProtectionOpener: Opener used only to remove 1-RTT header protection. The HP key
+    ///     does not change across key phases, so any current opener works and selecting it must
+    ///     have no key-derivation side effects.
+    ///   - shortHeaderOpenerSelector: Phase-aware AEAD opener selection for 1-RTT packets
+    ///   - largestPN: Largest packet number received (for PN decoding)
+    /// - Returns: The parsed packet
+    public func decodePacket(
+        data: Data,
+        dcidLength: Int,
+        longHeaderOpener: (any PacketOpenerProtocol)?,
+        headerProtectionOpener: (any PacketOpenerProtocol)?,
+        shortHeaderOpenerSelector: ShortHeaderOpenerSelector,
+        largestPN: UInt64 = 0
+    ) throws -> ParsedPacket {
+        guard !data.isEmpty else {
+            throw PacketCodecError.insufficientData
+        }
+
+        let firstByte = data[data.startIndex]
+        let isLongHeader = (firstByte & 0x80) != 0
+
+        if isLongHeader {
+            return try decodeLongHeaderPacket(data: data, opener: longHeaderOpener, largestPN: largestPN)
+        } else {
+            return try decodeShortHeaderPacket(
+                data: data,
+                dcidLength: dcidLength,
+                largestPN: largestPN,
+                headerProtectionOpener: headerProtectionOpener,
+                openerSelector: shortHeaderOpenerSelector
+            )
         }
     }
 
@@ -509,17 +589,25 @@ public struct PacketDecoder: Sendable {
         )
     }
 
-    /// Decodes a Short Header packet
+    /// Decodes a Short Header (1-RTT) packet, selecting the opener by Key Phase bit.
+    ///
+    /// RFC 9001 §6 ordering, which this method preserves precisely:
+    /// 1. Parse the protected header and remove header protection using the *header-protection*
+    ///    key. RFC 9001 §6.1 keeps the header-protection key constant across key updates, so HP
+    ///    removal does not depend on the current packet-protection phase and can run before the
+    ///    phase is known.
+    /// 2. Read the now-unprotected Key Phase bit.
+    /// 3. Ask `openerSelector` for the opener matching that phase. AEAD (`open`) runs only after
+    ///    selection. The selector — not the codec — decides whether new keys are derived; the
+    ///    codec never commits a key update, so a forged packet that fails AEAD here cannot change
+    ///    committed key state (RFC 9001 §6.3).
     private func decodeShortHeaderPacket(
         data: Data,
         dcidLength: Int,
-        opener: (any PacketOpenerProtocol)?,
-        largestPN: UInt64
+        largestPN: UInt64,
+        headerProtectionOpener: (any PacketOpenerProtocol)?,
+        openerSelector: ShortHeaderOpenerSelector
     ) throws -> ParsedPacket {
-        guard let opener = opener else {
-            throw PacketCodecError.noOpener
-        }
-
         // Step 1: Parse protected header (no validation of protected bits)
         let (protectedHeader, headerLength) = try ProtectedShortHeader.parse(from: data, dcidLength: dcidLength)
 
@@ -543,14 +631,25 @@ public struct PacketDecoder: Sendable {
         // Extract sample
         let sample = data[(data.startIndex + sampleOffset)..<(data.startIndex + sampleOffset + 16)]
 
-        // Step 3: Remove header protection
-        let (unprotectedFirstByte, unprotectedPNBytes) = try opener.removeHeaderProtection(
+        // Step 3: Remove header protection.
+        // RFC 9001 §6.1: the header-protection key is not updated across key phases, so the
+        // current opener's HP key removes header protection regardless of the packet's phase. We
+        // must remove HP before we can read the Key Phase bit. If the connection has no opener at
+        // all, fail with noOpener.
+        guard let hpOpener = headerProtectionOpener else {
+            throw PacketCodecError.noOpener
+        }
+        let (unprotectedFirstByte, unprotectedPNBytes) = try hpOpener.removeHeaderProtection(
             sample: sample,
             firstByte: protectedHeader.protectedFirstByte,
             packetNumberBytes: protectedPNBytes
         )
 
-        // Step 4: Decode packet number
+        // Step 4: Read the Key Phase bit (RFC 9001 §6.1: bit 0x04 of the unprotected first byte),
+        // now that header protection has been removed.
+        let keyPhase: UInt8 = (unprotectedFirstByte & 0x04) != 0 ? 1 : 0
+
+        // Step 4b: Decode packet number
         let actualPNLength = Int((unprotectedFirstByte & 0x03) + 1)
 
         var truncatedPN: UInt64 = 0
@@ -570,7 +669,14 @@ public struct PacketDecoder: Sendable {
             packetNumberLength: actualPNLength
         )
 
-        // Step 6: Build AAD and decrypt payload
+        // Step 6: Select the AEAD opener for this packet's key phase, THEN open.
+        // The selector may speculatively derive next-phase keys, but it MUST NOT commit a key
+        // update; commitment only happens after a successful open (see PacketProcessor).
+        guard let opener = try openerSelector(keyPhase) else {
+            throw PacketCodecError.noOpener
+        }
+
+        // Build AAD and decrypt payload
         var aad = Data()
         aad.append(unprotectedFirstByte)
         aad.append(protectedHeader.destinationConnectionID.bytes)
@@ -580,7 +686,8 @@ public struct PacketDecoder: Sendable {
         let ciphertextStart = data.startIndex + pnOffset + actualPNLength
         let ciphertext = data[ciphertextStart...]
 
-        // Decrypt payload
+        // Decrypt payload. A failure here (e.g. forged packet with a flipped phase bit) throws
+        // before any key state is committed, so forged packets never trigger a key update.
         let plaintext = try opener.open(
             ciphertext: Data(ciphertext),
             packetNumber: packetNumber,
@@ -595,7 +702,8 @@ public struct PacketDecoder: Sendable {
             packetNumber: packetNumber,
             frames: frames,
             encryptionLevel: .application,
-            packetSize: data.count
+            packetSize: data.count,
+            keyPhase: keyPhase
         )
     }
 

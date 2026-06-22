@@ -73,6 +73,10 @@ private struct DataStreamInternalState: Sendable {
 /// Bidirectional streams have both send and receive sides.
 /// Unidirectional streams have only one side active.
 public final class DataStream: Sendable {
+    /// Maximum permitted stream final offset (RFC 9000 §4.5): the stream final offset
+    /// MUST stay within the QUIC varint range (2^62-1).
+    static let maxFinalOffset: UInt64 = (1 << 62) - 1
+
     /// Stream identifier
     public let id: UInt64
 
@@ -257,6 +261,31 @@ public final class DataStream: Sendable {
                 throw StreamError.cannotReceiveOnSendOnlyStream
             }
 
+            // RFC 9000 §4.5: the final size of a stream is invariant once established,
+            // whether it was learned from a FIN-bearing STREAM frame or from RESET_STREAM.
+            // Reconcile a FIN-bearing frame against any already-known final size BEFORE the
+            // receive-state gate, so a FIN that contradicts a previously received
+            // RESET_STREAM (or earlier FIN) is reported as FINAL_SIZE_ERROR rather than a
+            // generic stream-state error. Use overflow-reporting arithmetic because the
+            // offset and length are attacker-controlled wire values.
+            let (computedEndOffset, endOffsetOverflow) =
+                frame.offset.addingReportingOverflow(UInt64(frame.data.count))
+            guard !endOffsetOverflow, computedEndOffset <= DataStream.maxFinalOffset else {
+                throw StreamError.bufferError(
+                    .finalOffsetOutOfRange(offset: frame.offset, length: UInt64(frame.data.count))
+                )
+            }
+            let endOffset = computedEndOffset
+
+            if frame.fin, let knownFinalSize = `internal`.state.finalSize {
+                guard endOffset == knownFinalSize else {
+                    throw StreamError.finalSizeMismatch(
+                        expected: knownFinalSize,
+                        received: endOffset
+                    )
+                }
+            }
+
             guard `internal`.state.canReceive else {
                 throw StreamError.invalidState(
                     current: String(describing: `internal`.state.recvState),
@@ -265,7 +294,6 @@ public final class DataStream: Sendable {
             }
 
             // Check receive flow control
-            let endOffset = frame.offset + UInt64(frame.data.count)
             if endOffset > `internal`.state.recvMaxData {
                 throw StreamError.flowControlViolation(
                     limit: `internal`.state.recvMaxData,

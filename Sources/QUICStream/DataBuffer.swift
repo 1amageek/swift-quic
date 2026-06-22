@@ -12,6 +12,9 @@ public enum DataBufferError: Error, Sendable {
     case finalSizeMismatch(expected: UInt64, received: UInt64)
     /// Data received extends beyond the known final size
     case dataExceedsFinalSize(finalSize: UInt64, receivedEnd: UInt64)
+    /// The computed end offset (offset + length) overflows or exceeds 2^62-1
+    /// (RFC 9000 §4.5 — final offset bound)
+    case finalOffsetOutOfRange(offset: UInt64, length: UInt64)
 }
 
 /// Internal buffer for ordered stream data reassembly
@@ -22,6 +25,10 @@ public enum DataBufferError: Error, Sendable {
 /// - FIN tracking and final size validation
 /// - Contiguous data extraction
 public struct DataBuffer: Sendable {
+    /// Maximum permitted stream final offset (RFC 9000 §4.5): a QUIC varint can encode at
+    /// most 2^62-1, and the stream final offset MUST stay within that range.
+    static let maxFinalOffset: UInt64 = (1 << 62) - 1
+
     /// Segments stored as (offset, data), sorted by offset
     private var segments: [(offset: UInt64, data: Data)] = []
 
@@ -50,8 +57,18 @@ public struct DataBuffer: Sendable {
     ///   - fin: Whether this is the final data (FIN flag)
     /// - Throws: DataBufferError on validation failures
     public mutating func insert(offset: UInt64, data: Data, fin: Bool) throws {
-        // Empty data with FIN is valid (just marks the end)
-        let endOffset = offset + UInt64(data.count)
+        // Empty data with FIN is valid (just marks the end).
+        //
+        // RFC 9000 §4.5: a stream's final offset (offset + length) MUST NOT exceed 2^62-1.
+        // `offset` and `data.count` derive from untrusted wire data, so compute the end
+        // offset with overflow reporting and reject an out-of-range result rather than
+        // wrapping. This is the reassembly-layer chokepoint that mirrors the frame-decode
+        // bound and also guards data produced internally.
+        let (rawEndOffset, overflow) = offset.addingReportingOverflow(UInt64(data.count))
+        guard !overflow, rawEndOffset <= DataBuffer.maxFinalOffset else {
+            throw DataBufferError.finalOffsetOutOfRange(offset: offset, length: UInt64(data.count))
+        }
+        let endOffset = rawEndOffset
 
         // Validate FIN consistency
         if fin {

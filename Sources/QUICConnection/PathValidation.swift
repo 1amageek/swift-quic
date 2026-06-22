@@ -53,9 +53,14 @@ public final class PathValidationManager: Sendable {
         /// Successfully validated paths
         var validatedPaths: Set<NetworkPath> = []
 
-        /// Challenges received that need responses
-        var pendingResponses: [Data] = []
+        /// Challenges received that still need a PATH_RESPONSE, paired with the path on which
+        /// they arrived (RFC 9000 §8.2.1: the response is sent on the path it arrived on).
+        var pendingResponses: [(data: Data, path: NetworkPath?)] = []
     }
+
+    /// Size in bytes of a PATH_RESPONSE frame on the wire: 1 type byte + 8 data bytes
+    /// (RFC 9000 §19.18). Used to charge the response against the anti-amplification budget.
+    public static let pathResponseFrameSize: UInt64 = 9
 
     /// Timeout for path validation (RFC 9000 recommends 3 * PTO)
     public let validationTimeout: Duration
@@ -95,13 +100,51 @@ public final class PathValidationManager: Sendable {
 
     // MARK: - Processing Received Frames
 
-    /// Processes a received PATH_CHALLENGE
+    /// Processes a received PATH_CHALLENGE on a specific path, honoring the anti-amplification
+    /// budget for unvalidated paths (RFC 9000 §8.2.1).
+    ///
+    /// RFC 9000 §8.2.1: "An endpoint MUST expand datagrams that contain a PATH_CHALLENGE frame
+    /// ... [and] An endpoint MUST NOT send more than three times ... until it has validated the
+    /// peer's address." A PATH_RESPONSE for an unvalidated path therefore counts against that
+    /// path's amplification budget, and the response is sent on the path it arrived on.
+    ///
+    /// - Parameters:
+    ///   - data: The 8-byte challenge data.
+    ///   - path: The network path the PATH_CHALLENGE arrived on.
+    ///   - remainingAmplificationBudget: Bytes still permitted to be sent toward `path` before
+    ///     it is validated. Pass `UInt64.max` for a validated path (no limit).
+    /// - Returns: The PATH_RESPONSE frame to send on `path`, or `nil` if the amplification budget
+    ///   is exhausted. When `nil`, the response is recorded as pending so it can be emitted later
+    ///   once more credit is available; it is never silently dropped.
+    public func handleChallenge(
+        _ data: Data,
+        on path: NetworkPath,
+        remainingAmplificationBudget: UInt64
+    ) -> Frame? {
+        return state.withLock { s in
+            let isValidated = s.validatedPaths.contains(path)
+            // A validated path is not subject to the anti-amplification limit.
+            if isValidated || remainingAmplificationBudget >= Self.pathResponseFrameSize {
+                return .pathResponse(data)
+            }
+            // Budget exhausted: defer the response (associated with its path) rather than
+            // dropping it. It will be re-attempted via getPendingResponses() when credit grows.
+            s.pendingResponses.append((data: data, path: path))
+            return nil
+        }
+    }
+
+    /// Processes a received PATH_CHALLENGE without a path/budget context.
+    ///
+    /// Convenience for paths that are already validated or otherwise not amplification-limited.
+    /// Always returns the PATH_RESPONSE frame. Prefer `handleChallenge(_:on:remainingAmplificationBudget:)`
+    /// for unvalidated paths so the response is charged against the amplification budget.
     /// - Parameter data: The 8-byte challenge data
     /// - Returns: PATH_RESPONSE frame to send back
     public func handleChallenge(_ data: Data) -> Frame {
         // RFC 9000: MUST respond with PATH_RESPONSE containing identical data
         state.withLock { s in
-            s.pendingResponses.append(data)
+            s.pendingResponses.append((data: data, path: nil))
         }
         return .pathResponse(data)
     }
@@ -145,8 +188,20 @@ public final class PathValidationManager: Sendable {
         state.withLock { $0.validatedPaths }
     }
 
-    /// Gets pending responses (challenges we received but haven't responded to)
+    /// Gets and clears pending responses (challenges we received but have not yet responded to,
+    /// e.g. because the anti-amplification budget was exhausted when they arrived).
+    /// - Returns: The challenge-data values still awaiting a PATH_RESPONSE.
     public func getPendingResponses() -> [Data] {
+        state.withLock { s in
+            let responses = s.pendingResponses.map { $0.data }
+            s.pendingResponses.removeAll()
+            return responses
+        }
+    }
+
+    /// Gets and clears pending responses together with the path each arrived on.
+    /// - Returns: Pairs of (challenge data, path) still awaiting a PATH_RESPONSE.
+    public func getPendingResponsesWithPaths() -> [(data: Data, path: NetworkPath?)] {
         state.withLock { s in
             let responses = s.pendingResponses
             s.pendingResponses.removeAll()
@@ -327,8 +382,18 @@ public final class ConnectionIDManager: Sendable {
                 )
             }
 
-            // Retire CIDs as requested by retire_prior_to
-            for seq in 0..<frame.retirePriorTo {
+            // Retire CIDs as requested by retire_prior_to.
+            //
+            // RFC 9000 §19.15 guarantees `retire_prior_to <= sequence_number` (enforced at
+            // decode by NewConnectionIDFrame's validating init), so this value is already
+            // bounded. We additionally bound the work to the connection IDs we actually hold
+            // rather than iterating `0..<retire_prior_to`: a long-lived connection can
+            // legitimately reach a very large sequence number, and iterating the attacker- or
+            // peer-supplied numeric range would be O(retire_prior_to) regardless of how few
+            // CIDs we store. Iterating the held set is O(stored CIDs), which is itself capped
+            // by active_connection_id_limit.
+            let sequencesToRetire = s.peerCIDs.keys.filter { $0 < frame.retirePriorTo }
+            for seq in sequencesToRetire {
                 s.peerCIDs.removeValue(forKey: seq)
                 s.retiredSequences.insert(seq)
             }

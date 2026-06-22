@@ -435,4 +435,25 @@ struct DataBufferTests {
 
         #expect(buffer.totalBytes == 100)
     }
+
+    // MARK: - Final Offset Bound (RFC 9000 §4.5)
+
+    @Test("Insert whose offset + length overflows is rejected")
+    func insertOverflowingEndOffsetRejected() throws {
+        var buffer = DataBuffer()
+        let offset: UInt64 = .max - 2  // offset + 8 overflows UInt64
+        #expect(throws: DataBufferError.self) {
+            try buffer.insert(offset: offset, data: Data(repeating: 0, count: 8), fin: false)
+        }
+    }
+
+    @Test("Insert whose end offset exceeds 2^62-1 is rejected")
+    func insertEndOffsetBeyondVarintMaxRejected() throws {
+        var buffer = DataBuffer()
+        let maxVarint: UInt64 = (1 << 62) - 1
+        // End offset would be maxVarint + 8, beyond the varint range.
+        #expect(throws: DataBufferError.self) {
+            try buffer.insert(offset: maxVarint - 1, data: Data(repeating: 0, count: 8), fin: false)
+        }
+    }
 }

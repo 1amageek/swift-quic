@@ -25,7 +25,7 @@ let package = Package(
     ],
     dependencies: [
         // UDP transport
-        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.1"),
+        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.2"),
 
         // Cryptography
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),

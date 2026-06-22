@@ -588,9 +588,8 @@ public final class ClientStateMachine: Sendable {
             // Store raw certificates
             state.context.peerCertificates = certificate.certificates
 
-            // Parse and validate X.509 certificate if verification is enabled
-            // Skip X.509 parsing if expectedPeerPublicKey is set (raw public key verification)
-            if state.configuration.verifyPeer && state.configuration.expectedPeerPublicKey == nil {
+            // X.509 path (skip if expectedPeerPublicKey is set — raw public key mode).
+            if state.configuration.expectedPeerPublicKey == nil {
                 guard let leafCertData = certificate.leafCertificate else {
                     throw TLSHandshakeError.certificateVerificationFailed("No certificate provided")
                 }
@@ -606,36 +605,43 @@ public final class ClientStateMachine: Sendable {
                 // Store the parsed certificate
                 state.context.peerCertificate = leafCert
 
-                // Parse intermediate certificates
-                let intermediateCerts = try certificate.certificates.dropFirst().compactMap { certData -> X509Certificate? in
-                    try X509Certificate.parse(from: certData)
-                }
-
-                // Set up validation options
-                var validationOptions = X509ValidationOptions()
-                validationOptions.hostname = state.configuration.serverName
-                validationOptions.allowSelfSigned = state.configuration.allowSelfSigned
-                // RFC 5280 Section 4.2.1.12: Server certificates MUST have serverAuth EKU
-                validationOptions.requiredEKU = .serverAuth
-
-                // Create validator with trusted roots
-                let validator = X509Validator(
-                    trustedRoots: state.configuration.trustedRootCertificates ?? [],
-                    options: validationOptions
-                )
-
-                // Validate the certificate chain
-                do {
-                    try validator.validate(certificate: leafCert, intermediates: Array(intermediateCerts))
-                } catch let error as X509Error {
-                    throw TLSHandshakeError.certificateVerificationFailed(error.description)
-                }
-
-                // Extract and store the public key for CertificateVerify verification
+                // Always extract and store the leaf public key. The CertificateVerify
+                // proof-of-possession signature MUST be verified against it regardless
+                // of `verifyPeer`: `verifyPeer` only controls X.509 chain/trust-anchor
+                // validation, never the handshake signature. Otherwise a single flag
+                // would yield an unauthenticated-but-"complete" channel (MITM).
                 do {
                     state.context.peerVerificationKey = try leafCert.extractPublicKey()
                 } catch {
                     throw TLSHandshakeError.certificateVerificationFailed("Failed to extract public key: \(error)")
+                }
+
+                // X.509 chain/trust-anchor validation is gated by verifyPeer.
+                if state.configuration.verifyPeer {
+                    // Parse intermediate certificates
+                    let intermediateCerts = try certificate.certificates.dropFirst().compactMap { certData -> X509Certificate? in
+                        try X509Certificate.parse(from: certData)
+                    }
+
+                    // Set up validation options
+                    var validationOptions = X509ValidationOptions()
+                    validationOptions.hostname = state.configuration.serverName
+                    validationOptions.allowSelfSigned = state.configuration.allowSelfSigned
+                    // RFC 5280 Section 4.2.1.12: Server certificates MUST have serverAuth EKU
+                    validationOptions.requiredEKU = .serverAuth
+
+                    // Create validator with trusted roots
+                    let validator = X509Validator(
+                        trustedRoots: state.configuration.trustedRootCertificates ?? [],
+                        options: validationOptions
+                    )
+
+                    // Validate the certificate chain
+                    do {
+                        try validator.validate(certificate: leafCert, intermediates: Array(intermediateCerts))
+                    } catch let error as X509Error {
+                        throw TLSHandshakeError.certificateVerificationFailed(error.description)
+                    }
                 }
             }
 
@@ -704,11 +710,13 @@ public final class ClientStateMachine: Sendable {
                 guard isValid else {
                     throw TLSHandshakeError.signatureVerificationFailed
                 }
-            } else if state.configuration.verifyPeer {
-                // verifyPeer is true but we have no key to verify with
-                throw TLSHandshakeError.certificateVerificationFailed("No public key available for verification")
+            } else if (state.context.peerCertificates?.isEmpty == false)
+                        || state.configuration.verifyPeer {
+                // A certificate (or CertificateVerify) was presented but no key is
+                // available to verify possession. Fail closed — proof of possession is
+                // mandatory whenever the peer authenticates, independent of `verifyPeer`.
+                throw TLSHandshakeError.certificateVerificationFailed("No public key available to verify CertificateVerify")
             }
-            // If verifyPeer is false, skip signature verification
 
             // Update transcript
             let message = HandshakeCodec.encode(type: .certificateVerify, content: data)
@@ -736,12 +744,13 @@ public final class ClientStateMachine: Sendable {
     /// - Returns: TLS outputs including application keys and client Finished
     public func processServerFinished(_ data: Data) throws -> (outputs: [TLSOutput], clientFinished: Data) {
         return try state.withLock { state in
-            // Accept Finished in waitFinished, waitCertificate, or waitCertificateVerify states
-            // (Server may skip Certificate/CertificateVerify in certain modes)
-            switch state.handshakeState {
-            case .waitFinished, .waitCertificate, .waitCertificateVerify:
-                break
-            default:
+            // Finished is accepted ONLY in .waitFinished. A full (certificate-based)
+            // handshake reaches .waitFinished only after Certificate + CertificateVerify
+            // have been processed; a PSK/resumption handshake transitions directly to
+            // .waitFinished after EncryptedExtensions (Certificate legitimately omitted).
+            // Accepting Finished in .waitCertificate/.waitCertificateVerify would let a
+            // server skip authentication entirely (unauthenticated/MITM) — forbidden.
+            guard state.handshakeState == .waitFinished else {
                 throw TLSHandshakeError.unexpectedMessage("Unexpected Finished in state \(state.handshakeState)")
             }
 

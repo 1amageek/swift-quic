@@ -548,10 +548,39 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             maxAllowed: ProtocolLimits.maxCryptoDataLength,
             context: "CRYPTO frame data length"
         )
+        // RFC 9000 §19.6 / §7.5: the largest offset delivered on the crypto stream cannot
+        // exceed 2^62-1. Reject (offset + length) overflow or out-of-range end offset as a
+        // FRAME_ENCODING_ERROR rather than computing a wrapped end offset.
+        try Self.validateEndOffsetWithinVarintRange(
+            offset: offset,
+            length: length,
+            context: "CRYPTO frame"
+        )
         guard let data = reader.readBytes(safeLength) else {
             throw FrameCodecError.insufficientData
         }
         return .crypto(CryptoFrame(offset: offset, data: data))
+    }
+
+    /// Validates that `offset + length` does not overflow and stays within the QUIC
+    /// varint range (`<= 2^62 - 1`), per RFC 9000 §4.5 / §7.5.
+    ///
+    /// Uses `addingReportingOverflow` because both operands originate from untrusted
+    /// wire data. A violation is surfaced as a FRAME_ENCODING_ERROR (final offset bound)
+    /// rather than being silently truncated.
+    @usableFromInline
+    @inline(__always)
+    internal static func validateEndOffsetWithinVarintRange(
+        offset: UInt64,
+        length: UInt64,
+        context: String
+    ) throws {
+        let (endOffset, overflow) = offset.addingReportingOverflow(length)
+        guard !overflow, endOffset <= Varint.maxValue else {
+            throw FrameCodecError.invalidFrameFormat(
+                "\(context) final offset exceeds 2^62-1 (offset=\(offset), length=\(length))"
+            )
+        }
     }
 
     @usableFromInline
@@ -593,6 +622,14 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
                 maxAllowed: ProtocolLimits.maxStreamDataLength,
                 context: "STREAM frame data length"
             )
+            // RFC 9000 §4.5: the final offset (offset + length) of a stream cannot exceed
+            // 2^62-1. Validate before reading bytes so an out-of-range frame is rejected as
+            // a FRAME_ENCODING_ERROR instead of producing a wrapped end offset.
+            try Self.validateEndOffsetWithinVarintRange(
+                offset: offset,
+                length: length,
+                context: "STREAM frame"
+            )
             guard let bytes = reader.readBytes(safeLength) else {
                 throw FrameCodecError.insufficientData
             }
@@ -601,6 +638,13 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             // No length means data extends to end of packet
             // Per RFC 9000 Section 12.4, this frame must be last in packet
             data = reader.readRemainingBytes()
+            // Even without an explicit length field, the resulting end offset must remain
+            // within the varint range (RFC 9000 §4.5).
+            try Self.validateEndOffsetWithinVarintRange(
+                offset: offset,
+                length: UInt64(data.count),
+                context: "STREAM frame"
+            )
         }
 
         return .stream(StreamFrame(
@@ -676,12 +720,28 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             throw FrameCodecError.insufficientData
         }
 
-        return .newConnectionID(try NewConnectionIDFrame(
-            sequenceNumber: seqNum,
-            retirePriorTo: retirePriorTo,
-            connectionID: try ConnectionID(bytes: cidBytes),
-            statelessResetToken: resetToken
-        ))
+        // RFC 9000 §19.15: `retire_prior_to > sequence_number` is a FRAME_ENCODING_ERROR.
+        // The structural invariant is enforced by NewConnectionIDFrame's validating init;
+        // translate its FrameError into the codec's error domain so callers consistently
+        // map it to FRAME_ENCODING_ERROR and reject the frame at decode time, before any
+        // retirement loop can run.
+        do {
+            return .newConnectionID(try NewConnectionIDFrame(
+                sequenceNumber: seqNum,
+                retirePriorTo: retirePriorTo,
+                connectionID: try ConnectionID(bytes: cidBytes),
+                statelessResetToken: resetToken
+            ))
+        } catch let error as FrameError {
+            switch error {
+            case .retirePriorToExceedsSequenceNumber(let rpt, let seq):
+                throw FrameCodecError.invalidFrameFormat(
+                    "NEW_CONNECTION_ID retire_prior_to (\(rpt)) > sequence_number (\(seq))"
+                )
+            case .invalidStatelessResetTokenLength:
+                throw FrameCodecError.invalidFrameFormat("Invalid stateless reset token length")
+            }
+        }
     }
 
     @usableFromInline

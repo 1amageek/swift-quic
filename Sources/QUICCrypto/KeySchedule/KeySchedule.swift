@@ -32,6 +32,11 @@ public struct KeySchedule: Sendable {
     /// Key update count (for debugging/logging)
     private var keyUpdateCount: UInt64
 
+    /// Negotiated cipher suite for the application (1-RTT) keys.
+    /// Used by key updates so derived keys match the negotiated AEAD (e.g. ChaCha20-Poly1305),
+    /// rather than defaulting to AES-128-GCM.
+    private var applicationCipherSuite: QUICCipherSuite
+
     // MARK: - Initialization
 
     /// Creates a new KeySchedule
@@ -43,6 +48,7 @@ public struct KeySchedule: Sendable {
         self.serverKeys = [:]
         self.keyPhase = 0
         self.keyUpdateCount = 0
+        self.applicationCipherSuite = .aes128GcmSha256
     }
 
     // MARK: - Initial Keys
@@ -104,13 +110,15 @@ public struct KeySchedule: Sendable {
     /// - Returns: Client and server key material tuple
     public mutating func setApplicationSecrets(
         clientSecret: SymmetricKey,
-        serverSecret: SymmetricKey
+        serverSecret: SymmetricKey,
+        cipherSuite: QUICCipherSuite = .aes128GcmSha256
     ) throws -> (client: KeyMaterial, server: KeyMaterial) {
         clientSecrets[.application] = clientSecret
         serverSecrets[.application] = serverSecret
+        applicationCipherSuite = cipherSuite
 
-        let clientKey = try KeyMaterial.derive(from: clientSecret)
-        let serverKey = try KeyMaterial.derive(from: serverSecret)
+        let clientKey = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
+        let serverKey = try KeyMaterial.derive(from: serverSecret, cipherSuite: cipherSuite)
 
         clientKeys[.application] = clientKey
         serverKeys[.application] = serverKey
@@ -156,9 +164,29 @@ public struct KeySchedule: Sendable {
         clientSecrets[.application] = newClientSecret
         serverSecrets[.application] = newServerSecret
 
-        // Derive new key material
-        let clientKey = try KeyMaterial.derive(from: newClientSecret)
-        let serverKey = try KeyMaterial.derive(from: newServerSecret)
+        // Derive new key material using the negotiated cipher suite (not the AES-128-GCM
+        // default), so a ChaCha20-Poly1305 connection updates to ChaCha20-Poly1305 keys.
+        var clientKey = try KeyMaterial.derive(from: newClientSecret, cipherSuite: applicationCipherSuite)
+        var serverKey = try KeyMaterial.derive(from: newServerSecret, cipherSuite: applicationCipherSuite)
+
+        // RFC 9001 §6.1: "The header protection key is not updated." Retain the existing
+        // header-protection keys across the update; only the packet protection key and IV change.
+        if let previousClient = clientKeys[.application] {
+            clientKey = KeyMaterial(
+                key: clientKey.key,
+                iv: clientKey.iv,
+                hp: previousClient.hp,
+                cipherSuite: applicationCipherSuite
+            )
+        }
+        if let previousServer = serverKeys[.application] {
+            serverKey = KeyMaterial(
+                key: serverKey.key,
+                iv: serverKey.iv,
+                hp: previousServer.hp,
+                cipherSuite: applicationCipherSuite
+            )
+        }
 
         clientKeys[.application] = clientKey
         serverKeys[.application] = serverKey

@@ -171,6 +171,22 @@ public final class KeyUpdateManager: Sendable {
         }
     }
 
+    /// Records multiple packet encryptions at once.
+    ///
+    /// Equivalent to calling `recordEncryption()` `count` times, but in O(1). Useful when a batch
+    /// of packets is sealed together, and avoids per-packet lock churn on the hot path.
+    /// - Parameter count: The number of encryptions to record.
+    public func recordEncryptions(_ count: UInt64) {
+        guard count > 0 else { return }
+        state.withLock { s in
+            // Saturating add: never wrap past UInt64.max (the limit is far below max anyway).
+            let current = s.currentAEADKeyUsage.packetsEncrypted
+            s.currentAEADKeyUsage.packetsEncrypted = current.addingReportingOverflow(count).overflow
+                ? UInt64.max
+                : current + count
+        }
+    }
+
     /// Records a decryption failure
     public func recordDecryptionFailure() {
         state.withLock { s in

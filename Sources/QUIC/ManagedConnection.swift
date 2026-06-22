@@ -177,6 +177,27 @@ public final class ManagedConnection: Sendable {
 
         // Set TLS provider on handler
         handler.setTLSProvider(tlsProvider)
+
+        // RFC 9000 §8.2.1: provide the handler with the live anti-amplification budget and the
+        // current network path so PATH_RESPONSE emission is charged against the budget for an
+        // unvalidated path and sent on the path the challenge arrived on.
+        handler.setAmplificationContextProvider { [weak self] in
+            guard let self else { return (UInt64.max, nil, true) }
+            let (remoteAddr, pathValidated) = self.state.withLock {
+                ($0.currentRemoteAddress, $0.pathValidated)
+            }
+            let path: NetworkPath? = remoteAddr.map {
+                NetworkPath(
+                    localAddress: self.localAddress.map(String.init(describing:)) ?? "",
+                    remoteAddress: String(describing: $0)
+                )
+            }
+            return (
+                remainingBudget: self.amplificationLimiter.availableSendWindow(),
+                currentPath: path,
+                isValidated: pathValidated && self.amplificationLimiter.isAddressValidated
+            )
+        }
     }
 
     // MARK: - Connection ID Management
@@ -356,8 +377,19 @@ public final class ManagedConnection: Sendable {
         if parsed.encryptionLevel == .initial, case .long(let longHeader) = parsed.header {
             let (role, currentDCID) = state.withLock { ($0.role, $0.destinationConnectionID) }
 
+            // RFC 9000 §7.3: Record the SCID observed in the peer's first Initial packet so it
+            // can be cross-validated against the peer's initial_source_connection_id transport
+            // parameter once the handshake completes. Record only the first observation; the
+            // peer MUST NOT change its SCID across Initial packets.
+            let peerSCID = longHeader.sourceConnectionID
+            state.withLock { s in
+                if s.observedPeerInitialSCID == nil {
+                    s.observedPeerInitialSCID = peerSCID
+                }
+            }
+
             if role == .client {
-                let serverSCID = longHeader.sourceConnectionID
+                let serverSCID = peerSCID
                 // Only update on first Initial packet (when DCIDs differ)
                 if currentDCID != serverSCID {
                     state.withLock { state in
@@ -426,8 +458,18 @@ public final class ManagedConnection: Sendable {
             if parsed.encryptionLevel == .initial, case .long(let longHeader) = parsed.header {
                 let (role, currentDCID) = state.withLock { ($0.role, $0.destinationConnectionID) }
 
+                // RFC 9000 §7.3: Record the SCID observed in the peer's first Initial packet for
+                // later cross-validation against initial_source_connection_id (see
+                // validateTransportParameterConnectionIDs). Record only the first observation.
+                let peerSCID = longHeader.sourceConnectionID
+                state.withLock { s in
+                    if s.observedPeerInitialSCID == nil {
+                        s.observedPeerInitialSCID = peerSCID
+                    }
+                }
+
                 if role == .client {
-                    let serverSCID = longHeader.sourceConnectionID
+                    let serverSCID = peerSCID
                     // Only update on first Initial packet (when DCIDs differ)
                     if currentDCID != serverSCID {
                         state.withLock { state in
@@ -559,6 +601,9 @@ public final class ManagedConnection: Sendable {
             s.hasProcessedRetry = true
             s.retryToken = retryToken
             s.destinationConnectionID = sourceCID
+            // RFC 9000 §7.3: Remember the Retry SCID so retry_source_connection_id can be
+            // cross-validated against it after the handshake.
+            s.observedRetrySCID = sourceCID
         }
 
         // RFC 9001: The client MUST discard Initial keys derived from the original
@@ -666,6 +711,12 @@ public final class ManagedConnection: Sendable {
 
         // Build 1-RTT packets separately (they shouldn't be coalesced with Initial/Handshake)
         if let appPackets = packetsByLevel[.application] {
+            // RFC 9001 §6.6: before sealing 1-RTT packets, initiate a key update if AEAD usage
+            // limits demand it. This must happen before sealing so the new keys and toggled phase
+            // bit are applied to this batch. encryptShortHeaderPacket takes the sealer and phase
+            // from the key-phase manager, keeping them consistent.
+            try maybeInitiateKeyUpdate()
+
             for packet in appPackets {
                 if case .short(let shortHeader) = packet.header {
                     let encrypted = try packetProcessor.encryptShortHeaderPacket(
@@ -679,6 +730,18 @@ public final class ManagedConnection: Sendable {
         }
 
         return result
+    }
+
+    /// Initiates a 1-RTT key update if AEAD usage limits require one (RFC 9001 §6.6).
+    ///
+    /// RFC 9001 §6.3: a key update is only initiated after the handshake is confirmed
+    /// (`established`). Delegates the limit decision and key derivation to the PacketProcessor,
+    /// which owns the key-phase manager. Errors from key derivation are propagated rather than
+    /// silently swallowed.
+    private func maybeInitiateKeyUpdate() throws {
+        guard isEstablished else { return }
+        guard packetProcessor.shouldInitiateApplicationKeyUpdate else { return }
+        try packetProcessor.initiateApplicationKeyUpdate()
     }
 
     /// Called when a timer expires
@@ -736,6 +799,10 @@ public final class ManagedConnection: Sendable {
                     throw ManagedConnectionError.invalidState("Missing peer transport parameters")
                 }
                 let params = try decodeTransportParameters(peerParams)
+                // RFC 9000 §7.3: Cross-validate the peer's connection-ID transport parameters
+                // against the connection IDs actually observed during the handshake. A mismatch
+                // is a TRANSPORT_PARAMETER_ERROR; reject before applying any peer parameters.
+                try validateTransportParameterConnectionIDs(params)
                 handler.setPeerTransportParameters(params)
 
                 // RFC 9000 Section 8.1: Lift amplification limit when handshake is confirmed
@@ -929,10 +996,16 @@ public final class ManagedConnection: Sendable {
             return .long(longHeader)
 
         case .application:
+            // RFC 9001 §6.1: the Key Phase bit reflects the current send key generation. Seed it
+            // from the key-phase manager's current phase (default 0 before any key update). The
+            // authoritative phase/sealer pairing is reasserted in
+            // PacketProcessor.encryptShortHeaderPacket, which rebuilds this bit from the manager so
+            // the sealed keys and phase bit can never disagree.
+            let currentPhase = packetProcessor.currentApplicationKeyPhase ?? 0
             let shortHeader = ShortHeader(
                 destinationConnectionID: dcid,
                 spinBit: false,
-                keyPhase: false
+                keyPhase: currentPhase == 1
             )
             return .short(shortHeader)
 
@@ -980,7 +1053,30 @@ public final class ManagedConnection: Sendable {
     private func encodeTransportParameters(_ params: TransportParameters) -> Data {
         // Use proper TransportParameterCodec for RFC 9000 compliant encoding
         // This includes mandatory initial_source_connection_id parameter
-        return TransportParameterCodec.encode(params)
+        return TransportParameterCodec.encode(augmentedLocalTransportParameters(params))
+    }
+
+    /// Returns the local transport parameters augmented with the connection IDs that the
+    /// server is required to advertise (RFC 9000 §7.3):
+    /// - `original_destination_connection_id`: the DCID from the client's first Initial,
+    ///   which the server holds in `originalConnectionID`.
+    /// - `retry_source_connection_id`: the SCID of the Retry the server sent, if any.
+    ///
+    /// The client peer cross-validates these against the connection IDs it used / observed.
+    /// Clients send neither parameter, so for the client role the input is returned unchanged.
+    private func augmentedLocalTransportParameters(_ params: TransportParameters) -> TransportParameters {
+        let (role, retrySCID) = state.withLock { ($0.role, $0.observedRetrySCID) }
+        guard role == .server else { return params }
+
+        var augmented = params
+        if augmented.originalDestinationConnectionID == nil {
+            augmented.originalDestinationConnectionID = originalConnectionID
+        }
+        // A server that sends a Retry MUST include retry_source_connection_id.
+        if let retrySCID, augmented.retrySourceConnectionID == nil {
+            augmented.retrySourceConnectionID = retrySCID
+        }
+        return augmented
     }
 
     /// Decodes transport parameters from wire format
@@ -992,6 +1088,69 @@ public final class ManagedConnection: Sendable {
             throw ManagedConnectionError.invalidState(
                 "Invalid peer transport parameters: \(error)"
             )
+        }
+    }
+
+    /// Cross-validates the peer's connection-ID transport parameters against the connection
+    /// IDs observed during the handshake (RFC 9000 §7.3).
+    ///
+    /// Enforces, whenever the corresponding value was observed on the wire:
+    /// - `initial_source_connection_id` equals the SCID seen in the peer's first Initial packet.
+    /// - (client only) `original_destination_connection_id` equals the DCID the client used in
+    ///   its first Initial packet.
+    /// - (client only, after a Retry) `retry_source_connection_id` equals the SCID of the
+    ///   received Retry packet.
+    ///
+    /// Any contradiction is surfaced as `ManagedConnectionError.transportParameterCIDMismatch`,
+    /// which maps to TRANSPORT_PARAMETER_ERROR. The check compares an advertised parameter
+    /// against an observed connection ID: a mismatch is only flagged when both sides are known
+    /// and differ, so it never fabricates a failure from data that was never exchanged.
+    private func validateTransportParameterConnectionIDs(_ params: TransportParameters) throws {
+        let (role, observedPeerSCID, observedRetrySCID, hasProcessedRetry) = state.withLock { s in
+            (s.role, s.observedPeerInitialSCID, s.observedRetrySCID, s.hasProcessedRetry)
+        }
+
+        // initial_source_connection_id MUST equal the SCID observed in the peer's Initial.
+        if let observedPeerSCID, let advertisedISCID = params.initialSourceConnectionID,
+           advertisedISCID != observedPeerSCID {
+            throw ManagedConnectionError.transportParameterCIDMismatch(
+                parameter: "initial_source_connection_id",
+                expected: observedPeerSCID.description,
+                received: advertisedISCID.description
+            )
+        }
+
+        // The following parameters are only sent by the server, so only the client validates.
+        if role == .client {
+            // original_destination_connection_id MUST equal the DCID the client used in its
+            // first Initial packet (held in originalConnectionID for clients).
+            if let advertisedODCID = params.originalDestinationConnectionID,
+               advertisedODCID != originalConnectionID {
+                throw ManagedConnectionError.transportParameterCIDMismatch(
+                    parameter: "original_destination_connection_id",
+                    expected: originalConnectionID.description,
+                    received: advertisedODCID.description
+                )
+            }
+
+            // retry_source_connection_id MUST equal the SCID of the Retry the client processed.
+            if hasProcessedRetry {
+                if let observedRetrySCID, let advertisedRSCID = params.retrySourceConnectionID,
+                   advertisedRSCID != observedRetrySCID {
+                    throw ManagedConnectionError.transportParameterCIDMismatch(
+                        parameter: "retry_source_connection_id",
+                        expected: observedRetrySCID.description,
+                        received: advertisedRSCID.description
+                    )
+                }
+            } else if let staleRSCID = params.retrySourceConnectionID {
+                // A retry_source_connection_id without any Retry is itself a violation.
+                throw ManagedConnectionError.transportParameterCIDMismatch(
+                    parameter: "retry_source_connection_id",
+                    expected: "<absent>",
+                    received: staleRSCID.description
+                )
+            }
         }
     }
 }
@@ -1605,6 +1764,18 @@ private struct ManagedConnectionState: Sendable {
     /// Retry token received from server (to include in subsequent Initial packets)
     var retryToken: Data? = nil
 
+    // MARK: - Transport Parameter CID Cross-Validation State (RFC 9000 §7.3)
+
+    /// The Source Connection ID observed in the peer's first long-header packet.
+    /// After the handshake, the peer's `initial_source_connection_id` transport
+    /// parameter MUST equal this value.
+    var observedPeerInitialSCID: ConnectionID? = nil
+
+    /// The Source Connection ID carried by a received Retry packet (client only).
+    /// If a Retry was processed, the peer's `retry_source_connection_id` transport
+    /// parameter MUST equal this value.
+    var observedRetrySCID: ConnectionID? = nil
+
     // MARK: - Connection Migration State
 
     /// Current remote address (may change during connection migration)
@@ -1649,4 +1820,21 @@ public enum ManagedConnectionError: Error, Sendable {
 
     /// Invalid state
     case invalidState(String)
+
+    /// A transport parameter connection ID did not match the connection IDs observed
+    /// during the handshake (RFC 9000 §7.3 — TRANSPORT_PARAMETER_ERROR).
+    case transportParameterCIDMismatch(parameter: String, expected: String, received: String)
+}
+
+extension ManagedConnectionError {
+    /// The QUIC transport error code that should be used to close the connection for this
+    /// error (RFC 9000 §20.1). Used so the connection close carries the correct code.
+    public var transportErrorCodeValue: UInt64 {
+        switch self {
+        case .transportParameterCIDMismatch:
+            return TransportErrorCode.transportParameterError.rawValue
+        case .connectionClosed, .handshakeNotComplete, .streamNotFound, .invalidState:
+            return TransportErrorCode.internalError.rawValue
+        }
+    }
 }

@@ -274,7 +274,8 @@ public struct NewConnectionIDFrame: Sendable, Hashable {
     ///   - retirePriorTo: Sequence number of the connection ID being retired
     ///   - connectionID: The new connection ID
     ///   - statelessResetToken: Stateless reset token (must be exactly 16 bytes)
-    /// - Throws: `FrameError.invalidStatelessResetTokenLength` if token is not 16 bytes
+    /// - Throws: `FrameError.invalidStatelessResetTokenLength` if token is not 16 bytes,
+    ///   or `FrameError.retirePriorToExceedsSequenceNumber` if `retirePriorTo > sequenceNumber`.
     public init(
         sequenceNumber: UInt64,
         retirePriorTo: UInt64,
@@ -285,6 +286,18 @@ public struct NewConnectionIDFrame: Sendable, Hashable {
             throw FrameError.invalidStatelessResetTokenLength(
                 actual: statelessResetToken.count,
                 expected: ProtocolLimits.statelessResetTokenLength
+            )
+        }
+        // RFC 9000 §19.15: "Receivers of this frame MUST [...] treat receipt of a
+        // value in the Retire Prior To field that is greater than that in the
+        // Sequence Number field as a connection error of type FRAME_ENCODING_ERROR."
+        // Enforcing the invariant at construction guarantees no decoded
+        // NEW_CONNECTION_ID frame can ever carry an out-of-range Retire Prior To,
+        // which prevents an unbounded retirement loop downstream.
+        guard retirePriorTo <= sequenceNumber else {
+            throw FrameError.retirePriorToExceedsSequenceNumber(
+                retirePriorTo: retirePriorTo,
+                sequenceNumber: sequenceNumber
             )
         }
         self.sequenceNumber = sequenceNumber
@@ -315,6 +328,9 @@ public struct NewConnectionIDFrame: Sendable, Hashable {
 public enum FrameError: Error, Sendable, Equatable {
     /// Stateless reset token has invalid length
     case invalidStatelessResetTokenLength(actual: Int, expected: Int)
+    /// NEW_CONNECTION_ID carried `retire_prior_to > sequence_number`
+    /// (RFC 9000 §19.15 — FRAME_ENCODING_ERROR)
+    case retirePriorToExceedsSequenceNumber(retirePriorTo: UInt64, sequenceNumber: UInt64)
 }
 
 // MARK: - CONNECTION_CLOSE Frame

@@ -167,3 +167,62 @@ struct ConnectionIDExchangeRFCTests {
         return (dcid: headerInfo.dcid, scid: headerInfo.scid)
     }
 }
+
+/// RFC 9000 §19.15 — NEW_CONNECTION_ID retirement loop must be bounded by the set of
+/// connection IDs we actually hold, never by the peer-supplied `retire_prior_to` value.
+@Suite("RFC 9000 §19.15 - NEW_CONNECTION_ID retirement bound")
+struct NewConnectionIDRetirementBoundTests {
+
+    @Test("Retirement loop is bounded by held CIDs, not retire_prior_to", .timeLimit(.minutes(1)))
+    func retirementBoundedByHeldCIDs() throws {
+        // A frame whose retire_prior_to equals its sequence number is structurally valid,
+        // but the sequence number can be large on a long-lived connection. Processing such a
+        // frame must do work proportional to the CIDs we store, not to the numeric range
+        // [0, retire_prior_to). A huge retire_prior_to must not drive a multi-billion-iteration
+        // loop; this test would hang under the old `for seq in 0..<retire_prior_to` behavior.
+        let manager = ConnectionIDManager(activeConnectionIDLimit: 8)
+
+        // Store a single peer CID at a low sequence number.
+        let cid0 = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
+        try manager.handleNewConnectionID(
+            NewConnectionIDFrame(
+                sequenceNumber: 0,
+                retirePriorTo: 0,
+                connectionID: cid0,
+                statelessResetToken: Data(repeating: 0xAA, count: 16)
+            )
+        )
+
+        // A new CID with a very large sequence number and an equally large retire_prior_to.
+        let bigSeq: UInt64 = 1_000_000_000  // would loop a billion times if unbounded
+        let cidBig = try ConnectionID(bytes: Data([0x05, 0x06, 0x07, 0x08]))
+        try manager.handleNewConnectionID(
+            NewConnectionIDFrame(
+                sequenceNumber: bigSeq,
+                retirePriorTo: bigSeq,  // valid (== sequence number); retires everything below
+                connectionID: cidBig,
+                statelessResetToken: Data(repeating: 0xBB, count: 16)
+            )
+        )
+
+        // The low-sequence CID must have been retired, the new one retained.
+        let available = manager.availablePeerCIDs
+        #expect(available.count == 1)
+        #expect(available.first?.sequenceNumber == bigSeq)
+    }
+
+    @Test("Hostile retire_prior_to > sequence_number is rejected before any retirement")
+    func hostileRetirePriorToRejected() throws {
+        // The validating frame initializer must reject the out-of-range value, so the
+        // manager never even sees it. Constructing the frame throws.
+        let cid = try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04]))
+        #expect(throws: FrameError.self) {
+            _ = try NewConnectionIDFrame(
+                sequenceNumber: 1,
+                retirePriorTo: (1 << 62) - 1,
+                connectionID: cid,
+                statelessResetToken: Data(repeating: 0x00, count: 16)
+            )
+        }
+    }
+}

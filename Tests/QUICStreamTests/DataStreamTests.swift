@@ -717,4 +717,109 @@ struct DataStreamTests {
             }
         }
     }
+
+    // MARK: - Final Size Reconciliation Across RESET_STREAM / FIN (RFC 9000 §4.5)
+
+    /// RFC 9000 Section 4.5: the final size is invariant regardless of whether it is first
+    /// learned from RESET_STREAM or from a FIN-bearing STREAM frame.
+    @Test("RFC 9000 4.5: RESET_STREAM then conflicting FIN raises final size mismatch")
+    func resetThenConflictingFinRejected() throws {
+        let stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+
+        // First: RESET_STREAM establishes a final size of 50.
+        try stream.handleResetStream(errorCode: 0, finalSize: 50)
+        #expect(stream.state.finalSize == 50)
+
+        // Then: a FIN-bearing frame claiming a different final size (80) must be rejected
+        // as a FINAL_SIZE_ERROR, not silently accepted or reported as a generic state error.
+        let conflictingFin = StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data(repeating: 0, count: 80),
+            fin: true
+        )
+        do {
+            try stream.receive(conflictingFin)
+            Issue.record("Expected StreamError.finalSizeMismatch to be thrown")
+        } catch let error as StreamError {
+            guard case .finalSizeMismatch(let expected, let received) = error else {
+                Issue.record("Wrong error type: \(error)")
+                return
+            }
+            #expect(expected == 50)
+            #expect(received == 80)
+        }
+    }
+
+    @Test("RFC 9000 4.5: RESET_STREAM then matching FIN final size is consistent")
+    func resetThenMatchingFinConsistent() throws {
+        let stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+
+        // RESET_STREAM establishes final size 50.
+        try stream.handleResetStream(errorCode: 0, finalSize: 50)
+
+        // A FIN with the same final size does not trigger a mismatch error. The receive
+        // gate (resetRecvd) still prevents further data delivery, but the reconciliation
+        // check must not flag a contradiction.
+        let matchingFin = StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data(repeating: 0, count: 50),
+            fin: true
+        )
+        do {
+            try stream.receive(matchingFin)
+            Issue.record("Expected the receive-state gate to reject post-reset data")
+        } catch let error as StreamError {
+            // Must be the state gate (resetRecvd), NOT a final-size mismatch.
+            guard case .invalidState = error else {
+                Issue.record("Expected invalidState, got: \(error)")
+                return
+            }
+        }
+        #expect(stream.state.finalSize == 50)
+    }
+
+    @Test("RFC 9000 4.5: FIN then conflicting RESET_STREAM raises mismatch (both orders)")
+    func finThenConflictingResetRejected() throws {
+        let stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+
+        // FIN establishes final size 50.
+        let fin = StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data(repeating: 0, count: 50),
+            fin: true
+        )
+        try stream.receive(fin)
+        #expect(stream.state.finalSize == 50)
+
+        // A RESET_STREAM with a different final size must be rejected.
+        do {
+            try stream.handleResetStream(errorCode: 0, finalSize: 80)
+            Issue.record("Expected StreamError.finalSizeMismatch to be thrown")
+        } catch let error as StreamError {
+            guard case .finalSizeMismatch(let expected, let received) = error else {
+                Issue.record("Wrong error type: \(error)")
+                return
+            }
+            #expect(expected == 50)
+            #expect(received == 80)
+        }
+    }
 }
