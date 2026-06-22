@@ -10,6 +10,7 @@ import QUICCrypto
 import QUICConnection
 import QUICStream
 import QUICRecovery
+import QUICTransport
 
 // MARK: - Handshake State
 
@@ -68,6 +69,21 @@ public final class ManagedConnection: Sendable {
     /// Connection ID manager for connection migration (RFC 9000 Section 9.5)
     private let connectionIDManager: ConnectionIDManager
 
+    /// Token-bucket pacer (RFC 9002 §7.7) for the outbound send path.
+    ///
+    /// Spreads outbound packets over time to avoid bursts. Its rate is driven from
+    /// the congestion window and smoothed RTT (`rate = N * cwnd / srtt`, N = 1.25).
+    /// When pacing is disabled (rate 0) the pacer never limits transmission.
+    private let pacer: Pacer
+
+    /// Pacing gain N (RFC 9002 §7.7): pacing rate is N * cwnd / srtt.
+    private let pacingGain: Double
+
+    /// Whether pacing is enabled for the outbound send path.
+    ///
+    /// When false the pacer is left disabled (rate 0) and the send path never waits.
+    private let pacingEnabled: Bool
+
     /// Internal state
     private let state: Mutex<ManagedConnectionState>
 
@@ -102,6 +118,29 @@ public final class ManagedConnection: Sendable {
     }
     private let sessionTicketState: Mutex<SessionTicketState>
 
+    /// Path MTU discovery state machine (DPLPMTUD, RFC 8899 / RFC 9000 §14).
+    ///
+    /// Drives active probing once the path is validated; feeds the discovered maximum
+    /// packet size back to the send path. When disabled it pins the PMTU at the 1200-byte
+    /// base for the connection's life.
+    private let pmtu: PathMTUDiscovery
+
+    /// State for incoming datagram AsyncStream (RFC 9221, lazy initialization pattern).
+    private struct IncomingDatagramState: Sendable {
+        var continuation: AsyncStream<Data>.Continuation?
+        var stream: AsyncStream<Data>?
+        var isShutdown: Bool = false
+        /// Buffer for datagrams that arrive before incomingDatagrams is accessed.
+        var pendingDatagrams: [Data] = []
+    }
+    private let incomingDatagramState: Mutex<IncomingDatagramState>
+
+    /// The maximum DATAGRAM frame size advertised by the peer (RFC 9221).
+    ///
+    /// 0 means the peer did not advertise DATAGRAM support. Populated from the peer's
+    /// `max_datagram_frame_size` transport parameter when the handshake completes.
+    private let peerMaxDatagramFrameSize: Mutex<UInt64>
+
     /// Original connection ID (for Initial key derivation)
     /// This is the DCID from the first client Initial packet
     private let originalConnectionID: ConnectionID
@@ -132,6 +171,10 @@ public final class ManagedConnection: Sendable {
     ///   - tlsProvider: TLS 1.3 provider
     ///   - localAddress: Local socket address (optional)
     ///   - remoteAddress: Remote socket address
+    ///   - congestionControlAlgorithm: Congestion control algorithm (default: CUBIC)
+    ///   - pacingEnabled: Whether to pace the outbound send path (default: true)
+    ///   - pmtuDiscoveryEnabled: Whether to run active path-MTU discovery (default: true)
+    ///   - pmtuMaxProbeSize: Upper bound DPLPMTUD will probe to in bytes (default: 1500)
     public init(
         role: ConnectionRole,
         version: QUICVersion,
@@ -141,15 +184,26 @@ public final class ManagedConnection: Sendable {
         transportParameters: TransportParameters,
         tlsProvider: any TLS13Provider,
         localAddress: SocketAddress? = nil,
-        remoteAddress: SocketAddress
+        remoteAddress: SocketAddress,
+        congestionControlAlgorithm: CongestionControlAlgorithm = .cubic,
+        pacingEnabled: Bool = true,
+        pmtuDiscoveryEnabled: Bool = true,
+        pmtuMaxProbeSize: Int = 1500
     ) {
         self.handler = QUICConnectionHandler(
             role: role,
             version: version,
             sourceConnectionID: sourceConnectionID,
             destinationConnectionID: destinationConnectionID,
-            transportParameters: transportParameters
+            transportParameters: transportParameters,
+            congestionControlAlgorithm: congestionControlAlgorithm
         )
+        self.pacingEnabled = pacingEnabled
+        self.pacingGain = 1.25
+        // Start the pacer disabled (rate 0 = no limiting). The rate is established
+        // once an RTT estimate exists, driven by updatePacingRate(). When pacing is
+        // disabled by configuration the pacer stays disabled for the connection's life.
+        self.pacer = Pacer(config: .disabled)
         self.packetProcessor = PacketProcessor(dcidLength: sourceConnectionID.length)
         self.tlsProvider = tlsProvider
         self.amplificationLimiter = AntiAmplificationLimiter(isServer: role == .server)
@@ -163,6 +217,13 @@ public final class ManagedConnection: Sendable {
         // For servers, original DCID is the DCID from the client's Initial packet
         self.originalConnectionID = originalConnectionID ?? destinationConnectionID
         self.transportParameters = transportParameters
+        self.pmtu = PathMTUDiscovery(
+            enabled: pmtuDiscoveryEnabled,
+            maxProbeSize: pmtuMaxProbeSize
+        )
+        self.incomingDatagramState = Mutex(IncomingDatagramState())
+        // Seed with our local advertised value; replaced by the peer's value at handshake.
+        self.peerMaxDatagramFrameSize = Mutex(0)
         self.onNewConnectionID = Mutex(nil)  // Set later via setNewConnectionIDCallback
         var initialState = ManagedConnectionState(
             role: role,
@@ -197,6 +258,24 @@ public final class ManagedConnection: Sendable {
                 currentPath: path,
                 isValidated: pathValidated && self.amplificationLimiter.isAddressValidated
             )
+        }
+
+        // RFC 9000 §14: route DPLPMTUD probe outcomes from the handler's loss/ACK
+        // processing into the PMTU state machine. A probe ACK raises the effective max
+        // packet size; a probe loss stops the raise (and is never counted for CC — the
+        // handler already excludes probe packets from congestion control).
+        handler.setPMTUProbeOutcomeCallback { [weak self] packetNumber, acknowledged in
+            guard let self else { return }
+            if acknowledged {
+                let raised = self.pmtu.onProbeAcknowledged(packetNumber: packetNumber)
+                if raised {
+                    // Feed the discovered MTU to the send path / congestion controller so the
+                    // minimum window tracks the larger packet size (RFC 9000 §14 / RFC 9002 §7.2).
+                    self.handler.updateMaxDatagramSize(self.pmtu.currentMaxPacketSize)
+                }
+            } else {
+                self.pmtu.onProbeLost(packetNumber: packetNumber)
+            }
         }
     }
 
@@ -689,6 +768,12 @@ public final class ManagedConnection: Sendable {
                         padToMinimum: true
                     )
                     result.append(encrypted)
+                    recordSentPacket(
+                        frames: packet.frames,
+                        level: .initial,
+                        packetNumber: packet.packetNumber,
+                        sentBytes: encrypted.count
+                    )
                 }
             }
         }
@@ -705,6 +790,12 @@ public final class ManagedConnection: Sendable {
                         padToMinimum: false
                     )
                     result.append(encrypted)
+                    recordSentPacket(
+                        frames: packet.frames,
+                        level: .handshake,
+                        packetNumber: packet.packetNumber,
+                        sentBytes: encrypted.count
+                    )
                 }
             }
         }
@@ -725,11 +816,188 @@ public final class ManagedConnection: Sendable {
                         packetNumber: packet.packetNumber
                     )
                     result.append(encrypted)
+                    recordSentPacket(
+                        frames: packet.frames,
+                        level: .application,
+                        packetNumber: packet.packetNumber,
+                        sentBytes: encrypted.count
+                    )
                 }
             }
         }
 
+        // RFC 9000 §14.3: opportunistically append a DPLPMTUD probe to discover a larger
+        // path MTU. The probe is a padded PING packet; on ACK it raises the effective max
+        // packet size, on loss it is reported only to the PMTU machine (never to CC).
+        if let probe = try maybeBuildPMTUProbe() {
+            result.append(probe)
+        }
+
+        // Refresh the pacing rate from the latest congestion window and RTT so the
+        // pacer spaces the next batch correctly (RFC 9002 §7.7).
+        updatePacingRate()
+
         return result
+    }
+
+    // MARK: - Congestion Control & Pacing
+
+    /// Records a generated packet with loss detection and congestion control, and
+    /// consumes pacer tokens for an in-flight packet.
+    ///
+    /// RFC 9002 Appendix A.5: a packet counts against bytes-in-flight (and pacing)
+    /// only when it carries ack-eliciting or otherwise in-flight content. ACK-only
+    /// packets are not in flight and therefore neither grow bytes-in-flight nor
+    /// consume pacing tokens.
+    private func recordSentPacket(
+        frames: [Frame],
+        level: EncryptionLevel,
+        packetNumber: UInt64,
+        sentBytes: Int
+    ) {
+        let ackEliciting = frames.contains { $0.isAckEliciting }
+        // A packet is in flight if it is ack-eliciting or carries any non-ACK,
+        // non-PADDING content. For our generated packets, ack-eliciting is the
+        // decisive signal: pure ACK packets are not in flight.
+        let inFlight = ackEliciting
+
+        let sentPacket = SentPacket(
+            packetNumber: packetNumber,
+            encryptionLevel: level,
+            timeSent: .now,
+            ackEliciting: ackEliciting,
+            inFlight: inFlight,
+            sentBytes: sentBytes
+        )
+        handler.recordSentPacket(sentPacket)
+    }
+
+    /// Updates the pacer rate from the current congestion window and smoothed RTT.
+    ///
+    /// RFC 9002 §7.7: pacing rate = N * congestion_window / smoothed_rtt, with
+    /// N = 1.25. When pacing is disabled by configuration, or no RTT estimate exists
+    /// yet, the pacer is left disabled (rate 0 = no limiting) so the send path never
+    /// waits or starves.
+    private func updatePacingRate() {
+        guard pacingEnabled else { return }
+
+        let (smoothedRTT, hasEstimate) = handler.smoothedRTTEstimate
+        guard hasEstimate else { return }
+
+        pacer.updateFromCongestion(
+            congestionWindow: UInt64(max(0, handler.congestionWindow)),
+            smoothedRTT: smoothedRTT,
+            pacingGain: pacingGain
+        )
+    }
+
+    /// Gates an outbound packet through the pacer and accounts for its bytes.
+    ///
+    /// This is the single per-packet pacing entry point for the send path. It
+    /// consults the token bucket: if enough tokens are available the packet may be
+    /// sent immediately and the tokens are consumed (returns `nil`); otherwise it
+    /// returns the delay the send loop must wait, then deducts the bytes so the next
+    /// packet is spaced relative to this one. When pacing is disabled this always
+    /// returns `nil` and never deducts (no limiting), so the loop never waits or
+    /// starves.
+    ///
+    /// - Parameter bytes: Size of the next packet in bytes.
+    /// - Returns: Delay to wait before sending, or `nil` to send immediately.
+    public func pacingDelay(bytes: Int) -> Duration? {
+        guard pacingEnabled else { return nil }
+        let byteCount = UInt64(max(0, bytes))
+        if let delay = pacer.packetDelay(bytes: byteCount) {
+            // Insufficient tokens: packetDelay did not deduct, so account for this
+            // packet now. The next packetDelay call will see the reduced bucket and
+            // continue spacing.
+            pacer.consume(bytes: byteCount)
+            return delay
+        }
+        // packetDelay returned nil and already consumed the tokens.
+        return nil
+    }
+
+    /// Whether outbound pacing is currently active (enabled and rate established).
+    public var isPacingActive: Bool {
+        pacingEnabled && pacer.isEnabled
+    }
+
+    /// Current pacing rate in bytes per second (0 when disabled or not established).
+    public var pacingRate: UInt64 {
+        pacer.rate
+    }
+
+    // MARK: - Path MTU Discovery (DPLPMTUD, RFC 8899 / RFC 9000 §14)
+
+    /// The current effective maximum packet size discovered for the path, in bytes.
+    ///
+    /// Starts at the 1200-byte QUIC minimum and rises as PMTU probes are acknowledged.
+    public var currentMaxPacketSize: Int {
+        pmtu.currentMaxPacketSize
+    }
+
+    /// The current DPLPMTUD search phase.
+    public var pmtuPhase: PMTUDiscoveryPhase {
+        pmtu.phase
+    }
+
+    /// Builds and records a DPLPMTUD probe packet if one should be sent now.
+    ///
+    /// RFC 9000 §14.3: a probe is a padded ack-eliciting packet (PING + PADDING) at a
+    /// size larger than the current PLPMTU. The probe is only generated once the path is
+    /// validated and the handshake is established, so the probe is not confused with
+    /// handshake traffic and a successful ACK validates an application-data path.
+    ///
+    /// The probe is registered with the handler so its loss is reported to DPLPMTUD and
+    /// excluded from congestion control (RFC 9000 §14.4).
+    ///
+    /// - Returns: The encrypted probe datagram, or `nil` if no probe is due.
+    private func maybeBuildPMTUProbe() throws -> Data? {
+        // Only probe once established and on a validated path.
+        let pathValidated = state.withLock { $0.pathValidated }
+        guard isEstablished, pathValidated else { return nil }
+        guard let target = pmtu.nextProbeSize() else { return nil }
+
+        let pn = handler.getNextPacketNumber(for: .application)
+        let header = buildPacketHeader(for: .application, packetNumber: pn)
+        guard case .short(let shortHeader) = header else { return nil }
+
+        // Measure the size of a PING-only packet, then add PADDING so the total datagram
+        // is exactly `target` bytes. PADDING encodes 1 byte per count, so the relationship
+        // between padding count and final ciphertext size is linear. Pass `target` as the
+        // max packet size so the (intentionally large) probe is not rejected as too large.
+        let baseProbe = try packetProcessor.encryptShortHeaderPacket(
+            frames: [.ping],
+            header: shortHeader,
+            packetNumber: pn,
+            maxPacketSize: target
+        )
+        let paddingNeeded = target - baseProbe.count
+        guard paddingNeeded > 0 else {
+            // The base packet already meets or exceeds the target; nothing to probe with.
+            return nil
+        }
+
+        let frames: [Frame] = [.ping, .padding(count: paddingNeeded)]
+        let probe = try packetProcessor.encryptShortHeaderPacket(
+            frames: frames,
+            header: shortHeader,
+            packetNumber: pn,
+            maxPacketSize: target
+        )
+
+        // Record the probe both for loss detection (in flight, ack-eliciting) and for the
+        // PMTU machine. recordSentPacket marks it in flight so loss detection tracks it; the
+        // handler excludes it from congestion control because it is registered as a probe.
+        handler.registerPMTUProbe(packetNumber: pn)
+        pmtu.recordProbeSent(size: probe.count, packetNumber: pn)
+        recordSentPacket(
+            frames: frames,
+            level: .application,
+            packetNumber: pn,
+            sentBytes: probe.count
+        )
+        return probe
     }
 
     /// Initiates a 1-RTT key update if AEAD usage limits require one (RFC 9001 §6.6).
@@ -804,6 +1072,14 @@ public final class ManagedConnection: Sendable {
                 // is a TRANSPORT_PARAMETER_ERROR; reject before applying any peer parameters.
                 try validateTransportParameterConnectionIDs(params)
                 handler.setPeerTransportParameters(params)
+
+                // RFC 9221: record the peer's advertised DATAGRAM support so sendDatagram
+                // can enforce it. 0 / absent means the peer does not support DATAGRAM frames.
+                peerMaxDatagramFrameSize.withLock { $0 = params.maxDatagramFrameSize }
+
+                // RFC 9000 §14: bound DPLPMTUD by the peer's max_udp_payload_size. The peer
+                // will not accept UDP payloads larger than this, so it caps the probe ceiling.
+                pmtu.setPeerMaxUDPPayloadSize(params.maxUDPPayloadSize)
 
                 // RFC 9000 Section 8.1: Lift amplification limit when handshake is confirmed
                 amplificationLimiter.confirmHandshake()
@@ -941,6 +1217,11 @@ public final class ManagedConnection: Sendable {
         // Handle stream data
         for (streamID, data) in result.streamData {
             notifyStreamDataReceived(streamID, data: data)
+        }
+
+        // Handle received datagrams (RFC 9221) - deliver to the incomingDatagrams stream.
+        for datagram in result.datagrams {
+            notifyDatagramReceived(datagram)
         }
 
         // Handle handshake completion (from HANDSHAKE_DONE frame)
@@ -1314,6 +1595,15 @@ extension ManagedConnection: QUICConnectionProtocol {
             state.continuation?.finish()
             state.continuation = nil
             state.pendingTickets.removeAll()
+        }
+
+        // Finish incoming datagram stream and mark as shutdown (RFC 9221).
+        incomingDatagramState.withLock { state in
+            guard !state.isShutdown else { return }
+            state.isShutdown = true
+            state.continuation?.finish()
+            state.continuation = nil
+            state.pendingDatagrams.removeAll()
         }
 
         // Resume any waiting stream readers with connection closed error
@@ -1737,6 +2027,133 @@ public enum MigrationError: Error, Sendable {
 
     /// No active connection ID available for migration
     case noActiveConnectionID
+}
+
+// MARK: - Datagram Errors (RFC 9221)
+
+/// Errors raised by the unreliable DATAGRAM API (RFC 9221).
+public enum QUICDatagramError: Error, Sendable, Equatable {
+    /// The peer did not advertise DATAGRAM support (max_datagram_frame_size == 0 / absent).
+    case datagramsNotSupported
+
+    /// The datagram is larger than the peer's advertised max_datagram_frame_size.
+    /// - Parameters:
+    ///   - size: The size of the whole DATAGRAM frame we attempted to send.
+    ///   - maximum: The peer's advertised maximum DATAGRAM frame size.
+    case datagramTooLarge(size: Int, maximum: UInt64)
+
+    /// The connection is closed or shutting down, so the datagram cannot be sent.
+    case connectionClosed
+}
+
+// MARK: - Datagram Public API (RFC 9221)
+
+extension ManagedConnection {
+    /// The maximum payload, in bytes, that can currently be sent in a single datagram.
+    ///
+    /// This accounts for the DATAGRAM frame overhead (type byte + length field) against the
+    /// peer's advertised `max_datagram_frame_size`. Returns 0 when the peer does not support
+    /// DATAGRAM frames. Use this to size payloads before calling `sendDatagram(_:)`.
+    public var maxDatagramPayloadSize: Int {
+        let peerMax = peerMaxDatagramFrameSize.withLock { $0 }
+        guard peerMax > 0 else { return 0 }
+        // A length-prefixed DATAGRAM frame is: 1 (type) + varint(payload.count) + payload.
+        // Find the largest payload P such that 1 + varint_len(P) + P <= peerMax. The varint
+        // length is non-decreasing in P, so we start from the optimistic estimate (payload =
+        // peerMax - 2, the smallest possible overhead) and shrink until the frame fits.
+        var payload = Int64(peerMax) - 2
+        while payload >= 0 {
+            let overhead = 1 + Varint.encodedLength(for: UInt64(payload))
+            if Int64(overhead) + payload <= Int64(peerMax) {
+                return Int(payload)
+            }
+            payload -= 1
+        }
+        return 0
+    }
+
+    /// Sends an unreliable datagram (RFC 9221).
+    ///
+    /// The bytes are carried in a DATAGRAM frame in a 1-RTT packet. Datagrams are
+    /// ack-eliciting and counted for congestion control and RTT, but are NOT retransmitted
+    /// if the packet carrying them is lost (RFC 9221 §5).
+    ///
+    /// - Parameter bytes: The datagram payload.
+    /// - Throws:
+    ///   - `QUICDatagramError.datagramsNotSupported` if the peer did not advertise support.
+    ///   - `QUICDatagramError.datagramTooLarge` if the resulting frame exceeds the peer's
+    ///     advertised `max_datagram_frame_size`.
+    ///   - `QUICDatagramError.connectionClosed` if the connection is shutting down.
+    public func sendDatagram(_ bytes: Data) async throws {
+        let peerMax = peerMaxDatagramFrameSize.withLock { $0 }
+        guard peerMax > 0 else {
+            throw QUICDatagramError.datagramsNotSupported
+        }
+
+        // Build the frame and validate its total wire size against the peer's limit.
+        // RFC 9221 §4: a length field is required when the DATAGRAM is not the last frame in
+        // a packet. We always emit the length-prefixed form (0x31) for safety when coalescing
+        // with other frames; the coalescing decision (0x30 vs 0x31) is finalized at encode time.
+        let frame = Frame.datagram(DatagramFrame(data: bytes, hasLength: true))
+        let frameSize = FrameSize.frame(frame)
+        guard UInt64(frameSize) <= peerMax else {
+            throw QUICDatagramError.datagramTooLarge(size: frameSize, maximum: peerMax)
+        }
+
+        // Reject after shutdown to avoid silently dropping the datagram.
+        let isShutdown = incomingDatagramState.withLock { $0.isShutdown }
+            || state.withLock { $0.handshakeState == .closed || $0.handshakeState == .closing }
+        guard !isShutdown else {
+            throw QUICDatagramError.connectionClosed
+        }
+
+        handler.queueFrame(frame, level: .application)
+        signalNeedsSend()
+    }
+
+    /// A stream of unreliable datagrams received from the peer (RFC 9221).
+    ///
+    /// Datagrams arrive in the order their carrying packets were processed. Like
+    /// `incomingStreams`, the stream is lazily created and buffers datagrams that arrive
+    /// before it is first accessed. It is finished on `shutdown()`.
+    public var incomingDatagrams: AsyncStream<Data> {
+        incomingDatagramState.withLock { state in
+            // After shutdown, return an already-finished stream so iterators don't hang.
+            if state.isShutdown {
+                if let existing = state.stream { return existing }
+                let (stream, continuation) = AsyncStream<Data>.makeStream()
+                continuation.finish()
+                state.stream = stream
+                return stream
+            }
+
+            if let existing = state.stream { return existing }
+
+            let (stream, continuation) = AsyncStream<Data>.makeStream()
+            state.stream = stream
+            state.continuation = continuation
+
+            // Drain any datagrams buffered before this was accessed.
+            for pending in state.pendingDatagrams {
+                continuation.yield(pending)
+            }
+            state.pendingDatagrams.removeAll()
+
+            return stream
+        }
+    }
+
+    /// Delivers a received datagram to the incomingDatagrams stream (internal helper).
+    private func notifyDatagramReceived(_ datagram: Data) {
+        incomingDatagramState.withLock { state in
+            guard !state.isShutdown else { return }
+            if let continuation = state.continuation {
+                continuation.yield(datagram)
+            } else {
+                state.pendingDatagrams.append(datagram)
+            }
+        }
+    }
 }
 
 // MARK: - Internal State

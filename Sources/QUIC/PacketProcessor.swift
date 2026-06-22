@@ -483,12 +483,16 @@ public final class PacketProcessor: Sendable {
     ///   - frames: Frames to include
     ///   - header: The short header template
     ///   - packetNumber: The packet number
+    ///   - maxPacketSize: Maximum permitted datagram size (default: 1200, the QUIC minimum).
+    ///     DPLPMTUD probes (RFC 9000 §14.3) pass a larger value so a padded probe can exceed
+    ///     the base PLPMTU.
     /// - Returns: The encrypted packet data
     /// - Throws: PacketCodecError if encryption fails
     public func encryptShortHeaderPacket(
         frames: [Frame],
         header: ShortHeader,
-        packetNumber: UInt64
+        packetNumber: UInt64,
+        maxPacketSize: Int = 1200
     ) throws -> Data {
         // RFC 9001 §6: when key update is wired, the outgoing sealer and the Key Phase bit MUST
         // come from the same source so they cannot disagree. Take both from the key-phase manager:
@@ -511,7 +515,8 @@ public final class PacketProcessor: Sendable {
                 frames: frames,
                 header: phaseHeader,
                 packetNumber: packetNumber,
-                sealer: context.currentSealer
+                sealer: context.currentSealer,
+                maxPacketSize: maxPacketSize
             )
         }
 
@@ -524,7 +529,8 @@ public final class PacketProcessor: Sendable {
             frames: frames,
             header: header,
             packetNumber: packetNumber,
-            sealer: sealer
+            sealer: sealer,
+            maxPacketSize: maxPacketSize
         )
     }
 

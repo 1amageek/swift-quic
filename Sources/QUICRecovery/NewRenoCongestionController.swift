@@ -43,9 +43,10 @@ public final class NewRenoCongestionController: CongestionController, Sendable {
         var pacingRate: Double  // bytes per nanosecond
         var burstTokens: Int
 
-        // Configuration (immutable after init)
-        let maxDatagramSize: Int
-        let minimumWindow: Int
+        // Configuration. `maxDatagramSize` / `minimumWindow` track the path MTU and may be
+        // raised by DPLPMTUD (RFC 9000 §14) via updateMaxDatagramSize(_:).
+        var maxDatagramSize: Int
+        var minimumWindow: Int
     }
 
     // MARK: - Initialization
@@ -228,6 +229,16 @@ public final class NewRenoCongestionController: CongestionController, Sendable {
             s.recoveryStartTime = nil
             s.burstTokens = LossDetectionConstants.initialBurstTokens
             s.pacingRate = 0
+        }
+    }
+
+    public func updateMaxDatagramSize(_ maxDatagramSize: Int) {
+        state.withLock { s in
+            // RFC 9000 §14 / RFC 9002 §7.2: track the (raised) path MTU. Only ever raise the
+            // datagram size and the minimum-window floor; never shrink the current window.
+            guard maxDatagramSize > s.maxDatagramSize else { return }
+            s.maxDatagramSize = maxDatagramSize
+            s.minimumWindow = 2 * maxDatagramSize
         }
     }
 

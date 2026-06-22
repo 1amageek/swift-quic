@@ -134,6 +134,9 @@ public enum QUICError: Error, Sendable {
     /// Frame not allowed in this packet type
     case frameNotAllowed(frameType: UInt64, packetType: String)
 
+    /// A protocol invariant was violated (maps to PROTOCOL_VIOLATION, RFC 9000 §20.1).
+    case protocolViolation(String)
+
     // MARK: - Crypto Errors
 
     /// TLS error
@@ -209,6 +212,8 @@ extension QUICError: CustomStringConvertible {
             return "Invalid frame: \(msg)"
         case .frameNotAllowed(let frameType, let packetType):
             return "Frame type 0x\(String(format: "%x", frameType)) not allowed in \(packetType) packet"
+        case .protocolViolation(let msg):
+            return "Protocol violation: \(msg)"
         case .tlsError(let msg):
             return "TLS error: \(msg)"
         case .certificateError(let msg):
@@ -256,6 +261,8 @@ extension QUICError {
         case .unsupportedVersion:
             return .protocolViolation
         case .frameNotAllowed:
+            return .protocolViolation
+        case .protocolViolation:
             return .protocolViolation
         case .keyDerivationError:
             return .cryptoError

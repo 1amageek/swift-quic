@@ -145,6 +145,17 @@ public protocol CongestionController: Sendable {
     ///   `onPersistentCongestion`. They should not both be called for the
     ///   same loss event, as persistent congestion subsumes normal loss handling.
     func onPersistentCongestion()
+
+    /// Updates the maximum datagram size used to size the congestion window.
+    ///
+    /// RFC 9002 §7.2: the minimum congestion window is `2 * max_datagram_size`. When
+    /// DPLPMTUD (RFC 8899 / RFC 9000 §14) raises the path MTU, the congestion controller
+    /// is informed so the minimum window tracks the new, larger packet size. This only
+    /// adjusts the minimum window floor and the unit of growth; it never shrinks the
+    /// current congestion window.
+    ///
+    /// - Parameter maxDatagramSize: The new maximum datagram size in bytes.
+    func updateMaxDatagramSize(_ maxDatagramSize: Int)
 }
 
 // MARK: - Default Implementations
@@ -154,5 +165,35 @@ extension CongestionController {
     /// Default implementation of available window calculation
     public func availableWindow(bytesInFlight: Int) -> Int {
         max(0, congestionWindow - bytesInFlight)
+    }
+}
+
+// MARK: - Congestion Control Algorithm Selection
+
+/// Selectable congestion control algorithm (RFC 9002 §7 / RFC 9438).
+///
+/// Used by configuration to choose which `CongestionController` implementation a
+/// connection instantiates. `NewReno` remains available for interoperability and
+/// testing; `CUBIC` is the modern default.
+public enum CongestionControlAlgorithm: Sendable, Equatable, CaseIterable {
+    /// NewReno congestion control (RFC 9002 §7).
+    case newReno
+    /// CUBIC congestion control (RFC 9438). Default.
+    case cubic
+
+    /// Creates a fresh congestion controller for this algorithm.
+    ///
+    /// - Parameter maxDatagramSize: Maximum datagram size in bytes used to size the
+    ///   initial and minimum windows.
+    /// - Returns: A new congestion controller instance implementing the selected algorithm.
+    public func makeController(
+        maxDatagramSize: Int = LossDetectionConstants.maxDatagramSize
+    ) -> any CongestionController {
+        switch self {
+        case .newReno:
+            return NewRenoCongestionController(maxDatagramSize: maxDatagramSize)
+        case .cubic:
+            return CubicCongestionController(maxDatagramSize: maxDatagramSize)
+        }
     }
 }

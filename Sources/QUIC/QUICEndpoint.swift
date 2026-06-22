@@ -354,7 +354,11 @@ public actor QUICEndpoint {
             transportParameters: transportParameters,
             tlsProvider: tlsProvider,
             localAddress: _localAddress,
-            remoteAddress: address
+            remoteAddress: address,
+            congestionControlAlgorithm: configuration.congestionControlAlgorithm,
+            pacingEnabled: configuration.pacingEnabled,
+            pmtuDiscoveryEnabled: configuration.pmtuDiscoveryEnabled,
+            pmtuMaxProbeSize: configuration.pmtuMaxProbeSize
         )
 
         // Set callback for NEW_CONNECTION_ID frames
@@ -432,7 +436,11 @@ public actor QUICEndpoint {
             transportParameters: transportParameters,
             tlsProvider: tlsProvider,
             localAddress: _localAddress,
-            remoteAddress: address
+            remoteAddress: address,
+            congestionControlAlgorithm: configuration.congestionControlAlgorithm,
+            pacingEnabled: configuration.pacingEnabled,
+            pmtuDiscoveryEnabled: configuration.pmtuDiscoveryEnabled,
+            pmtuMaxProbeSize: configuration.pmtuMaxProbeSize
         )
 
         connection.setNewConnectionIDCallback { [weak router, weak connection] cid in
@@ -550,7 +558,11 @@ public actor QUICEndpoint {
             transportParameters: transportParameters,
             tlsProvider: tlsProvider,
             localAddress: _localAddress,
-            remoteAddress: address
+            remoteAddress: address,
+            congestionControlAlgorithm: configuration.congestionControlAlgorithm,
+            pacingEnabled: configuration.pacingEnabled,
+            pmtuDiscoveryEnabled: configuration.pmtuDiscoveryEnabled,
+            pmtuMaxProbeSize: configuration.pmtuMaxProbeSize
         )
 
         // Register connection
@@ -687,7 +699,11 @@ public actor QUICEndpoint {
             transportParameters: transportParameters,
             tlsProvider: tlsProvider,
             localAddress: _localAddress,
-            remoteAddress: info.remoteAddress
+            remoteAddress: info.remoteAddress,
+            congestionControlAlgorithm: configuration.congestionControlAlgorithm,
+            pacingEnabled: configuration.pacingEnabled,
+            pmtuDiscoveryEnabled: configuration.pmtuDiscoveryEnabled,
+            pmtuMaxProbeSize: configuration.pmtuMaxProbeSize
         )
 
         // Register with both our SCID and the client's DCID
@@ -1056,9 +1072,15 @@ public actor QUICEndpoint {
                 // Generate packets from pending stream data
                 let packets = try connection.generateOutboundPackets()
 
-                // Send each packet
+                // Send each packet, honoring the pacing interval (RFC 9002 §7.7).
+                // Pacing spreads transmission over time so a full congestion window
+                // is not emitted as a single burst. When pacing is disabled the delay
+                // is always nil and packets are sent back-to-back.
+                let nioAddress = try connection.remoteAddress.toNIOAddress()
                 for packet in packets {
-                    let nioAddress = try connection.remoteAddress.toNIOAddress()
+                    if let delay = connection.pacingDelay(bytes: packet.count) {
+                        try await Task.sleep(for: delay)
+                    }
                     try await socket.send(packet, to: nioAddress)
                 }
             } catch {

@@ -5,6 +5,7 @@
 import Foundation
 import QUICCore
 import QUICCrypto
+import QUICRecovery
 
 // MARK: - Security Mode
 
@@ -112,6 +113,50 @@ public struct QUICConfiguration: Sendable {
     /// ACK delay exponent (default: 3)
     public var ackDelayExponent: UInt64
 
+    // MARK: - Congestion Control
+
+    /// Congestion control algorithm (default: CUBIC, RFC 9438).
+    ///
+    /// CUBIC is the modern default; NewReno (RFC 9002 §7) remains available for
+    /// interoperability and testing.
+    public var congestionControlAlgorithm: CongestionControlAlgorithm
+
+    /// Whether to pace outbound packets (default: true).
+    ///
+    /// When enabled, packets are spread over time at `N * cwnd / smoothed_rtt`
+    /// (RFC 9002 §7.7, N = 1.25) rather than emitted as bursts. When disabled the
+    /// send path applies no rate limiting.
+    public var pacingEnabled: Bool
+
+    // MARK: - Path MTU Discovery (DPLPMTUD, RFC 8899 / RFC 9000 §14)
+
+    /// Whether to perform active path-MTU discovery (DPLPMTUD, default: true).
+    ///
+    /// When enabled, the connection probes the path with padded ack-eliciting
+    /// packets to discover a packet size larger than the 1200-byte QUIC minimum
+    /// (RFC 9000 §14.3). When disabled, the effective maximum packet size stays at
+    /// the 1200-byte base PLPMTU for the connection's lifetime.
+    public var pmtuDiscoveryEnabled: Bool
+
+    /// Upper bound on the size DPLPMTUD will probe to, in bytes (default: 1500).
+    ///
+    /// This is the search ceiling: discovery never raises the PMTU above this value
+    /// regardless of how large a probe succeeds. The effective ceiling is further
+    /// clamped by the peer's `max_udp_payload_size` transport parameter (RFC 9000
+    /// §14, §18.2). Typical Ethernet is 1500 bytes.
+    public var pmtuMaxProbeSize: Int
+
+    // MARK: - Datagram Extension (RFC 9221)
+
+    /// Maximum DATAGRAM frame size this endpoint will advertise and accept (RFC 9221).
+    ///
+    /// This is the maximum size of a whole DATAGRAM frame (type byte + optional length +
+    /// payload) we are willing to receive, advertised to the peer via the
+    /// `max_datagram_frame_size` transport parameter. A value of 0 (the default) disables
+    /// the DATAGRAM extension: we advertise no support and `sendDatagram` will fail until
+    /// the peer advertises support.
+    public var maxDatagramFrameSize: UInt64
+
     // MARK: - Connection ID
 
     /// Preferred connection ID length (default: 8)
@@ -183,6 +228,11 @@ public struct QUICConfiguration: Sendable {
         self.initialMaxStreamsUni = 100
         self.maxAckDelay = .milliseconds(25)
         self.ackDelayExponent = 3
+        self.congestionControlAlgorithm = .cubic
+        self.pacingEnabled = true
+        self.pmtuDiscoveryEnabled = true
+        self.pmtuMaxProbeSize = 1500
+        self.maxDatagramFrameSize = 0
         self.connectionIDLength = 8
         self.version = .v1
         self.alpn = ["h3"]
@@ -304,5 +354,7 @@ extension TransportParameters {
         self.maxAckDelay = UInt64(config.maxAckDelay.components.seconds * 1000 +
                                    config.maxAckDelay.components.attoseconds / 1_000_000_000_000_000)
         self.initialSourceConnectionID = sourceConnectionID
+        // RFC 9221: advertise our DATAGRAM support (0 = unsupported, the default).
+        self.maxDatagramFrameSize = config.maxDatagramFrameSize
     }
 }

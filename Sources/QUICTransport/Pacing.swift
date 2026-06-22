@@ -128,6 +128,20 @@ public final class Pacer: Sendable {
         }
     }
 
+    // MARK: - Testing Seam
+
+    /// Forces `lastUpdate` into the past to deterministically exercise the
+    /// large-elapsed token-replenishment path (regression coverage for the
+    /// `Double`→`UInt64` overflow trap). Test-only.
+    internal func _setLastUpdateForTesting(secondsInPast: Double) {
+        state.withLock { $0.lastUpdate = ContinuousClock.now - .seconds(secondsInPast) }
+    }
+
+    /// Current token count (test/diagnostics).
+    public var currentTokens: UInt64 {
+        state.withLock { $0.tokens }
+    }
+
     // MARK: - Packet Scheduling
 
     /// Calculates delay before sending a packet
@@ -141,7 +155,8 @@ public final class Pacer: Sendable {
     /// - Returns: Delay to wait, or nil if packet can be sent immediately
     public func packetDelay(bytes: UInt64) -> Duration? {
         state.withLock { s in
-            guard s.isEnabled else { return nil }
+            // A zero (or unset) rate means "no pacing" — never divide by zero below.
+            guard s.isEnabled, s.rate > 0 else { return nil }
 
             let now = ContinuousClock.now
             replenishTokens(&s, now: now)
@@ -187,13 +202,37 @@ public final class Pacer: Sendable {
         }
     }
 
-    /// Replenishes tokens based on elapsed time
+    /// Replenishes tokens based on elapsed time.
+    ///
+    /// Overflow-safe: the token count never exceeds `maxBurst`, so we only ever
+    /// need to produce up to the remaining headroom. Computing against the
+    /// headroom (and clamping the `Double` product before converting) avoids two
+    /// traps that a naive `UInt64(elapsedSeconds * rate)` hits: a `Double`→`UInt64`
+    /// conversion overflow (when `elapsed * rate` exceeds `UInt64.max`, e.g. a
+    /// large first interval or a high rate) and a `UInt64` addition overflow.
     private func replenishTokens(_ s: inout PacerState, now: ContinuousClock.Instant) {
         let elapsed = now - s.lastUpdate
-        let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        let newTokens = UInt64(max(0, elapsedSeconds * Double(s.rate)))
+        // Guard against a non-monotonic / zero step: never reduce, never produce.
+        guard elapsed > .zero else { s.lastUpdate = now; return }
 
-        s.tokens = min(s.tokens + newTokens, s.maxBurst)
+        let headroom = s.maxBurst > s.tokens ? s.maxBurst - s.tokens : 0
+        if headroom == 0 {
+            s.lastUpdate = now
+            return
+        }
+
+        let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        let produced = elapsedSeconds * Double(s.rate)
+        // Clamp to headroom before the UInt64 conversion so neither the conversion
+        // nor the addition can overflow. `produced` is bounded and finite here.
+        let newTokens: UInt64
+        if produced.isFinite, produced > 0 {
+            newTokens = produced >= Double(headroom) ? headroom : UInt64(produced)
+        } else {
+            newTokens = 0
+        }
+
+        s.tokens += newTokens          // newTokens <= headroom, so this cannot overflow maxBurst
         s.lastUpdate = now
     }
 

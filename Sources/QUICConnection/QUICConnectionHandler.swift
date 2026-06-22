@@ -44,8 +44,8 @@ public final class QUICConnectionHandler: Sendable {
     /// Packet number space manager (loss detection + ACK management)
     private let pnSpaceManager: PacketNumberSpaceManager
 
-    /// Congestion controller
-    private let congestionController: NewRenoCongestionController
+    /// Congestion controller (algorithm selected at construction time)
+    private let congestionController: any CongestionController
 
     /// Crypto stream manager
     private let cryptoStreamManager: CryptoStreamManager
@@ -102,6 +102,38 @@ public final class QUICConnectionHandler: Sendable {
         amplificationContextProvider.withLock { $0 = provider }
     }
 
+    // MARK: - Path MTU Discovery Hooks (RFC 9000 §14)
+
+    /// Application-space packet numbers that carry DPLPMTUD probes.
+    ///
+    /// RFC 9000 §14.4: PMTU probe packets are ack-eliciting and in flight, but their
+    /// loss MUST NOT be treated as a congestion signal. We therefore track probe packet
+    /// numbers here so that, when loss detection reports them, we exclude them from the
+    /// congestion-controller loss event and instead route their fate to the PMTU machine.
+    private let pmtuProbePacketNumbers: Mutex<Set<UInt64>> = Mutex([])
+
+    /// Callback invoked when a tracked PMTU probe is acknowledged or lost.
+    ///
+    /// The boolean is `true` for acknowledgment and `false` for loss/timeout. Injected
+    /// by the owning connection, which holds the `PathMTUDiscovery` state machine.
+    private let pmtuProbeOutcome: Mutex<(@Sendable (_ packetNumber: UInt64, _ acknowledged: Bool) -> Void)?>
+        = Mutex(nil)
+
+    /// Sets the callback used to report PMTU probe outcomes to the owning connection.
+    public func setPMTUProbeOutcomeCallback(
+        _ callback: (@Sendable (_ packetNumber: UInt64, _ acknowledged: Bool) -> Void)?
+    ) {
+        pmtuProbeOutcome.withLock { $0 = callback }
+    }
+
+    /// Registers an application-space packet number as carrying a PMTU probe.
+    ///
+    /// Once registered, the packet's loss is reported to the PMTU machine and excluded
+    /// from congestion-control loss handling (RFC 9000 §14.4).
+    public func registerPMTUProbe(packetNumber: UInt64) {
+        pmtuProbePacketNumbers.withLock { _ = $0.insert(packetNumber) }
+    }
+
     // MARK: - Initialization
 
     /// Creates a new connection handler
@@ -111,12 +143,16 @@ public final class QUICConnectionHandler: Sendable {
     ///   - sourceConnectionID: Local connection ID
     ///   - destinationConnectionID: Peer's connection ID
     ///   - transportParameters: Local transport parameters
+    ///   - congestionControlAlgorithm: Congestion control algorithm to use (default: CUBIC)
+    ///   - maxDatagramSize: Maximum datagram size used to size the congestion window
     public init(
         role: ConnectionRole,
         version: QUICVersion,
         sourceConnectionID: ConnectionID,
         destinationConnectionID: ConnectionID,
-        transportParameters: TransportParameters
+        transportParameters: TransportParameters,
+        congestionControlAlgorithm: CongestionControlAlgorithm = .cubic,
+        maxDatagramSize: Int = LossDetectionConstants.maxDatagramSize
     ) {
         self.connectionState = Mutex(ConnectionState(
             role: role,
@@ -126,7 +162,9 @@ public final class QUICConnectionHandler: Sendable {
         ))
 
         self.pnSpaceManager = PacketNumberSpaceManager()
-        self.congestionController = NewRenoCongestionController()
+        self.congestionController = congestionControlAlgorithm.makeController(
+            maxDatagramSize: maxDatagramSize
+        )
         self.cryptoStreamManager = CryptoStreamManager()
 
         // Initialize stream manager with transport parameters
@@ -302,6 +340,26 @@ public final class QUICConnectionHandler: Sendable {
                 // No action needed
                 break
 
+            case .datagram(let datagramFrame):
+                // RFC 9221 §5: validate an incoming DATAGRAM against the size WE advertised.
+                // A frame larger than our max_datagram_frame_size is a PROTOCOL_VIOLATION.
+                // We only advertise support when maxDatagramFrameSize > 0; receiving any
+                // DATAGRAM while we advertised 0 is likewise a violation.
+                let advertised = localTransportParams.maxDatagramFrameSize
+                guard advertised > 0 else {
+                    throw QUICError.frameNotAllowed(
+                        frameType: UInt64(frame.frameType.rawValue),
+                        packetType: "\(level)"
+                    )
+                }
+                let wireSize = UInt64(FrameSize.frame(frame))
+                guard wireSize <= advertised else {
+                    throw QUICError.protocolViolation(
+                        "DATAGRAM frame of \(wireSize) bytes exceeds advertised max_datagram_frame_size \(advertised)"
+                    )
+                }
+                result.datagrams.append(datagramFrame.data)
+
             // MARK: - Connection Migration Frames
 
             case .pathChallenge(let data):
@@ -377,6 +435,30 @@ public final class QUICConnectionHandler: Sendable {
             receiveTime: now
         )
 
+        // RFC 9000 §14.4: separate DPLPMTUD probe packets from ordinary packets. Probes
+        // are reported to the PMTU machine but excluded from congestion control — their
+        // loss is not a congestion signal, and their (large) acknowledgment must not be
+        // double-counted by the controller's ordinary path. Acks of probes still grow the
+        // window normally as in-flight packets, so we keep acked probes in the CC list and
+        // only exclude *lost* probes; this matches "a lost probe is not a loss for CC".
+        let trackedProbes = pmtuProbePacketNumbers.withLock { $0 }
+        let probeOutcome = pmtuProbeOutcome.withLock { $0 }
+
+        if !trackedProbes.isEmpty {
+            for acked in result.ackedPackets where trackedProbes.contains(acked.packetNumber) {
+                probeOutcome?(acked.packetNumber, true)
+            }
+            for lost in result.lostPackets where trackedProbes.contains(lost.packetNumber) {
+                probeOutcome?(lost.packetNumber, false)
+            }
+            // Stop tracking probes that have now resolved (acked or lost).
+            let resolved = Set(result.ackedPackets.map(\.packetNumber))
+                .union(result.lostPackets.map(\.packetNumber))
+            if !resolved.isEmpty {
+                pmtuProbePacketNumbers.withLock { $0.subtract(resolved) }
+            }
+        }
+
         // Congestion Control: process acknowledged packets
         if !result.ackedPackets.isEmpty {
             congestionController.onPacketsAcknowledged(
@@ -386,8 +468,12 @@ public final class QUICConnectionHandler: Sendable {
             )
         }
 
-        // Congestion Control: process lost packets
-        if !result.lostPackets.isEmpty {
+        // Congestion Control: process lost packets.
+        // RFC 9000 §14.4: exclude PMTU probe packets — their loss is not counted for CC.
+        let ccLostPackets = trackedProbes.isEmpty
+            ? result.lostPackets
+            : result.lostPackets.filter { !trackedProbes.contains($0.packetNumber) }
+        if !ccLostPackets.isEmpty {
             // RFC 9002 Section 7.6.2 - Persistent Congestion
             //
             // Per the RFC, persistent congestion detection happens AFTER loss detection,
@@ -405,11 +491,11 @@ public final class QUICConnectionHandler: Sendable {
             // This optimization is valid because:
             // - minimum_window (2*MSS) < cwnd/2 for any cwnd > 4*MSS (always true after slow start)
             // - Persistent congestion resets to slow start (ssthresh=∞), which is the desired behavior
-            if pnSpaceManager.checkPersistentCongestion(lostPackets: result.lostPackets) {
+            if pnSpaceManager.checkPersistentCongestion(lostPackets: ccLostPackets) {
                 congestionController.onPersistentCongestion()
             } else {
                 congestionController.onPacketsLost(
-                    packets: result.lostPackets,
+                    packets: ccLostPackets,
                     now: now,
                     rtt: pnSpaceManager.rttEstimator
                 )
@@ -667,6 +753,10 @@ public final class QUICConnectionHandler: Sendable {
                 let rtt = pnSpaceManager.rttEstimator
                 let lostPackets = detector.detectLostPackets(now: now, rttEstimator: rtt)
                 if !lostPackets.isEmpty {
+                    // RFC 9000 §14.4: report any lost DPLPMTUD probes to the PMTU machine.
+                    // A probe loss is not a congestion signal, so it is reported only here
+                    // (not to the congestion controller).
+                    reportPMTUProbeLosses(lostPackets)
                     return .retransmit(lostPackets, level: level)
                 }
             }
@@ -680,6 +770,23 @@ public final class QUICConnectionHandler: Sendable {
         }
 
         return .none
+    }
+
+    /// Reports any tracked PMTU probe packets in the given lost set to the PMTU machine.
+    ///
+    /// RFC 9000 §14.4: a lost probe is reported to DPLPMTUD but never to congestion control.
+    private func reportPMTUProbeLosses(_ lostPackets: [SentPacket]) {
+        let trackedProbes = pmtuProbePacketNumbers.withLock { $0 }
+        guard !trackedProbes.isEmpty else { return }
+        let probeOutcome = pmtuProbeOutcome.withLock { $0 }
+        var resolved: Set<UInt64> = []
+        for lost in lostPackets where trackedProbes.contains(lost.packetNumber) {
+            probeOutcome?(lost.packetNumber, false)
+            resolved.insert(lost.packetNumber)
+        }
+        if !resolved.isEmpty {
+            pmtuProbePacketNumbers.withLock { $0.subtract(resolved) }
+        }
     }
 
     /// Gets the next timer deadline
@@ -732,6 +839,14 @@ public final class QUICConnectionHandler: Sendable {
         congestionController.congestionWindow
     }
 
+    /// Informs the congestion controller of a (raised) path MTU (RFC 9000 §14).
+    ///
+    /// Forwards the DPLPMTUD-discovered max packet size so the minimum-window floor
+    /// tracks the larger datagram size. Never shrinks the current congestion window.
+    public func updateMaxDatagramSize(_ maxDatagramSize: Int) {
+        congestionController.updateMaxDatagramSize(maxDatagramSize)
+    }
+
     /// Available window for sending (congestion window minus bytes in flight)
     public var availableWindow: Int {
         congestionController.availableWindow(bytesInFlight: pnSpaceManager.totalBytesInFlight)
@@ -740,6 +855,21 @@ public final class QUICConnectionHandler: Sendable {
     /// Current congestion control state
     public var congestionState: CongestionState {
         congestionController.currentState
+    }
+
+    /// Current total bytes in flight across all packet number spaces.
+    public var bytesInFlight: Int {
+        pnSpaceManager.totalBytesInFlight
+    }
+
+    /// Smoothed RTT estimate, and whether an RTT sample has been observed yet.
+    ///
+    /// Used by the connection layer to drive the pacing rate from cwnd and srtt
+    /// (RFC 9002 §7.7). When `hasEstimate` is false the smoothed RTT is the initial
+    /// estimate and pacing should not yet be derived from it.
+    public var smoothedRTTEstimate: (rtt: Duration, hasEstimate: Bool) {
+        let estimator = pnSpaceManager.rttEstimator
+        return (estimator.smoothedRTT, estimator.hasEstimate)
     }
 
     // MARK: - Stream Management
@@ -1027,6 +1157,9 @@ public struct FrameProcessingResult: Sendable {
 
     /// Connection IDs retired by peer
     public var retiredConnectionIDs: [UInt64] = []
+
+    /// Unreliable datagrams received via DATAGRAM frames (RFC 9221), in receive order.
+    public var datagrams: [Data] = []
 }
 
 /// Packet to be sent

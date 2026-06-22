@@ -152,6 +152,14 @@ public struct TransportParameterCodec: Sendable {
             encodeParameter(&writer, id: .retrySourceConnectionID, data: rscid.bytes)
         }
 
+        // max_datagram_frame_size (RFC 9221, only advertise when non-zero).
+        // RFC 9221 §3: absence and 0 are equivalent ("DATAGRAM frames not supported"),
+        // so we only emit the parameter when we actually support DATAGRAM frames.
+        if params.maxDatagramFrameSize > 0 {
+            encodeVarintParameter(&writer, id: .maxDatagramFrameSize,
+                                 value: params.maxDatagramFrameSize)
+        }
+
         return writer.toData()
     }
 
@@ -370,6 +378,9 @@ public struct TransportParameterCodec: Sendable {
 
         case .retrySourceConnectionID:
             params.retrySourceConnectionID = try ConnectionID(bytes: value)
+
+        case .maxDatagramFrameSize:
+            params.maxDatagramFrameSize = try decodeVarint(value)
         }
     }
 
