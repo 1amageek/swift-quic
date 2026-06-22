@@ -135,11 +135,11 @@ public struct VersionNegotiator: Sendable {
 
         // Destination Connection ID (from client's SCID)
         packet.append(UInt8(destinationCID.length))
-        packet.append(destinationCID.bytes)
+        packet.append(contentsOf: destinationCID.bytes)
 
         // Source Connection ID (from client's DCID)
         packet.append(UInt8(sourceCID.length))
-        packet.append(sourceCID.bytes)
+        packet.append(contentsOf: sourceCID.bytes)
 
         // Supported Versions
         for version in supportedVersions {

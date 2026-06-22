@@ -63,7 +63,7 @@ public struct TransportParameterCodec: Sendable {
 
         // original_destination_connection_id (server only)
         if let odcid = params.originalDestinationConnectionID {
-            encodeParameter(&writer, id: .originalDestinationConnectionID, data: odcid.bytes)
+            encodeParameter(&writer, id: .originalDestinationConnectionID, data: Data(odcid.bytes))
         }
 
         // max_idle_timeout
@@ -144,12 +144,12 @@ public struct TransportParameterCodec: Sendable {
 
         // initial_source_connection_id
         if let iscid = params.initialSourceConnectionID {
-            encodeParameter(&writer, id: .initialSourceConnectionID, data: iscid.bytes)
+            encodeParameter(&writer, id: .initialSourceConnectionID, data: Data(iscid.bytes))
         }
 
         // retry_source_connection_id (server only, after Retry)
         if let rscid = params.retrySourceConnectionID {
-            encodeParameter(&writer, id: .retrySourceConnectionID, data: rscid.bytes)
+            encodeParameter(&writer, id: .retrySourceConnectionID, data: Data(rscid.bytes))
         }
 
         // max_datagram_frame_size (RFC 9221, only advertise when non-zero).

@@ -6,8 +6,8 @@
 ///
 /// Some limits are mandated by RFC 9000, others are implementation
 /// choices based on practical considerations (e.g., UDP MTU constraints).
-
-import Foundation
+///
+/// Embedded-clean: no Foundation, no `any`.
 
 /// Protocol-defined limits for QUIC fields
 public enum ProtocolLimits {
@@ -102,7 +102,7 @@ public enum ProtocolLimits {
         _ length: UInt64,
         maxAllowed limit: Int,
         context: String
-    ) throws {
+    ) throws(ConversionError) {
         guard length <= UInt64(limit) else {
             throw ConversionError.exceedsLimit(
                 value: length,

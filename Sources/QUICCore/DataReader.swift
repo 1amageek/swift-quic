@@ -2,8 +2,13 @@
 ///
 /// DataReader provides a convenient way to sequentially read bytes from Data,
 /// tracking the current position automatically.
+///
+/// This is the legacy `Data`-based cursor retained in the Foundation adapter.
+/// The Embedded-clean cursor is `P2PCoreBytes` `ByteReader`/`ByteWriter` used by
+/// ``QUICCoreCodec``; `DataReader`/`DataWriter` bridge `Data` call sites.
 
 import Foundation
+import QUICCoreCodec
 
 /// A cursor-based reader for binary data
 public struct DataReader: Sendable {

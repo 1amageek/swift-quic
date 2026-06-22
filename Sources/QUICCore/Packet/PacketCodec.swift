@@ -247,7 +247,7 @@ public struct PacketEncoder: Sendable {
         // Build unprotected header (first byte + DCID)
         var unprotectedHeader = Data()
         unprotectedHeader.append(header.firstByte)
-        unprotectedHeader.append(header.destinationConnectionID.bytes)
+        unprotectedHeader.append(contentsOf: header.destinationConnectionID.bytes)
 
         // Build packet number bytes
         let pnBytes = encodePacketNumber(packetNumber, length: header.packetNumberLength)
@@ -308,7 +308,7 @@ public struct PacketEncoder: Sendable {
             let tokenLength = header.token?.count ?? 0
             Varint(UInt64(tokenLength)).encode(to: &data)
             if let token = header.token {
-                data.append(token)
+                data.append(contentsOf: token)
             }
         }
 
@@ -679,7 +679,7 @@ public struct PacketDecoder: Sendable {
         // Build AAD and decrypt payload
         var aad = Data()
         aad.append(unprotectedFirstByte)
-        aad.append(protectedHeader.destinationConnectionID.bytes)
+        aad.append(contentsOf: protectedHeader.destinationConnectionID.bytes)
         aad.append(unprotectedPNBytes.prefix(actualPNLength))
 
         // Get ciphertext (Short header packets have no Length field, consume rest of datagram)

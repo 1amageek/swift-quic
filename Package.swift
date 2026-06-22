@@ -2,14 +2,27 @@
 
 import PackageDescription
 
+// Embedded toggle controls the experimental Embedded feature + WMO for the
+// Embedded-clean cores. Lifetimes is enabled in BOTH modes because Span-returning
+// members of the P2PCoreBytes dependency require @_lifetime.
+let embeddedEnabled = Context.environment["P2P_CORE_EMBEDDED"] == "1"
+
+let coreSettings: [SwiftSetting] = {
+    var s: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
+    if embeddedEnabled {
+        s += [.enableExperimentalFeature("Embedded"), .unsafeFlags(["-wmo"])]
+    }
+    return s
+}()
+
 let package = Package(
     name: "swift-quic",
     platforms: [
-        .macOS(.v15),
-        .iOS(.v18),
-        .tvOS(.v18),
-        .watchOS(.v11),
-        .visionOS(.v2),
+        .macOS(.v26),
+        .iOS(.v26),
+        .tvOS(.v26),
+        .watchOS(.v26),
+        .visionOS(.v26),
     ],
     products: [
         // Main public API
@@ -17,7 +30,12 @@ let package = Package(
             name: "QUIC",
             targets: ["QUIC"]
         ),
-        // Core types (no I/O dependencies)
+        // Embedded-clean wire codec (varint + frame + packet-header codec)
+        .library(
+            name: "QUICCoreCodec",
+            targets: ["QUICCoreCodec"]
+        ),
+        // Core types (no I/O dependencies) — Foundation adapter over QUICCoreCodec
         .library(
             name: "QUICCore",
             targets: ["QUICCore"]
@@ -39,13 +57,30 @@ let package = Package(
 
         // Documentation
         .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
+
+        // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter)
+        .package(path: "../swift-p2p-core"),
     ],
     targets: [
-        // MARK: - Core Types (No I/O)
+        // MARK: - Embedded-clean wire codec (dual-build: host + Embedded)
+
+        .target(
+            name: "QUICCoreCodec",
+            dependencies: [
+                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+            ],
+            path: "Sources/QUICCoreCodec",
+            swiftSettings: coreSettings
+        ),
+
+        // MARK: - Core Types (Foundation adapter over QUICCoreCodec)
 
         .target(
             name: "QUICCore",
-            dependencies: [],
+            dependencies: [
+                "QUICCoreCodec",
+                .product(name: "P2PCoreFoundation", package: "swift-p2p-core"),
+            ],
             path: "Sources/QUICCore"
         ),
 

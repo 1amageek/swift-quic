@@ -1,8 +1,12 @@
 /// QUIC Version (RFC 9000 Section 15)
 ///
 /// QUIC versions are identified by a 32-bit unsigned number.
+///
+/// Embedded-clean: no Foundation, no `any`. The salt / retry-integrity
+/// constants are exposed as `[UInt8]` (the Foundation adapter restores the
+/// historical `Data?` views).
 
-import Foundation
+import P2PCoreBytes
 
 /// A QUIC protocol version
 public struct QUICVersion: RawRepresentable, Hashable, Sendable {
@@ -44,22 +48,22 @@ public struct QUICVersion: RawRepresentable, Hashable, Sendable {
     // MARK: - Initial Salt
 
     /// Returns the initial salt for key derivation (RFC 9001 Section 5.2)
-    public var initialSalt: Data? {
+    public var initialSaltBytes: [UInt8]? {
         switch self {
         case .v1:
             // QUIC v1 initial salt
-            return Data([
+            return [
                 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
                 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
                 0xcc, 0xbb, 0x7f, 0x0a
-            ])
+            ]
         case .v2:
             // QUIC v2 initial salt (RFC 9369)
-            return Data([
+            return [
                 0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb,
                 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
                 0xf9, 0xbd, 0x2e, 0xd9
-            ])
+            ]
         default:
             return nil
         }
@@ -68,36 +72,36 @@ public struct QUICVersion: RawRepresentable, Hashable, Sendable {
     // MARK: - Retry Integrity
 
     /// Returns the retry integrity key for this version
-    public var retryIntegrityKey: Data? {
+    public var retryIntegrityKeyBytes: [UInt8]? {
         switch self {
         case .v1:
-            return Data([
+            return [
                 0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
                 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e
-            ])
+            ]
         case .v2:
-            return Data([
+            return [
                 0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2,
                 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92
-            ])
+            ]
         default:
             return nil
         }
     }
 
     /// Returns the retry integrity nonce for this version
-    public var retryIntegrityNonce: Data? {
+    public var retryIntegrityNonceBytes: [UInt8]? {
         switch self {
         case .v1:
-            return Data([
+            return [
                 0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
                 0x23, 0x98, 0x25, 0xbb
-            ])
+            ]
         case .v2:
-            return Data([
+            return [
                 0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99,
                 0x90, 0xef, 0xb0, 0x4a
-            ])
+            ]
         default:
             return nil
         }
@@ -107,18 +111,20 @@ public struct QUICVersion: RawRepresentable, Hashable, Sendable {
 // MARK: - Encoding/Decoding
 
 extension QUICVersion {
-    /// Encodes the version as 4 bytes (big-endian)
-    public func encode(to data: inout Data) {
-        data.append(UInt8(rawValue >> 24))
-        data.append(UInt8((rawValue >> 16) & 0xFF))
-        data.append(UInt8((rawValue >> 8) & 0xFF))
-        data.append(UInt8(rawValue & 0xFF))
+    /// Encodes the version as 4 bytes (big-endian).
+    public func encode(to writer: inout ByteWriter) {
+        writer.writeUInt32(rawValue)
     }
 
-    /// Decodes a version from 4 bytes
-    public static func decode(from reader: inout DataReader) -> QUICVersion? {
-        guard let value = reader.readUInt32() else { return nil }
-        return QUICVersion(rawValue: value)
+    /// Decodes a version from 4 bytes, advancing the reader. Returns `nil` on
+    /// insufficient data (matching the historical optional API).
+    public static func decode(from reader: inout ByteReader) -> QUICVersion? {
+        do {
+            let value = try reader.readUInt32()
+            return QUICVersion(rawValue: value)
+        } catch {
+            return nil
+        }
     }
 }
 
@@ -134,8 +140,24 @@ extension QUICVersion: CustomStringConvertible {
         case .negotiation:
             return "QUIC(negotiation)"
         default:
-            return "QUIC(0x\(String(format: "%08x", rawValue)))"
+            return "QUIC(0x\(Self.hex8(rawValue)))"
         }
+    }
+
+    /// Lowercase 8-digit hex of a `UInt32`, zero-padded (Embedded-clean; no
+    /// `String(format:)`).
+    private static func hex8(_ value: UInt32) -> String {
+        let digits: [Character] = ["0", "1", "2", "3", "4", "5", "6", "7",
+                                   "8", "9", "a", "b", "c", "d", "e", "f"]
+        var chars: [Character] = []
+        chars.reserveCapacity(8)
+        var shift = 28
+        while shift >= 0 {
+            let nibble = Int((value >> UInt32(shift)) & 0xF)
+            chars.append(digits[nibble])
+            shift -= 4
+        }
+        return String(chars)
     }
 }
 

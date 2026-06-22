@@ -141,7 +141,7 @@ public struct RetryIntegrityTag: Sendable {
         pseudoPacket.append(UInt8(originalDCID.length))
 
         // Original Destination Connection ID
-        pseudoPacket.append(originalDCID.bytes)
+        pseudoPacket.append(contentsOf: originalDCID.bytes)
 
         // Rest of the Retry packet
         pseudoPacket.append(retryPacket)
@@ -179,11 +179,11 @@ public struct RetryIntegrityTag: Sendable {
 
         // DCID Length + DCID
         packet.append(UInt8(destinationCID.length))
-        packet.append(destinationCID.bytes)
+        packet.append(contentsOf: destinationCID.bytes)
 
         // SCID Length + SCID
         packet.append(UInt8(sourceCID.length))
-        packet.append(sourceCID.bytes)
+        packet.append(contentsOf: sourceCID.bytes)
 
         // Retry Token
         packet.append(retryToken)
