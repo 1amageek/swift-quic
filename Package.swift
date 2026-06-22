@@ -35,6 +35,11 @@ let package = Package(
             name: "QUICCoreCodec",
             targets: ["QUICCoreCodec"]
         ),
+        // Embedded-clean packet protection (PacketProtector<C,A> / SuiteProtector<C>)
+        .library(
+            name: "QUICPacketProtectionCore",
+            targets: ["QUICPacketProtectionCore"]
+        ),
         // Core types (no I/O dependencies) — Foundation adapter over QUICCoreCodec
         .library(
             name: "QUICCore",
@@ -58,7 +63,7 @@ let package = Package(
         // Documentation
         .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
 
-        // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter)
+        // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter) + crypto seam
         .package(path: "../swift-p2p-core"),
     ],
     targets: [
@@ -70,6 +75,23 @@ let package = Package(
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
             ],
             path: "Sources/QUICCoreCodec",
+            swiftSettings: coreSettings
+        ),
+
+        // MARK: - Embedded-clean packet protection (dual-build: host + Embedded)
+
+        // The generic packet protector: PacketProtector<C, A> (AEAD payload
+        // protection + header protection over the CryptoProvider /
+        // HeaderProtectionProvider seam) and the SuiteProtector<C> closed enum
+        // that replaces the `any PacketOpener`/`any PacketSealer` existentials.
+        .target(
+            name: "QUICPacketProtectionCore",
+            dependencies: [
+                "QUICCoreCodec",
+                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+            ],
+            path: "Sources/QUICPacketProtectionCore",
             swiftSettings: coreSettings
         ),
 
@@ -90,6 +112,7 @@ let package = Package(
             name: "QUICCrypto",
             dependencies: [
                 "QUICCore",
+                "QUICPacketProtectionCore",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "X509", package: "swift-certificates"),
                 .product(name: "SwiftASN1", package: "swift-asn1"),
@@ -173,7 +196,11 @@ let package = Package(
 
         .testTarget(
             name: "QUICCryptoTests",
-            dependencies: ["QUICCrypto"],
+            dependencies: [
+                "QUICCrypto",
+                "QUICPacketProtectionCore",
+                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+            ],
             path: "Tests/QUICCryptoTests"
         ),
 
