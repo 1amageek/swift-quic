@@ -303,7 +303,7 @@ public final class DataStream: Sendable {
 
             // Insert into buffer
             do {
-                try `internal`.recvBuffer.insert(offset: frame.offset, data: frame.data, fin: frame.fin)
+                try `internal`.recvBuffer.insert(offset: frame.offset, data: Data(frame.data), fin: frame.fin)
             } catch let error as DataBufferError {
                 throw StreamError.bufferError(error)
             }

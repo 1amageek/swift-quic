@@ -3,8 +3,9 @@
 /// Provides accurate frame size calculations for QUIC frames.
 /// This is the single source of truth for frame sizes, used by both
 /// frame encoding and capacity planning.
-
-import Foundation
+///
+/// Embedded-clean: no Foundation, no `any`. Operates on `[UInt8]`-backed frames
+/// and the QUIC ``Varint`` length helper.
 
 /// Frame size calculation utilities
 public enum FrameSize {
@@ -107,8 +108,6 @@ public enum FrameSize {
         }
 
         // Additional ACK Ranges (gap + range pairs)
-        // インデックスベースのループで ArraySlice 作成を回避
-        // dropFirst() は ArraySlice を返すため、iterator 生成コストが発生する
         let ranges = frame.ackRanges
         if ranges.count > 1 {
             for i in 1..<ranges.count {

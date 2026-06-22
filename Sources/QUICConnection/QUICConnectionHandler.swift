@@ -358,11 +358,14 @@ public final class QUICConnectionHandler: Sendable {
                         "DATAGRAM frame of \(wireSize) bytes exceeds advertised max_datagram_frame_size \(advertised)"
                     )
                 }
-                result.datagrams.append(datagramFrame.data)
+                result.datagrams.append(Data(datagramFrame.data))
 
             // MARK: - Connection Migration Frames
 
-            case .pathChallenge(let data):
+            case .pathChallenge(let challengeBytes):
+                // The Frame enum carries the challenge as `[UInt8]`; the path validator
+                // and the processing result work in `Data`.
+                let data = Data(challengeBytes)
                 // RFC 9000 §8.2.1: respond on the path the PATH_CHALLENGE arrived on, and for an
                 // unvalidated path charge the PATH_RESPONSE against the anti-amplification budget.
                 let amplification = amplificationContextProvider.withLock { $0() }
@@ -386,7 +389,10 @@ public final class QUICConnectionHandler: Sendable {
                 }
                 result.pathChallengeData.append(data)
 
-            case .pathResponse(let data):
+            case .pathResponse(let responseBytes):
+                // The Frame enum carries the response as `[UInt8]`; the path validator
+                // and the processing result work in `Data`.
+                let data = Data(responseBytes)
                 // Handle response using PathValidationManager
                 if let validatedPath = pathValidationManager.handleResponse(data) {
                     result.pathValidated = validatedPath
@@ -397,8 +403,8 @@ public final class QUICConnectionHandler: Sendable {
                 // Process using ConnectionIDManager
                 // RFC 9000 §5.1.1: Validates duplicate sequence numbers and limit
                 try connectionIDManager.handleNewConnectionID(frame)
-                // Register the stateless reset token
-                statelessResetManager.registerReceivedToken(frame.statelessResetToken)
+                // Register the stateless reset token (frame token is `[UInt8]`)
+                statelessResetManager.registerReceivedToken(Data(frame.statelessResetToken))
                 result.newConnectionIDs.append(frame)
 
             case .retireConnectionID(let sequenceNumber):

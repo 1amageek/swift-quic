@@ -479,7 +479,7 @@ struct FrameCodecTests {
 
     @Test("Encode and decode PATH_CHALLENGE frame")
     func pathChallengeFrame() throws {
-        let challengeData = Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
+        let challengeData: [UInt8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
         let frame = Frame.pathChallenge(challengeData)
         let encoded = try codec.encode(frame)
 
@@ -500,7 +500,7 @@ struct FrameCodecTests {
 
     @Test("Encode and decode PATH_RESPONSE frame")
     func pathResponseFrame() throws {
-        let responseData = Data([0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01])
+        let responseData: [UInt8] = [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
         let frame = Frame.pathResponse(responseData)
         let encoded = try codec.encode(frame)
 
@@ -602,7 +602,7 @@ struct FrameCodecTests {
             .resetStream(ResetStreamFrame(streamID: 4, applicationErrorCode: 1, finalSize: 100)),
             .stopSending(StopSendingFrame(streamID: 8, applicationErrorCode: 2)),
             .crypto(CryptoFrame(offset: 0, data: Data([0x01, 0x02, 0x03]))),
-            .newToken(Data([0xAA, 0xBB, 0xCC])),
+            .newToken([0xAA, 0xBB, 0xCC]),
             .stream(StreamFrame(streamID: 0, offset: 0, data: Data("Hello".utf8), fin: false)),
             .stream(StreamFrame(streamID: 4, offset: 100, data: Data("World".utf8), fin: true)),
             .maxData(10_000_000),
@@ -615,8 +615,8 @@ struct FrameCodecTests {
             .streamsBlocked(StreamsBlockedFrame(streamLimit: 50, isBidirectional: false)),
             .newConnectionID(newCIDFrame),
             .retireConnectionID(3),
-            .pathChallenge(Data(repeating: 0x12, count: 8)),
-            .pathResponse(Data(repeating: 0x34, count: 8)),
+            .pathChallenge([UInt8](repeating: 0x12, count: 8)),
+            .pathResponse([UInt8](repeating: 0x34, count: 8)),
             .connectionClose(ConnectionCloseFrame(errorCode: 0, frameType: nil, reasonPhrase: "", isApplicationError: false)),
             .connectionClose(ConnectionCloseFrame(errorCode: 0x100, reasonPhrase: "App error", isApplicationError: true)),
             .handshakeDone,

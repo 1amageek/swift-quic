@@ -95,7 +95,9 @@ public final class PathValidationManager: Sendable {
     /// - Returns: The PATH_CHALLENGE frame
     public func createChallengeFrame(for path: NetworkPath) -> Frame {
         let data = startValidation(for: path)
-        return .pathChallenge(data)
+        // The PATH_CHALLENGE payload is `[UInt8]` in the Embedded-clean Frame enum;
+        // this path validator tracks challenge data as `Data`, so convert here.
+        return .pathChallenge([UInt8](data))
     }
 
     // MARK: - Processing Received Frames
@@ -125,7 +127,8 @@ public final class PathValidationManager: Sendable {
             let isValidated = s.validatedPaths.contains(path)
             // A validated path is not subject to the anti-amplification limit.
             if isValidated || remainingAmplificationBudget >= Self.pathResponseFrameSize {
-                return .pathResponse(data)
+                // PATH_RESPONSE payload is `[UInt8]` in the Embedded-clean Frame enum.
+                return .pathResponse([UInt8](data))
             }
             // Budget exhausted: defer the response (associated with its path) rather than
             // dropping it. It will be re-attempted via getPendingResponses() when credit grows.
@@ -146,7 +149,8 @@ public final class PathValidationManager: Sendable {
         state.withLock { s in
             s.pendingResponses.append((data: data, path: nil))
         }
-        return .pathResponse(data)
+        // PATH_RESPONSE payload is `[UInt8]` in the Embedded-clean Frame enum.
+        return .pathResponse([UInt8](data))
     }
 
     /// Processes a received PATH_RESPONSE
@@ -413,7 +417,7 @@ public final class ConnectionIDManager: Sendable {
             let peerCID = PeerConnectionID(
                 connectionID: frame.connectionID,
                 sequenceNumber: frame.sequenceNumber,
-                statelessResetToken: frame.statelessResetToken,
+                statelessResetToken: Data(frame.statelessResetToken),
                 receivedAt: .now
             )
             s.peerCIDs[frame.sequenceNumber] = peerCID

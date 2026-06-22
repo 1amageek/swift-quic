@@ -2,8 +2,12 @@
 ///
 /// Frames are the units of structured data within QUIC packets.
 /// Each frame type serves a specific purpose in the protocol.
-
-import Foundation
+///
+/// Embedded-clean: no Foundation, no `any`. The direct byte payloads
+/// (`.newToken`, `.pathChallenge`, `.pathResponse`) are `[UInt8]`; the
+/// struct-carried payloads (`.crypto`, `.stream`, `.datagram`, ...) store their
+/// bytes as `[UInt8]` in the frame structs. The Foundation adapter restores the
+/// historical `Data`-accepting construction surface.
 
 // MARK: - Frame Type
 
@@ -91,7 +95,7 @@ public enum Frame: Sendable, Hashable {
     case crypto(CryptoFrame)
 
     /// NEW_TOKEN frame (type 0x07) - provides token for future connections
-    case newToken(Data)
+    case newToken([UInt8])
 
     /// STREAM frame (type 0x08-0x0f) - carries stream data
     case stream(StreamFrame)
@@ -121,10 +125,10 @@ public enum Frame: Sendable, Hashable {
     case retireConnectionID(UInt64)
 
     /// PATH_CHALLENGE frame (type 0x1a) - path validation challenge
-    case pathChallenge(Data)
+    case pathChallenge([UInt8])
 
     /// PATH_RESPONSE frame (type 0x1b) - path validation response
-    case pathResponse(Data)
+    case pathResponse([UInt8])
 
     /// CONNECTION_CLOSE frame (type 0x1c, 0x1d) - closes connection
     case connectionClose(ConnectionCloseFrame)

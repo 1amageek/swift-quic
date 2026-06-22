@@ -63,8 +63,10 @@ public struct CryptoStream: Sendable {
             return
         }
 
-        // Trim leading bytes if they overlap with already-read data
-        var dataToInsert = frame.data
+        // Trim leading bytes if they overlap with already-read data.
+        // The frame's `data` is `[UInt8]` (Embedded-clean core); the crypto buffer
+        // stores `Data`, so convert at this boundary.
+        var dataToInsert = Data(frame.data)
         var insertOffset = frame.offset
         if frame.offset < readOffset {
             let skip = Int(readOffset - frame.offset)

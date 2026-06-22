@@ -223,11 +223,11 @@ struct FrameSizeTests {
         #expect(handshakeDoneSize == FrameSize.handshakeDoneFrame)
 
         // PATH_CHALLENGE
-        let pathChallengeSize = try codec.encode(.pathChallenge(Data(repeating: 0, count: 8))).count
+        let pathChallengeSize = try codec.encode(.pathChallenge([UInt8](repeating: 0, count: 8))).count
         #expect(pathChallengeSize == FrameSize.pathChallengeFrame)
 
         // PATH_RESPONSE
-        let pathResponseSize = try codec.encode(.pathResponse(Data(repeating: 0, count: 8))).count
+        let pathResponseSize = try codec.encode(.pathResponse([UInt8](repeating: 0, count: 8))).count
         #expect(pathResponseSize == FrameSize.pathResponseFrame)
     }
 
@@ -282,7 +282,7 @@ struct FrameSizeTests {
             .resetStream(ResetStreamFrame(streamID: 4, applicationErrorCode: 0, finalSize: 1000)),
             .stopSending(StopSendingFrame(streamID: 4, applicationErrorCode: 0)),
             .crypto(CryptoFrame(offset: 0, data: Data(repeating: 0, count: 100))),
-            .newToken(Data(repeating: 0xAB, count: 32)),
+            .newToken([UInt8](repeating: 0xAB, count: 32)),
             .stream(StreamFrame(streamID: 4, offset: 0, data: Data([1, 2, 3]), fin: false, hasLength: true)),
             .maxData(1_000_000),
             .maxStreamData(MaxStreamDataFrame(streamID: 4, maxStreamData: 500_000)),
@@ -291,8 +291,8 @@ struct FrameSizeTests {
             .streamDataBlocked(StreamDataBlockedFrame(streamID: 4, streamDataLimit: 500_000)),
             .streamsBlocked(StreamsBlockedFrame(streamLimit: 100, isBidirectional: true)),
             .retireConnectionID(5),
-            .pathChallenge(Data(repeating: 0, count: 8)),
-            .pathResponse(Data(repeating: 0, count: 8)),
+            .pathChallenge([UInt8](repeating: 0, count: 8)),
+            .pathResponse([UInt8](repeating: 0, count: 8)),
             .connectionClose(ConnectionCloseFrame(errorCode: 0, frameType: nil, reasonPhrase: "test", isApplicationError: true)),
             .handshakeDone,
             .datagram(DatagramFrame(data: Data([1, 2, 3]), hasLength: true))

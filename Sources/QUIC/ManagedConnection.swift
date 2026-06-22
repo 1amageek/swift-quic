@@ -1996,8 +1996,8 @@ extension ManagedConnection {
     ///   The actual packet creation happens via the normal packet sending mechanism.
     private func createPathChallengePacket(challengeData: Data) throws -> Data? {
         // PATH_CHALLENGE will be included in the next 1-RTT packet
-        // Queue the frame via the handler
-        handler.queueFrame(.pathChallenge(challengeData), level: .application)
+        // Queue the frame via the handler (the Frame payload is `[UInt8]`)
+        handler.queueFrame(.pathChallenge([UInt8](challengeData)), level: .application)
 
         // Return nil - the frame will be sent with normal packet flow
         // This avoids duplicating packet creation logic
@@ -2009,8 +2009,8 @@ extension ManagedConnection {
     /// - Note: This queues the frame to be sent with the next outbound packet.
     private func createPathResponsePacket(data: Data) throws -> Data? {
         // PATH_RESPONSE must be sent immediately (RFC 9000 Section 8.2.2)
-        // Queue the frame via the handler
-        handler.queueFrame(.pathResponse(data), level: .application)
+        // Queue the frame via the handler (the Frame payload is `[UInt8]`)
+        handler.queueFrame(.pathResponse([UInt8](data)), level: .application)
 
         // Return nil - the frame will be sent with normal packet flow
         return nil

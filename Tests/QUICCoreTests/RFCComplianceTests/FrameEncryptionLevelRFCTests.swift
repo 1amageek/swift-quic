@@ -184,14 +184,14 @@ struct FrameEncryptionLevelRFCTests {
     @Test("PATH_CHALLENGE frame NOT allowed at Initial level")
     func pathChallengeNotAllowedAtInitial() throws {
         #expect(throws: ProtocolViolation.self) {
-            _ = try validator.isFrameAllowed(.pathChallenge(Data(repeating: 0, count: 8)), at: .initial)
+            _ = try validator.isFrameAllowed(.pathChallenge([UInt8](repeating: 0, count: 8)), at: .initial)
         }
     }
 
     @Test("NEW_TOKEN frame NOT allowed at Initial level")
     func newTokenNotAllowedAtInitial() throws {
         #expect(throws: ProtocolViolation.self) {
-            _ = try validator.isFrameAllowed(.newToken(Data()), at: .initial)
+            _ = try validator.isFrameAllowed(.newToken([UInt8]()), at: .initial)
         }
     }
 
@@ -273,14 +273,14 @@ struct FrameEncryptionLevelRFCTests {
     @Test("PATH_CHALLENGE frame NOT allowed at 0-RTT level")
     func pathChallengeNotAllowedAt0RTT() throws {
         #expect(throws: ProtocolViolation.self) {
-            _ = try validator.isFrameAllowed(.pathChallenge(Data(repeating: 0, count: 8)), at: .zeroRTT)
+            _ = try validator.isFrameAllowed(.pathChallenge([UInt8](repeating: 0, count: 8)), at: .zeroRTT)
         }
     }
 
     @Test("NEW_TOKEN frame NOT allowed at 0-RTT level")
     func newTokenNotAllowedAt0RTT() throws {
         #expect(throws: ProtocolViolation.self) {
-            _ = try validator.isFrameAllowed(.newToken(Data()), at: .zeroRTT)
+            _ = try validator.isFrameAllowed(.newToken([UInt8]()), at: .zeroRTT)
         }
     }
 
@@ -304,7 +304,7 @@ struct FrameEncryptionLevelRFCTests {
             .ping,
             .ack(AckFrame(largestAcknowledged: 0, ackDelay: 0, ackRanges: [])),
             .crypto(CryptoFrame(offset: 0, data: Data())),
-            .newToken(Data([0x01, 0x02])),
+            .newToken([0x01, 0x02]),
             .stream(StreamFrame(streamID: 0, offset: 0, data: Data(), fin: false)),
             .maxData(1000),
             .maxStreamData(maxStreamDataFrame),
@@ -314,8 +314,8 @@ struct FrameEncryptionLevelRFCTests {
             .streamsBlocked(StreamsBlockedFrame(streamLimit: 10, isBidirectional: true)),
             .newConnectionID(newCIDFrame),
             .retireConnectionID(0),
-            .pathChallenge(Data(repeating: 0, count: 8)),
-            .pathResponse(Data(repeating: 0, count: 8)),
+            .pathChallenge([UInt8](repeating: 0, count: 8)),
+            .pathResponse([UInt8](repeating: 0, count: 8)),
             .connectionClose(ConnectionCloseFrame(errorCode: 0, frameType: nil, reasonPhrase: "", isApplicationError: false)),
             .handshakeDone,
             .resetStream(ResetStreamFrame(streamID: 0, applicationErrorCode: 0, finalSize: 0)),
@@ -396,18 +396,18 @@ struct FrameEncryptionLevelRFCTests {
         // with a token to send in the Token field of an Initial packet.
 
         // Only allowed at 1-RTT
-        let result = try validator.isFrameAllowed(.newToken(Data([0x01])), at: .application)
+        let result = try validator.isFrameAllowed(.newToken([0x01]), at: .application)
         #expect(result)
 
         // Not allowed at other levels
         #expect(throws: ProtocolViolation.self) {
-            _ = try validator.isFrameAllowed(.newToken(Data()), at: .initial)
+            _ = try validator.isFrameAllowed(.newToken([UInt8]()), at: .initial)
         }
         #expect(throws: ProtocolViolation.self) {
-            _ = try validator.isFrameAllowed(.newToken(Data()), at: .handshake)
+            _ = try validator.isFrameAllowed(.newToken([UInt8]()), at: .handshake)
         }
         #expect(throws: ProtocolViolation.self) {
-            _ = try validator.isFrameAllowed(.newToken(Data()), at: .zeroRTT)
+            _ = try validator.isFrameAllowed(.newToken([UInt8]()), at: .zeroRTT)
         }
     }
 }

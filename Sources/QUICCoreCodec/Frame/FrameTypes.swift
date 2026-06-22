@@ -1,8 +1,12 @@
 /// QUIC Frame Type Definitions
 ///
 /// Detailed structures for each QUIC frame type.
-
-import Foundation
+///
+/// Embedded-clean: no Foundation, no `any`. Byte payloads (`StreamFrame.data`,
+/// `CryptoFrame.data`, `DatagramFrame.data`, `NewConnectionIDFrame.statelessResetToken`)
+/// are `[UInt8]`; `ConnectionCloseFrame.reasonPhrase` stays `String` (stdlib). The
+/// Foundation adapter restores the historical `Data`-accepting initializers and
+/// the `[UInt8] == Data` comparison surface.
 
 // MARK: - ACK Frame
 
@@ -75,7 +79,7 @@ public struct StreamFrame: Sendable, Hashable {
     public let offset: UInt64
 
     /// Stream data
-    public let data: Data
+    public let data: [UInt8]
 
     /// Whether this is the final data on the stream
     public let fin: Bool
@@ -89,7 +93,7 @@ public struct StreamFrame: Sendable, Hashable {
     public init(
         streamID: UInt64,
         offset: UInt64,
-        data: Data,
+        data: [UInt8],
         fin: Bool = false,
         hasLength: Bool = true
     ) {
@@ -118,10 +122,10 @@ public struct CryptoFrame: Sendable, Hashable {
     public let offset: UInt64
 
     /// Cryptographic handshake data
-    public let data: Data
+    public let data: [UInt8]
 
     /// Creates a CRYPTO frame
-    public init(offset: UInt64, data: Data) {
+    public init(offset: UInt64, data: [UInt8]) {
         self.offset = offset
         self.data = data
     }
@@ -265,7 +269,7 @@ public struct NewConnectionIDFrame: Sendable, Hashable {
     public let connectionID: ConnectionID
 
     /// Stateless reset token (16 bytes)
-    public let statelessResetToken: Data
+    public let statelessResetToken: [UInt8]
 
     /// Creates a NEW_CONNECTION_ID frame with validation
     ///
@@ -280,8 +284,8 @@ public struct NewConnectionIDFrame: Sendable, Hashable {
         sequenceNumber: UInt64,
         retirePriorTo: UInt64,
         connectionID: ConnectionID,
-        statelessResetToken: Data
-    ) throws {
+        statelessResetToken: [UInt8]
+    ) throws(FrameError) {
         guard statelessResetToken.count == ProtocolLimits.statelessResetTokenLength else {
             throw FrameError.invalidStatelessResetTokenLength(
                 actual: statelessResetToken.count,
@@ -313,7 +317,7 @@ public struct NewConnectionIDFrame: Sendable, Hashable {
         unchecked sequenceNumber: UInt64,
         retirePriorTo: UInt64,
         connectionID: ConnectionID,
-        statelessResetToken: Data
+        statelessResetToken: [UInt8]
     ) {
         assert(statelessResetToken.count == ProtocolLimits.statelessResetTokenLength,
                "Stateless reset token must be \(ProtocolLimits.statelessResetTokenLength) bytes")
@@ -367,12 +371,12 @@ public struct ConnectionCloseFrame: Sendable, Hashable {
 /// DATAGRAM frame (RFC 9221)
 public struct DatagramFrame: Sendable, Hashable {
     /// Datagram data
-    public let data: Data
+    public let data: [UInt8]
 
     /// Whether the frame includes an explicit length field
     public let hasLength: Bool
 
-    public init(data: Data, hasLength: Bool = true) {
+    public init(data: [UInt8], hasLength: Bool = true) {
         self.data = data
         self.hasLength = hasLength
     }
