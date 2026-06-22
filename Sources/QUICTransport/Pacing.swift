@@ -5,9 +5,19 @@
 ///
 /// Uses a token bucket algorithm where tokens accumulate at the
 /// pacing rate and are consumed when sending packets.
+///
+/// ## Caller-locked core
+///
+/// The token-bucket math (including the 1.3.0 `Double`→`UInt64` overflow fix) lives
+/// in the Embedded-clean value type `QUICRecoveryCore.PacerCore`. This class is the
+/// host adapter: it keeps the `Mutex`, fixes a `ContinuousClock` epoch, converts
+/// `Instant`/`Duration` to/from the monotonic `UInt64` nanoseconds the core consumes,
+/// and computes the `Duration` delay (so the public API is byte-identical). Public
+/// API and observable behavior are unchanged.
 
 import Foundation
 import Synchronization
+import QUICRecoveryCore
 
 // MARK: - Pacing Configuration
 
@@ -64,41 +74,26 @@ public struct PacingConfiguration: Sendable {
 /// pacer.updateRate(bytesPerSecond: newRate)
 /// ```
 public final class Pacer: Sendable {
-    private let state: Mutex<PacerState>
+    private let state: Mutex<PacerCore>
 
-    private struct PacerState: Sendable {
-        /// Current pacing rate in bytes per second
-        var rate: UInt64
+    /// Minimum pacing interval (host-only; participates in the `Duration` delay path).
+    private let minInterval: Duration
 
-        /// Available token bucket capacity in bytes
-        var tokens: UInt64
-
-        /// Maximum burst size in bytes
-        var maxBurst: UInt64
-
-        /// Last time tokens were updated
-        var lastUpdate: ContinuousClock.Instant
-
-        /// Minimum pacing interval
-        var minInterval: Duration
-
-        /// Whether pacing is enabled
-        var isEnabled: Bool
-    }
+    /// The epoch against which all `Instant`s are converted to monotonic nanos.
+    private let epoch: ContinuousClock.Instant
 
     // MARK: - Initialization
 
     /// Creates a new pacer
     /// - Parameter config: Pacing configuration
     public init(config: PacingConfiguration = PacingConfiguration()) {
-        let now = ContinuousClock.now
-        self.state = Mutex(PacerState(
+        let epoch = ContinuousClock.now
+        self.epoch = epoch
+        self.minInterval = config.minInterval
+        self.state = Mutex(PacerCore(
             rate: config.initialRate,
-            tokens: config.maxBurst,
             maxBurst: config.maxBurst,
-            lastUpdate: now,
-            minInterval: config.minInterval,
-            isEnabled: config.initialRate > 0
+            nowNanos: 0
         ))
     }
 
@@ -110,22 +105,14 @@ public final class Pacer: Sendable {
     ///
     /// - Parameter bytesPerSecond: New pacing rate (0 to disable)
     public func updateRate(bytesPerSecond: UInt64) {
-        state.withLock { s in
-            s.rate = bytesPerSecond
-            s.isEnabled = bytesPerSecond > 0
-        }
+        state.withLock { $0.updateRate(bytesPerSecond: bytesPerSecond) }
     }
 
     /// Updates the maximum burst size
     ///
     /// - Parameter bytes: Maximum burst size in bytes
     public func updateMaxBurst(bytes: UInt64) {
-        state.withLock { s in
-            s.maxBurst = bytes
-            if s.tokens > bytes {
-                s.tokens = bytes
-            }
-        }
+        state.withLock { $0.updateMaxBurst(bytes: bytes) }
     }
 
     // MARK: - Testing Seam
@@ -134,12 +121,15 @@ public final class Pacer: Sendable {
     /// large-elapsed token-replenishment path (regression coverage for the
     /// `Double`→`UInt64` overflow trap). Test-only.
     internal func _setLastUpdateForTesting(secondsInPast: Double) {
-        state.withLock { $0.lastUpdate = ContinuousClock.now - .seconds(secondsInPast) }
+        let nowNanos = currentNanos()
+        let pastNanos = Self.nanos(of: .seconds(secondsInPast))
+        let lastUpdate = nowNanos > pastNanos ? nowNanos - pastNanos : 0
+        state.withLock { $0.setLastUpdate(nanos: lastUpdate) }
     }
 
     /// Current token count (test/diagnostics).
     public var currentTokens: UInt64 {
-        state.withLock { $0.tokens }
+        state.withLock { $0.currentTokens }
     }
 
     // MARK: - Packet Scheduling
@@ -154,30 +144,21 @@ public final class Pacer: Sendable {
     /// - Parameter bytes: Size of packet to send
     /// - Returns: Delay to wait, or nil if packet can be sent immediately
     public func packetDelay(bytes: UInt64) -> Duration? {
-        state.withLock { s in
-            // A zero (or unset) rate means "no pacing" — never divide by zero below.
-            guard s.isEnabled, s.rate > 0 else { return nil }
-
-            let now = ContinuousClock.now
-            replenishTokens(&s, now: now)
-
-            // Check if we have enough tokens
-            if s.tokens >= bytes {
-                s.tokens -= bytes
-                return nil  // Can send immediately
+        let nowNanos = currentNanos()
+        return state.withLock { core in
+            switch core.schedule(bytes: bytes, nowNanos: nowNanos) {
+            case .disabled, .immediate:
+                return nil
+            case .insufficient(let tokensNeeded):
+                // Calculate time to wait for tokens (rate > 0 guaranteed by `schedule`).
+                let secondsToWait = Double(tokensNeeded) / Double(core.rate)
+                let delay = Duration.seconds(secondsToWait)
+                // Enforce minimum interval
+                if delay < minInterval {
+                    return minInterval
+                }
+                return delay
             }
-
-            // Calculate time to wait for tokens
-            let tokensNeeded = bytes - s.tokens
-            let secondsToWait = Double(tokensNeeded) / Double(s.rate)
-            let delay = Duration.seconds(secondsToWait)
-
-            // Enforce minimum interval
-            if delay < s.minInterval {
-                return s.minInterval
-            }
-
-            return delay
         }
     }
 
@@ -188,52 +169,8 @@ public final class Pacer: Sendable {
     ///
     /// - Parameter bytes: Number of bytes sent
     public func consume(bytes: UInt64) {
-        state.withLock { s in
-            guard s.isEnabled else { return }
-
-            let now = ContinuousClock.now
-            replenishTokens(&s, now: now)
-
-            if s.tokens >= bytes {
-                s.tokens -= bytes
-            } else {
-                s.tokens = 0
-            }
-        }
-    }
-
-    /// Replenishes tokens based on elapsed time.
-    ///
-    /// Overflow-safe: the token count never exceeds `maxBurst`, so we only ever
-    /// need to produce up to the remaining headroom. Computing against the
-    /// headroom (and clamping the `Double` product before converting) avoids two
-    /// traps that a naive `UInt64(elapsedSeconds * rate)` hits: a `Double`→`UInt64`
-    /// conversion overflow (when `elapsed * rate` exceeds `UInt64.max`, e.g. a
-    /// large first interval or a high rate) and a `UInt64` addition overflow.
-    private func replenishTokens(_ s: inout PacerState, now: ContinuousClock.Instant) {
-        let elapsed = now - s.lastUpdate
-        // Guard against a non-monotonic / zero step: never reduce, never produce.
-        guard elapsed > .zero else { s.lastUpdate = now; return }
-
-        let headroom = s.maxBurst > s.tokens ? s.maxBurst - s.tokens : 0
-        if headroom == 0 {
-            s.lastUpdate = now
-            return
-        }
-
-        let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        let produced = elapsedSeconds * Double(s.rate)
-        // Clamp to headroom before the UInt64 conversion so neither the conversion
-        // nor the addition can overflow. `produced` is bounded and finite here.
-        let newTokens: UInt64
-        if produced.isFinite, produced > 0 {
-            newTokens = produced >= Double(headroom) ? headroom : UInt64(produced)
-        } else {
-            newTokens = 0
-        }
-
-        s.tokens += newTokens          // newTokens <= headroom, so this cannot overflow maxBurst
-        s.lastUpdate = now
+        let nowNanos = currentNanos()
+        state.withLock { $0.consume(bytes: bytes, nowNanos: nowNanos) }
     }
 
     // MARK: - State Queries
@@ -250,10 +187,8 @@ public final class Pacer: Sendable {
 
     /// Available tokens (bytes that can be sent immediately)
     public var availableTokens: UInt64 {
-        state.withLock { s in
-            replenishTokens(&s, now: .now)
-            return s.tokens
-        }
+        let nowNanos = currentNanos()
+        return state.withLock { $0.availableTokens(nowNanos: nowNanos) }
     }
 
     /// Time until the next packet can be sent
@@ -262,6 +197,22 @@ public final class Pacer: Sendable {
     /// - Returns: Duration until packet can be sent, or zero if immediate
     public func timeUntilSend(bytes: UInt64) -> Duration {
         packetDelay(bytes: bytes) ?? .zero
+    }
+
+    // MARK: - Clock seam
+
+    /// Current epoch-relative time in monotonic nanoseconds.
+    private func currentNanos() -> UInt64 {
+        Self.nanos(of: epoch.duration(to: ContinuousClock.now))
+    }
+
+    /// Converts a `Duration` to whole nanoseconds (negative clamps to 0), matching
+    /// the host's `components`-based decomposition.
+    @inline(__always)
+    private static func nanos(of duration: Duration) -> UInt64 {
+        let (seconds, attoseconds) = duration.components
+        let ns = seconds * 1_000_000_000 + attoseconds / 1_000_000_000
+        return ns < 0 ? 0 : UInt64(ns)
     }
 }
 

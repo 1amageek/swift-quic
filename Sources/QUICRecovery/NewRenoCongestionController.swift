@@ -16,9 +16,18 @@
 /// this implementation includes pacing:
 /// - pacing_rate = cwnd / smoothed_rtt
 /// - Initial burst tokens allow immediate sending at connection start
+///
+/// ## Caller-locked core
+///
+/// The RFC 9002 §7 state machine lives in the Embedded-clean value type
+/// `QUICRecoveryCore.NewRenoCore`. This class is the host adapter: it keeps the
+/// `Mutex`, fixes a `ContinuousClock` epoch, converts `Instant`/`Duration` to the
+/// monotonic `UInt64` nanoseconds the core consumes, and delegates the math under
+/// the lock. Public API and observable behavior are unchanged.
 
 import Foundation
 import Synchronization
+import QUICRecoveryCore
 
 /// NewReno congestion controller with integrated pacing
 ///
@@ -28,25 +37,18 @@ public final class NewRenoCongestionController: CongestionController, Sendable {
 
     // MARK: - Internal State
 
-    private let state: Mutex<CCState>
+    private let state: Mutex<AdapterState>
 
-    /// Internal state protected by Mutex
-    private struct CCState: Sendable {
-        // RFC 9002 Section 7.1 State Variables
-        var congestionWindow: Int
-        var ssthresh: Int
-        var recoveryStartTime: ContinuousClock.Instant?
-        var bytesAcked: Int
+    /// The epoch against which all `Instant`s are converted to monotonic nanos.
+    private let epoch: ContinuousClock.Instant
 
-        // Pacing State
-        var nextSendTime: ContinuousClock.Instant
-        var pacingRate: Double  // bytes per nanosecond
-        var burstTokens: Int
-
-        // Configuration. `maxDatagramSize` / `minimumWindow` track the path MTU and may be
-        // raised by DPLPMTUD (RFC 9000 §14) via updateMaxDatagramSize(_:).
-        var maxDatagramSize: Int
-        var minimumWindow: Int
+    /// Caller-locked state: the value-type core plus the host-only shadow needed to
+    /// reconstruct `ContinuousClock.Instant`s exactly for the public API.
+    private struct AdapterState {
+        /// The Embedded-clean RFC 9002 §7 state machine.
+        var core: NewRenoCore
+        /// The original recovery-start `Instant` (exact round-trip for `currentState`).
+        var recoveryStartInstant: ContinuousClock.Instant?
     }
 
     // MARK: - Initialization
@@ -55,37 +57,24 @@ public final class NewRenoCongestionController: CongestionController, Sendable {
     ///
     /// - Parameter maxDatagramSize: Maximum datagram size in bytes (default: 1200)
     public init(maxDatagramSize: Int = LossDetectionConstants.maxDatagramSize) {
-        let minimumWindow = 2 * maxDatagramSize
-        // RFC 9002 Section 7.2: Initial window calculation
-        let initialWindow = min(
-            10 * maxDatagramSize,
-            max(14720, 2 * maxDatagramSize)
-        )
-
-        self.state = Mutex(CCState(
-            congestionWindow: initialWindow,
-            ssthresh: Int.max,
-            recoveryStartTime: nil,
-            bytesAcked: 0,
-            nextSendTime: .now,
-            pacingRate: 0,
-            burstTokens: LossDetectionConstants.initialBurstTokens,
-            maxDatagramSize: maxDatagramSize,
-            minimumWindow: minimumWindow
+        self.epoch = ContinuousClock.now
+        self.state = Mutex(AdapterState(
+            core: NewRenoCore(maxDatagramSize: maxDatagramSize),
+            recoveryStartInstant: nil
         ))
     }
 
     // MARK: - CongestionController Protocol
 
     public var congestionWindow: Int {
-        state.withLock { $0.congestionWindow }
+        state.withLock { $0.core.congestionWindow }
     }
 
     public var currentState: CongestionState {
         state.withLock { s in
-            if let recoveryStart = s.recoveryStartTime {
+            if let recoveryStart = s.recoveryStartInstant {
                 return .recovery(startTime: recoveryStart)
-            } else if s.congestionWindow < s.ssthresh {
+            } else if s.core.congestionWindow < s.core.ssthresh {
                 return .slowStart
             } else {
                 return .congestionAvoidance
@@ -94,41 +83,23 @@ public final class NewRenoCongestionController: CongestionController, Sendable {
     }
 
     public func availableWindow(bytesInFlight: Int) -> Int {
-        state.withLock { s in
-            max(0, s.congestionWindow - bytesInFlight)
-        }
+        state.withLock { $0.core.availableWindow(bytesInFlight: bytesInFlight) }
     }
 
     // MARK: - Pacing
 
     public func nextSendTime() -> ContinuousClock.Instant? {
         state.withLock { s in
-            // Burst tokens allow immediate sending at connection start
-            if s.burstTokens > 0 {
-                return nil
-            }
-            // If pacing rate is not yet established, allow immediate sending
-            if s.pacingRate <= 0 {
-                return nil
-            }
-            return s.nextSendTime
+            guard let nanos = s.core.nextSendNanosOrImmediate else { return nil }
+            return MonotonicNanos.instant(from: epoch, nanos: nanos)
         }
     }
 
     // MARK: - Event Handlers
 
     public func onPacketSent(bytes: Int, now: ContinuousClock.Instant) {
-        state.withLock { s in
-            if s.burstTokens > 0 {
-                s.burstTokens -= 1
-            } else if s.pacingRate > 0 {
-                // Calculate next send time based on pacing rate
-                // interval = bytes / pacingRate (in nanoseconds)
-                let intervalNanos = Double(bytes) / s.pacingRate
-                let nanos = Int64(intervalNanos)
-                s.nextSendTime = now + .nanoseconds(nanos)
-            }
-        }
+        let nowNanos = MonotonicNanos.nanos(from: epoch, to: now)
+        state.withLock { $0.core.onPacketSent(bytes: bytes, nowNanos: nowNanos) }
     }
 
     public func onPacketsAcknowledged(
@@ -136,42 +107,14 @@ public final class NewRenoCongestionController: CongestionController, Sendable {
         now: ContinuousClock.Instant,
         rtt: RTTEstimator
     ) {
+        let corePackets = packets.map { corePacket($0) }
+        let snapshot = rttSnapshot(rtt)
         state.withLock { s in
-            for packet in packets {
-                // Only in-flight packets affect congestion control
-                guard packet.inFlight else { continue }
-
-                // During recovery: only count packets sent AFTER recovery started
-                if let recoveryStart = s.recoveryStartTime {
-                    if packet.timeSent <= recoveryStart {
-                        // Ignore ACKs of packets sent before recovery
-                        // (already accounted for in the congestion event)
-                        continue
-                    }
-                    // A packet sent during recovery was acknowledged
-                    // Exit recovery and resume congestion avoidance
-                    s.recoveryStartTime = nil
-                }
-
-                // Window growth based on current phase
-                if s.congestionWindow < s.ssthresh {
-                    // Slow Start: exponential growth
-                    // cwnd += bytes_acked
-                    s.congestionWindow += packet.sentBytes
-                } else {
-                    // Congestion Avoidance: linear growth (AIMD)
-                    // Increase cwnd by max_datagram_size when
-                    // accumulated acked bytes >= cwnd
-                    s.bytesAcked += packet.sentBytes
-                    if s.bytesAcked >= s.congestionWindow {
-                        s.congestionWindow += s.maxDatagramSize
-                        s.bytesAcked = 0
-                    }
-                }
+            s.core.onPacketsAcknowledged(packets: corePackets, rtt: snapshot)
+            // Exiting recovery clears the shadow instant in lockstep with the core.
+            if s.core.recoveryStartNanos == nil {
+                s.recoveryStartInstant = nil
             }
-
-            // Update pacing rate based on new window and RTT
-            updatePacingRate(&s, rtt: rtt)
         }
     }
 
@@ -180,92 +123,57 @@ public final class NewRenoCongestionController: CongestionController, Sendable {
         now: ContinuousClock.Instant,
         rtt: RTTEstimator
     ) {
-        guard !packets.isEmpty else { return }
-
+        let corePackets = packets.map { corePacket($0) }
+        let snapshot = rttSnapshot(rtt)
+        let nowNanos = MonotonicNanos.nanos(from: epoch, to: now)
         state.withLock { s in
-            // RFC 9002 Section 7.3.2: Only one window reduction per RTT
-            // If already in recovery, don't reduce again
-            if s.recoveryStartTime != nil {
-                return
+            let wasInRecovery = s.core.recoveryStartNanos != nil
+            s.core.onPacketsLost(packets: corePackets, nowNanos: nowNanos, rtt: snapshot)
+            if !wasInRecovery, s.core.recoveryStartNanos != nil {
+                s.recoveryStartInstant = now
             }
-
-            // Enter recovery: reduce window by half
-            enterRecovery(&s, now: now)
-
-            // Update pacing rate for reduced window
-            updatePacingRate(&s, rtt: rtt)
         }
     }
 
     public func onECNCongestionEvent(now: ContinuousClock.Instant) {
+        let nowNanos = MonotonicNanos.nanos(from: epoch, to: now)
         state.withLock { s in
-            // ECN-CE is treated the same as packet loss
-            if s.recoveryStartTime != nil {
-                return
+            let wasInRecovery = s.core.recoveryStartNanos != nil
+            s.core.onECNCongestionEvent(nowNanos: nowNanos)
+            if !wasInRecovery, s.core.recoveryStartNanos != nil {
+                s.recoveryStartInstant = now
             }
-            enterRecovery(&s, now: now)
         }
     }
 
     public func onPersistentCongestion() {
         state.withLock { s in
-            // RFC 9002 Section 7.6.2: Persistent Congestion
-            //
-            // Persistent congestion is declared when packets spanning a period
-            // greater than (2 * PTO * kPersistentCongestionThreshold) are all lost.
-            // This indicates a fundamental change in network conditions.
-            //
-            // Response (more severe than normal loss):
-            // - Collapse cwnd to minimum (2 * max_datagram_size)
-            // - Reset ssthresh to infinity (re-enter slow start)
-            // - Clear recovery state (not in recovery after this)
-            // - Reset pacing (will be re-established with new RTT samples)
-            //
-            // This is similar to TCP's RTO response, treating the network
-            // as if it were a completely new path.
-            s.congestionWindow = s.minimumWindow
-            s.ssthresh = Int.max
-            s.bytesAcked = 0
-            s.recoveryStartTime = nil
-            s.burstTokens = LossDetectionConstants.initialBurstTokens
-            s.pacingRate = 0
+            s.core.onPersistentCongestion()
+            s.recoveryStartInstant = nil
         }
     }
 
     public func updateMaxDatagramSize(_ maxDatagramSize: Int) {
-        state.withLock { s in
-            // RFC 9000 §14 / RFC 9002 §7.2: track the (raised) path MTU. Only ever raise the
-            // datagram size and the minimum-window floor; never shrink the current window.
-            guard maxDatagramSize > s.maxDatagramSize else { return }
-            s.maxDatagramSize = maxDatagramSize
-            s.minimumWindow = 2 * maxDatagramSize
-        }
+        state.withLock { $0.core.updateMaxDatagramSize(maxDatagramSize) }
     }
 
-    // MARK: - Private Helpers
+    // MARK: - Projection helpers
 
-    /// Enters recovery state and reduces congestion window
-    private func enterRecovery(_ s: inout CCState, now: ContinuousClock.Instant) {
-        s.recoveryStartTime = now
-
-        // RFC 9002 Section 7.3.2: Reduce window by loss reduction factor (0.5)
-        let reducedWindow = Int(Double(s.congestionWindow) * LossDetectionConstants.lossReductionFactor)
-        s.ssthresh = max(reducedWindow, s.minimumWindow)
-        s.congestionWindow = s.ssthresh
-        s.bytesAcked = 0
+    /// Projects a host `SentPacket` into the Embedded-clean `CongestionPacket`.
+    private func corePacket(_ packet: SentPacket) -> CongestionPacket {
+        CongestionPacket(
+            sentBytes: packet.sentBytes,
+            timeSentNanos: MonotonicNanos.nanos(from: epoch, to: packet.timeSent),
+            inFlight: packet.inFlight
+        )
     }
 
-    /// Updates pacing rate based on current cwnd and RTT
-    private func updatePacingRate(_ s: inout CCState, rtt: RTTEstimator) {
-        guard rtt.hasEstimate else { return }
-
-        // pacing_rate = cwnd / smoothed_rtt (in bytes per nanosecond)
-        let smoothedNanos = rtt.smoothedRTT.components.seconds * 1_000_000_000 +
-                            rtt.smoothedRTT.components.attoseconds / 1_000_000_000
-
-        if smoothedNanos > 0 {
-            s.pacingRate = Double(s.congestionWindow) / Double(smoothedNanos)
-        }
+    /// Projects a host `RTTEstimator` into the Embedded-clean `RTTSnapshot`.
+    private func rttSnapshot(_ rtt: RTTEstimator) -> RTTSnapshot {
+        RTTSnapshot(
+            hasEstimate: rtt.hasEstimate,
+            smoothedRTTNanos: MonotonicNanos.nanos(of: rtt.smoothedRTT)
+        )
     }
 }
 
@@ -274,17 +182,6 @@ public final class NewRenoCongestionController: CongestionController, Sendable {
 extension NewRenoCongestionController: CustomStringConvertible {
 
     public var description: String {
-        state.withLock { s in
-            let stateStr: String
-            if s.recoveryStartTime != nil {
-                stateStr = "recovery"
-            } else if s.congestionWindow < s.ssthresh {
-                stateStr = "slow_start"
-            } else {
-                stateStr = "congestion_avoidance"
-            }
-
-            return "NewReno(cwnd=\(s.congestionWindow), ssthresh=\(s.ssthresh), state=\(stateStr))"
-        }
+        state.withLock { $0.core.description }
     }
 }

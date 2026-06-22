@@ -40,6 +40,11 @@ let package = Package(
             name: "QUICPacketProtectionCore",
             targets: ["QUICPacketProtectionCore"]
         ),
+        // Embedded-clean congestion control (CUBIC + Reno) + pacing value types
+        .library(
+            name: "QUICRecoveryCore",
+            targets: ["QUICRecoveryCore"]
+        ),
         // Core types (no I/O dependencies) — Foundation adapter over QUICCoreCodec
         .library(
             name: "QUICCore",
@@ -92,6 +97,21 @@ let package = Package(
                 .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
             ],
             path: "Sources/QUICPacketProtectionCore",
+            swiftSettings: coreSettings
+        ),
+
+        // MARK: - Embedded-clean congestion control + pacing (dual-build: host + Embedded)
+
+        // The value-type congestion controllers (CUBIC RFC 9438 + NewReno RFC 9002 §7)
+        // and the token-bucket pacer (RFC 9002 §7.7), with time injected as a
+        // monotonic `UInt64` nanosecond parameter. No Foundation/any/Mutex/ContinuousClock.
+        .target(
+            name: "QUICRecoveryCore",
+            dependencies: [
+                "QUICCoreCodec",
+                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+            ],
+            path: "Sources/QUICRecoveryCore",
             swiftSettings: coreSettings
         ),
 
@@ -153,6 +173,7 @@ let package = Package(
             name: "QUICRecovery",
             dependencies: [
                 "QUICCore",
+                "QUICRecoveryCore",
             ],
             path: "Sources/QUICRecovery",
             exclude: ["CONTEXT.md"]
@@ -164,6 +185,7 @@ let package = Package(
             name: "QUICTransport",
             dependencies: [
                 "QUICCore",
+                "QUICRecoveryCore",
                 .product(name: "NIOUDPTransport", package: "swift-nio-udp"),
             ],
             path: "Sources/QUICTransport"
