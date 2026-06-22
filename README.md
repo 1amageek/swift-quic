@@ -10,6 +10,7 @@ swift-quic provides a modern, type-safe QUIC implementation designed for the swi
 
 - **RFC 9000/9001/9002 Compliant**: Full QUIC transport protocol implementation
 - **TLS 1.3 Integration**: Native TLS 1.3 handshake with certificate validation (via [swift-certificates](https://github.com/apple/swift-certificates))
+- **Enforced Peer Authentication**: CertificateVerify signature is always verified; a server cannot skip Certificate/CertificateVerify, and Finished is accepted only after authentication completes (no unauthenticated/MITM channel)
 - **0-RTT Support**: Early data transmission with session resumption
 - **Connection Migration**: PATH_CHALLENGE/RESPONSE with address validation
 - **Type-Safe**: Leverages Swift's type system for compile-time safety
@@ -21,7 +22,7 @@ swift-quic provides a modern, type-safe QUIC implementation designed for the swi
   - Full ACK cycle: 1.9M pkts/sec
 - **Memory Safe**: Validated encoding/decoding with bounds checking and overflow protection
 - **Graceful Shutdown**: Proper continuation management prevents hangs
-- **Security Hardened**: Integer overflow protection, ACK range validation, race condition prevention
+- **Security Hardened**: Integer overflow protection, ACK range validation, race condition prevention, enforced peer authentication, and RFC-mandated frame/transport-parameter validations (see [Security](#security))
 
 ## Requirements
 
@@ -34,7 +35,7 @@ Add swift-quic to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-quic.git", branch: "main")
+    .package(url: "https://github.com/1amageek/swift-quic.git", from: "1.2.0")
 ]
 ```
 
@@ -170,24 +171,28 @@ Stream management and flow control (RFC 9000 Section 2-4):
 ```swift
 import QUIC
 
-// Server: Accept incoming connections
-let endpoint = QUICEndpoint(role: .server)
-try await endpoint.start(address: SocketAddress(ipAddress: "0.0.0.0", port: 4433))
+// A TLS 1.3 provider must always be configured (no insecure default).
+// Use .production / .development with your own provider, or .testing in unit tests.
+let config = QUICConfiguration.production { MyTLSProvider() }
 
-for try await connection in endpoint.incomingConnections {
+// Server: bind a socket, serve, and accept incoming connections
+let serverSocket = NIOQUICSocket(configuration: .unicast(port: 4433))
+let (server, _) = try await QUICEndpoint.serve(socket: serverSocket, configuration: config)
+
+for await connection in server.incomingConnections {
     Task {
         // Handle incoming streams
-        for try await stream in connection.incomingStreams {
+        for await stream in connection.incomingStreams {
             let data = try await stream.read()
-            try await stream.write(responseData)
+            try await stream.write(data)
             try await stream.closeWrite()
         }
     }
 }
 
-// Client: Connect to server
-let client = QUICEndpoint(role: .client)
-let connection = try await client.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4433))
+// Client: dial a server (returns once the handshake completes)
+let client = QUICEndpoint(configuration: config)
+let connection = try await client.dial(address: SocketAddress(ipAddress: "127.0.0.1", port: 4433))
 
 // Open a stream
 let stream = try await connection.openStream()
@@ -196,7 +201,8 @@ try await stream.closeWrite()
 let response = try await stream.read()
 
 // Graceful shutdown
-await connection.shutdown()
+await connection.close(error: nil)
+try await client.shutdown()
 ```
 
 ### Frame Encoding/Decoding
@@ -223,8 +229,8 @@ let decoded = try codec.decodeFrames(from: encoded)
 ```swift
 import QUICCore
 
-// Parse a packet header
-let (header, headerLength) = try PacketHeader.parse(from: packetData)
+// Parse a (still header-protected) packet header
+let (header, headerLength) = try ProtectedPacketHeader.parse(from: packetData, dcidLength: 8)
 
 switch header {
 case .long(let longHeader):
@@ -427,9 +433,13 @@ swift test --filter QUICBenchmarks     # Benchmarks
   - Final size immutability enforcement
   - RESET_STREAM final size vs flow control limit validation
   - Out-of-order FIN validation against buffered data
+- **RFC 9000 Section 7.3**: Transport-parameter <-> Connection-ID cross-validation
+  - `initial_source_connection_id`, `original_destination_connection_id`, and `retry_source_connection_id` checked against connection IDs observed during the handshake (mismatch is TRANSPORT_PARAMETER_ERROR)
 - **RFC 9000 Section 8.1**: Anti-Amplification Limit
   - Server-side 3x amplification limit before address validation
   - Overflow-safe byte tracking with saturating arithmetic
+- **RFC 9000 Section 8.2.1**: Path-bound, amplification-budgeted PATH_RESPONSE
+  - A PATH_RESPONSE for an unvalidated path is charged against the anti-amplification budget and sent on the path the challenge arrived on
 - **RFC 9000 Section 12.4**: Varint-encoded frame types (supports extended frame types)
 - **RFC 9000 Section 14.1**: Initial packet minimum size (1200 bytes) with automatic padding
 - **RFC 9000 Section 17**: Long and Short header formats with validation
@@ -438,7 +448,10 @@ swift test --filter QUICBenchmarks     # Benchmarks
 - **RFC 9001 Section 5.2**: Initial keys with AES-128-GCM-SHA256
 - **RFC 9001 Section 5.4**: Header protection with 4-byte packet number handling
 - **RFC 9001 Section 5.8**: Retry packet integrity tag verification
-- **RFC 9001 Section 6**: Key Update mechanism with AEAD limit tracking
+- **RFC 9001 Section 6**: 1-RTT Key Update wired into the live connection
+  - Usage-limit-driven initiation (AEAD confidentiality/integrity limits per cipher suite)
+  - Cipher-suite-correct key derivation and key-phase opener selection on receive
+  - Known limitation: continuous multi-generation rotation (ACK-driven re-enable of subsequent updates) is not yet live; only the first rotation occurs automatically
 - **RFC 9218**: Extensible priority scheme (urgency 0-7, incremental flag)
   - Priority-based stream scheduling
   - Fair queuing within same priority level (round-robin)
@@ -454,13 +467,19 @@ swift test --filter QUICBenchmarks     # Benchmarks
 
 ### Security
 
+- Enforced peer authentication: CertificateVerify signature is always verified; a server cannot skip Certificate/CertificateVerify, and Finished is accepted only after authentication (no silent fallback to an unauthenticated channel)
 - Integer overflow protection with saturating arithmetic
 - ACK range underflow validation (prevents malformed ACK processing)
 - ACK range count validation (prevents memory exhaustion attacks)
 - PATH_CHALLENGE/PATH_RESPONSE 8-byte payload enforcement
+- Path-bound, amplification-budgeted PATH_RESPONSE (RFC 9000 Section 8.2.1: a response for an unvalidated path is charged against the 3x anti-amplification budget and sent on the path the challenge arrived on)
 - STREAM/DATAGRAM frame boundary validation
+- STREAM/CRYPTO final-offset bound: `offset + length` must not exceed 2^62-1
 - Flow control violation detection (connection close on violation)
-- RESET_STREAM final size validation against advertised limits
+- RESET_STREAM final size validation against advertised limits and reconciliation with previously received/buffered data (final-size immutability)
+- NEW_CONNECTION_ID `retire_prior_to` bound (`retire_prior_to <= sequence_number`; anti-DoS)
+- `active_connection_id_limit` clamped to a practical maximum to bound state
+- Transport-parameter <-> Connection-ID cross-validation (RFC 9000 Section 7.3): `initial_source_connection_id`, `original_destination_connection_id`, and `retry_source_connection_id` are checked against the connection IDs observed during the handshake (mismatch is a TRANSPORT_PARAMETER_ERROR)
 - DCID length validation (0-20 bytes per RFC 9000 Section 17.2)
 - Double-start prevention in connection handshake
 - Race condition prevention in shutdown paths
@@ -510,7 +529,8 @@ swift test --filter QUICBenchmarks     # Benchmarks
 - [x] Phase 8: Quality Improvements
   - [x] ECN support for congestion signaling
   - [x] Pacing for send rate control
-  - [x] KeyUpdate for AEAD limit tracking
+  - [x] 1-RTT Key Update wired into the live connection (usage-limit-driven, cipher-suite-correct)
+    - Known limitation: continuous multi-generation rotation (ACK-driven re-enable) is not yet live; only the first rotation is automatic
   - [x] ChaCha20-Poly1305 support
 - [x] Phase 9: Security Hardening
   - [x] Integer overflow protection (saturating arithmetic)
