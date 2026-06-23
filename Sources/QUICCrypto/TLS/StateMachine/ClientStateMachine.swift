@@ -20,6 +20,17 @@ public final class ClientStateMachine: Sendable {
         var context: HandshakeContext = HandshakeContext()
         var configuration: TLSConfiguration = TLSConfiguration()
 
+        /// The Embedded-clean pre-ServerHello FSM, constructed at `startHandshake`.
+        /// It owns the running transcript + key schedule by value and encodes
+        /// ClientHello production (incl. the PSK two-pass binder + 0-RTT early
+        /// secret), the HelloRetryRequest `message_hash` transform, and ServerHello
+        /// processing (handshake-secret derivation). The adapter assembles the
+        /// extension list, generates the ephemeral key, and computes the (EC)DHE
+        /// shared secret; the core derives the secrets and hands its transcript +
+        /// key schedule to the auth FSM at the ServerHello → EncryptedExtensions
+        /// boundary.
+        var clientHandshake: QUICClientHandshake<QUICFoundationProvider>?
+
         /// The Embedded-clean post-ServerHello auth FSM, constructed once ServerHello
         /// has been processed. It owns the running transcript + key schedule by value
         /// and encodes the CertificateVerify / Finished auth invariants. The adapter
@@ -111,8 +122,20 @@ public final class ClientStateMachine: Sendable {
             // Build the cipher suites list
             var cipherSuites: [CipherSuite] = [.tls_aes_128_gcm_sha256]
 
+            // The Embedded-clean pre-ServerHello FSM owns the transcript + key
+            // schedule from ClientHello onward. The adapter assembles the extension
+            // list (above); the core encodes the ClientHello, folds it into the
+            // transcript, computes the PSK two-pass binder, and derives the 0-RTT
+            // early-traffic-secret. The main transcript suite is the client default
+            // (SHA-256), matching the legacy `HandshakeContext.transcriptHash`.
+            var handshake = QUICClientHandshake<QUICFoundationProvider>(
+                cipherSuite: CipherSuite.tls_aes_128_gcm_sha256.coreCipherSuite
+            )
+
             // PSK-related extensions (if we have a session ticket)
-            var pskExtensionsInfo: (offered: OfferedPsks, ticket: SessionTicketData)?
+            var offeredPsks: OfferedPsks?
+            var pskBinder: QUICClientHandshake<QUICFoundationProvider>.PSKBinderInput?
+            var attemptEarlyDataResolved = false
 
             if let ticket = sessionTicket, ticket.isValid() {
                 // If resuming, prefer the original cipher suite
@@ -132,102 +155,55 @@ public final class ClientStateMachine: Sendable {
                     extensions.append(.earlyDataClient())
                     state.context.earlyDataState.attemptingEarlyData = true
                     state.context.earlyDataState.maxEarlyDataSize = effectiveMaxEarlyData
+                    attemptEarlyDataResolved = true
                 }
 
                 // pre_shared_key must be the last extension
                 // Create the PSK identity from the ticket
                 let pskIdentity = PskIdentity(ticket: ticket)
-                let offeredPsks = OfferedPsks(
+                offeredPsks = OfferedPsks(
                     identities: [pskIdentity],
                     binders: [Data(repeating: 0, count: ticket.cipherSuite.hashLength)] // Placeholder
                 )
-                pskExtensionsInfo = (offered: offeredPsks, ticket: ticket)
 
-                // Initialize key schedule with PSK
-                let psk = SymmetricKey(data: ticket.resumptionPSK)
-                state.context.keySchedule = TLSKeySchedule(cipherSuite: ticket.cipherSuite)
-                state.context.keySchedule.deriveEarlySecret(psk: psk)
+                // Install the PSK early secret into the core's key schedule (ticket
+                // suite), matching the legacy adapter's startHandshake.
+                handshake.installPSKEarlySecret(
+                    psk: [UInt8](ticket.resumptionPSK),
+                    binderCipherSuite: ticket.cipherSuite.coreCipherSuite
+                )
+                pskBinder = .init(
+                    isResumption: true,
+                    binderCipherSuite: ticket.cipherSuite.coreCipherSuite
+                )
 
                 // Store the PSK cipher suite for 0-RTT key output
                 // (will be updated to negotiated suite after ServerHello)
                 state.context.cipherSuite = ticket.cipherSuite
             }
 
-            // If offering PSK, we need to compute binders using a two-pass approach
-            var clientHelloMessage: Data
-            if let pskInfo = pskExtensionsInfo {
-                let ticket = pskInfo.ticket
-                var offeredPsks = pskInfo.offered
+            // Produce the ClientHello through the core (handles PSK binder + 0-RTT).
+            let (clientHelloBytes, earlySecretBytes) = try Self.produceClientHello(
+                &handshake,
+                random: [UInt8](random),
+                legacySessionID: [UInt8](sessionID),
+                cipherSuites: cipherSuites,
+                extensions: extensions,
+                offeredPsks: offeredPsks,
+                pskBinder: pskBinder,
+                attemptEarlyData: attemptEarlyDataResolved
+            )
+            let clientHelloMessage = Data(clientHelloBytes)
 
-                // First pass: Build ClientHello with placeholder binders
-                var extensionsWithPsk = extensions
-                extensionsWithPsk.append(.preSharedKeyClient(offeredPsks))
-
-                let placeholderClientHello = ClientHello(
-                    random: random,
-                    legacySessionID: sessionID,
-                    cipherSuites: cipherSuites,
-                    extensions: extensionsWithPsk
-                )
-
-                // Encode ClientHello to get the transcript up to binders
-                let clientHelloWithPlaceholder = placeholderClientHello.encodeAsHandshake()
-
-                // Compute the truncated transcript (excluding binders)
-                let bindersSectionSize = offeredPsks.bindersSize
-                let truncatedClientHello = clientHelloWithPlaceholder.prefix(clientHelloWithPlaceholder.count - bindersSectionSize)
-
-                // Initialize transcript hash with truncated ClientHello
-                var transcriptHashForBinder = TranscriptHash(cipherSuite: ticket.cipherSuite)
-                transcriptHashForBinder.update(with: Data(truncatedClientHello))
-
-                // Compute binder
-                let binderKey = try state.context.keySchedule.deriveBinderKey(isResumption: true)
-                state.context.binderKey = binderKey
-                let transcriptHash = transcriptHashForBinder.currentHash()
-                let finishedKeyForBinder = state.context.keySchedule.finishedKey(from: binderKey)
-                let binder = state.context.keySchedule.finishedVerifyData(
-                    forKey: finishedKeyForBinder,
-                    transcriptHash: transcriptHash
-                )
-
-                // Second pass: Rebuild ClientHello with correct binders
-                offeredPsks.binders = [[UInt8](binder)]
-
-                var finalExtensions = extensions
-                finalExtensions.append(.preSharedKeyClient(offeredPsks))
-
-                let finalClientHello = ClientHello(
-                    random: random,
-                    legacySessionID: sessionID,
-                    cipherSuites: cipherSuites,
-                    extensions: finalExtensions
-                )
-
-                clientHelloMessage = finalClientHello.encodeAsHandshake()
-
-                // Derive early traffic secret if attempting 0-RTT
-                if state.context.earlyDataState.attemptingEarlyData {
-                    var earlyTranscript = TranscriptHash(cipherSuite: ticket.cipherSuite)
-                    earlyTranscript.update(with: clientHelloMessage)
-                    let earlySecret = try state.context.keySchedule.deriveClientEarlyTrafficSecret(
-                        transcriptHash: earlyTranscript.currentHash()
-                    )
-                    state.context.clientEarlyTrafficSecret = earlySecret
-                }
-            } else {
-                // Standard ClientHello without PSK
-                let clientHello = ClientHello(
-                    random: random,
-                    legacySessionID: sessionID,
-                    cipherSuites: cipherSuites,
-                    extensions: extensions
-                )
-                clientHelloMessage = clientHello.encodeAsHandshake()
+            if let earlySecretBytes {
+                state.context.clientEarlyTrafficSecret = SymmetricKey(data: earlySecretBytes)
             }
 
-            // Update transcript
-            state.context.transcriptHash.update(with: clientHelloMessage)
+            // Keep the adapter's transcript/key-schedule bridge in sync with the core
+            // so the post-handshake paths observe a consistent state.
+            state.context.transcriptHash.coreValue = handshake.currentTranscript
+            state.context.keySchedule.coreValue = handshake.currentKeySchedule
+            state.clientHandshake = handshake
 
             // Transition state
             state.handshakeState = .waitServerHello
@@ -322,7 +298,7 @@ public final class ClientStateMachine: Sendable {
                 throw TLSHandshakeError.noKeyShareMatch
             }
 
-            // Perform key agreement
+            // Perform key agreement (adapter-side, swift-crypto ephemeral key).
             let sharedSecret = try ourKeyExchange.sharedSecret(with: serverKeyShare.serverShare.keyExchangeData)
             state.context.sharedSecret = sharedSecret
 
@@ -330,40 +306,41 @@ public final class ClientStateMachine: Sendable {
             state.context.cipherSuite = serverHello.cipherSuite
             state.context.serverRandom = serverHello.randomData
 
-            // Update transcript with ServerHello
-            let serverHelloMessage = HandshakeCodec.encode(type: .serverHello, content: data)
-            state.context.transcriptHash.update(with: serverHelloMessage)
-
-            // Initialize or update key schedule for the selected cipher suite
-            if !pskAccepted {
-                // Non-PSK mode: reinitialize key schedule with no PSK
-                state.context.keySchedule = TLSKeySchedule(cipherSuite: serverHello.cipherSuite)
-                state.context.keySchedule.deriveEarlySecret(psk: nil)
+            // Drive the pre-ServerHello FSM: it folds ServerHello into the transcript,
+            // reinitialises the key schedule for the negotiated suite (non-PSK), and
+            // derives the handshake-traffic secrets from the precomputed (EC)DHE
+            // shared secret. The legacy QUIC adapter performs no downgrade-sentinel
+            // check, so `checkDowngrade: false` keeps behaviour byte-identical.
+            guard var handshake = state.clientHandshake else {
+                throw TLSHandshakeError.internalError("Pre-ServerHello FSM not initialized")
             }
-            // If PSK was accepted, early secret was already derived with PSK in startHandshake
-
-            // Derive handshake secrets
-            let transcriptHash = state.context.transcriptHash.currentHash()
-            let (clientSecret, serverSecret) = try state.context.keySchedule.deriveHandshakeSecrets(
-                sharedSecret: sharedSecret,
-                transcriptHash: transcriptHash
+            let serverHelloMessage = HandshakeCodec.encode(type: .serverHello, content: data)
+            let sharedSecretBytes = sharedSecret.withUnsafeBytes { [UInt8]($0) }
+            let secrets = try Self.ingestServerHello(
+                &handshake,
+                serverRandom: [UInt8](serverHello.randomData),
+                cipherSuite: serverHello.cipherSuite.coreCipherSuite,
+                pskAccepted: pskAccepted,
+                sharedSecret: sharedSecretBytes,
+                rawMessageBytes: [UInt8](serverHelloMessage)
             )
 
+            let clientSecret = SymmetricKey(data: secrets.client)
+            let serverSecret = SymmetricKey(data: secrets.server)
             state.context.clientHandshakeSecret = clientSecret
             state.context.serverHandshakeSecret = serverSecret
+
+            // Keep the adapter's transcript/key-schedule bridge in sync before the
+            // auth FSM takes ownership.
+            state.context.transcriptHash.coreValue = handshake.currentTranscript
+            state.context.keySchedule.coreValue = handshake.currentKeySchedule
+            state.clientHandshake = handshake
 
             // Hand the running transcript (CH..SH folded) + key schedule (at the
             // handshake-secret stage) to the Embedded-clean post-ServerHello auth FSM,
             // which now owns transcript folding, CertificateVerify/Finished
             // verification, and the application/exporter/resumption derivations.
-            state.authMachine = QUICClientAuthMachine<QUICFoundationProvider>(
-                transcript: state.context.transcriptHash.coreValue,
-                keySchedule: state.context.keySchedule.coreValue,
-                cipherSuite: serverHello.cipherSuite.coreCipherSuite,
-                clientHandshakeSecret: clientSecret.bytes,
-                serverHandshakeSecret: serverSecret.bytes,
-                pskUsed: pskAccepted
-            )
+            state.authMachine = try Self.makeAuthMachine(consuming: handshake)
 
             // Transition state
             state.handshakeState = .waitEncryptedExtensions
@@ -412,20 +389,19 @@ public final class ClientStateMachine: Sendable {
         // Store cipher suite from HRR
         state.context.cipherSuite = hrr.cipherSuite
 
-        // RFC 8446 Section 4.4.1: Special transcript handling for HRR
-        // Save the hash of ClientHello1
-        let clientHello1Hash = state.context.transcriptHash.currentHash()
-        state.context.originalClientHello1Hash = clientHello1Hash
-
-        // Replace transcript with message_hash synthetic message
-        state.context.transcriptHash = TranscriptHash.fromMessageHash(
-            clientHello1Hash: clientHello1Hash,
-            cipherSuite: hrr.cipherSuite
-        )
-
-        // Add HRR to transcript
+        // RFC 8446 Section 4.4.1: the pre-ServerHello FSM applies the special
+        // `message_hash` transcript transform and folds the HRR in. The core owns
+        // the transcript, so the synthetic-message bytes stay byte-identical.
+        guard var handshake = state.clientHandshake else {
+            throw TLSHandshakeError.internalError("Pre-ServerHello FSM not initialized")
+        }
         let hrrMessage = HandshakeCodec.encode(type: .serverHello, content: data)
-        state.context.transcriptHash.update(with: hrrMessage)
+        try Self.applyHelloRetryRequest(
+            &handshake,
+            cipherSuite: hrr.cipherSuite.coreCipherSuite,
+            rawMessageBytes: [UInt8](hrrMessage)
+        )
+        state.clientHandshake = handshake
 
         // Generate new key pair for the requested group
         let newKeyExchange = try KeyExchange.generate(for: requestedGroup)
@@ -489,18 +465,135 @@ public final class ClientStateMachine: Sendable {
             throw TLSHandshakeError.internalError("Missing client random or session ID")
         }
 
-        let clientHello = ClientHello(
-            random: clientRandom,
-            legacySessionID: sessionID,
-            cipherSuites: [.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384],
+        // Produce ClientHello2 through the core (no PSK re-offer here, so no binder),
+        // which folds it into the running transcript (message_hash + HRR).
+        guard var handshake = state.clientHandshake else {
+            throw TLSHandshakeError.internalError("Pre-ServerHello FSM not initialized")
+        }
+        let clientHello2Bytes = try Self.produceClientHello2(
+            &handshake,
+            random: [UInt8](clientRandom),
+            legacySessionID: [UInt8](sessionID),
             extensions: extensions
         )
+        state.clientHandshake = handshake
 
-        // Encode and update transcript
-        let clientHelloMessage = clientHello.encodeAsHandshake()
-        state.context.transcriptHash.update(with: clientHelloMessage)
+        // Keep the adapter's transcript bridge in sync with the core.
+        state.context.transcriptHash.coreValue = handshake.currentTranscript
 
-        return clientHelloMessage
+        return Data(clientHello2Bytes)
+    }
+
+    // MARK: - Pre-ServerHello FSM bridges
+    //
+    // The mutating core calls live in dedicated `inout`-FSM helpers (not driven via
+    // the `inout ClientState` functions) so the typed `catch as` mapping is isolated
+    // from the `ClientState`-mutating control flow. This keeps the FSM ownership
+    // transfer simple for the compiler and the error mapping in one place.
+
+    /// Applies the HelloRetryRequest `message_hash` transform on the FSM.
+    private static func applyHelloRetryRequest(
+        _ handshake: inout QUICClientHandshake<QUICFoundationProvider>,
+        cipherSuite: TLSCipherSuiteCore,
+        rawMessageBytes: [UInt8]
+    ) throws {
+        do {
+            try handshake.applyHelloRetryRequest(
+                cipherSuite: cipherSuite,
+                rawMessageBytes: rawMessageBytes
+            )
+        } catch {
+            // `applyHelloRetryRequest` uses typed throws, so `error` is statically a
+            // `QUICClientHandshakeError`; a bare `catch` (no `as`) avoids the
+            // existential conversion that crashes SILGen.
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Produces the ClientHello (handles the PSK two-pass binder + 0-RTT) through
+    /// the FSM.
+    private static func produceClientHello(
+        _ handshake: inout QUICClientHandshake<QUICFoundationProvider>,
+        random: [UInt8],
+        legacySessionID: [UInt8],
+        cipherSuites: [CipherSuite],
+        extensions: [TLSExtension],
+        offeredPsks: OfferedPsks?,
+        pskBinder: QUICClientHandshake<QUICFoundationProvider>.PSKBinderInput?,
+        attemptEarlyData: Bool
+    ) throws -> (clientHello: [UInt8], earlyTrafficSecret: [UInt8]?) {
+        do {
+            return try handshake.produceClientHello(
+                random: random,
+                legacySessionID: legacySessionID,
+                cipherSuites: cipherSuites,
+                extensions: extensions,
+                offeredPsks: offeredPsks,
+                pskBinder: pskBinder,
+                attemptEarlyData: attemptEarlyData
+            )
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Ingests the ServerHello (folds it, derives the handshake secrets) through the
+    /// FSM. The legacy QUIC adapter performs no downgrade-sentinel check, so the FSM
+    /// is driven with `checkDowngrade: false` to stay byte-identical.
+    private static func ingestServerHello(
+        _ handshake: inout QUICClientHandshake<QUICFoundationProvider>,
+        serverRandom: [UInt8],
+        cipherSuite: TLSCipherSuiteCore,
+        pskAccepted: Bool,
+        sharedSecret: [UInt8],
+        rawMessageBytes: [UInt8]
+    ) throws -> (client: [UInt8], server: [UInt8]) {
+        do {
+            return try handshake.ingestServerHello(
+                serverRandom: serverRandom,
+                cipherSuite: cipherSuite,
+                pskAccepted: pskAccepted,
+                sharedSecret: sharedSecret,
+                checkDowngrade: false,
+                rawMessageBytes: rawMessageBytes
+            )
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Hands the FSM's transcript + key schedule off to the post-ServerHello auth FSM.
+    private static func makeAuthMachine(
+        consuming handshake: consuming QUICClientHandshake<QUICFoundationProvider>
+    ) throws -> QUICClientAuthMachine<QUICFoundationProvider> {
+        do {
+            return try handshake.makeAuthMachine()
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Produces ClientHello2 (no PSK re-offer) through the FSM.
+    private static func produceClientHello2(
+        _ handshake: inout QUICClientHandshake<QUICFoundationProvider>,
+        random: [UInt8],
+        legacySessionID: [UInt8],
+        extensions: [TLSExtension]
+    ) throws -> [UInt8] {
+        do {
+            return try handshake.produceClientHello2(
+                random: random,
+                legacySessionID: legacySessionID,
+                cipherSuites: [.tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384],
+                extensions: extensions,
+                offeredPsks: nil,
+                pskBinder: nil
+            )
+        } catch {
+            // Typed throws: `error` is statically a `QUICClientHandshakeError`. A bare
+            // `catch` avoids the existential conversion that crashes SILGen.
+            throw TLSHandshakeError.from(error)
+        }
     }
 
     // MARK: - Process EncryptedExtensions
@@ -1038,15 +1131,6 @@ public final class ClientStateMachine: Sendable {
     }
 }
 
-// MARK: - SymmetricKey bytes helper
-
-extension SymmetricKey {
-    /// The raw key bytes (host-only bridge for the `[UInt8]`-based auth FSM core).
-    fileprivate var bytes: [UInt8] {
-        withUnsafeBytes { [UInt8]($0) }
-    }
-}
-
 // MARK: - Auth FSM state ↔ adapter state bridge
 
 extension QUICClientAuthMachine<QUICFoundationProvider>.AuthState {
@@ -1067,6 +1151,26 @@ extension QUICClientAuthMachine<QUICFoundationProvider>.AuthState {
 // MARK: - TLSClientAuthError → TLSHandshakeError bridge
 
 extension TLSHandshakeError {
+    /// Maps an Embedded-clean ``QUICClientHandshakeError`` from the pre-ServerHello
+    /// FSM core onto the adapter's `TLSHandshakeError` so existing error-handling /
+    /// alert mapping and the handshake-flow tests observe identical behaviour.
+    static func from(_ error: QUICClientHandshakeError) -> TLSHandshakeError {
+        switch error {
+        case .unexpectedMessage(let tag):
+            return .unexpectedMessage("Unexpected message in state \(tag)")
+        case .downgradeDetected:
+            return .unsupportedVersion
+        case .keyExchange(let kxError):
+            return .keyExchangeFailed("\(kxError)")
+        case .wire(let wireError):
+            return .decodeError("\(wireError)")
+        case .keySchedule(let scheduleError):
+            return .internalError("Key schedule error: \(scheduleError)")
+        case .internalInvariant(let tag):
+            return .internalError("Pre-ServerHello FSM invariant violated: \(tag)")
+        }
+    }
+
     /// Maps an Embedded-clean ``TLSClientAuthError`` from the auth FSM core onto the
     /// adapter's `TLSHandshakeError` so existing error-handling / alert mapping and
     /// the auth tests observe identical behaviour.
