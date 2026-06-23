@@ -4,6 +4,7 @@
 /// for signature verification.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 @preconcurrency import X509
 import SwiftASN1

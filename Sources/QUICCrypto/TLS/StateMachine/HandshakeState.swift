@@ -3,6 +3,7 @@
 /// Defines the state machine for TLS 1.3 handshake.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 
 // MARK: - Client Handshake State

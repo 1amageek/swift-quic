@@ -23,6 +23,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - Key Share Entry
 

@@ -7,6 +7,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - Supported Groups Extension
 

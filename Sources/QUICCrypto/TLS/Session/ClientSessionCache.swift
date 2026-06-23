@@ -4,6 +4,7 @@
 /// and 0-RTT early data.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import Synchronization
 

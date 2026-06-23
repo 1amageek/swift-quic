@@ -14,6 +14,7 @@
 /// a PSK that can be used for session resumption.
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - NewSessionTicket Message
 

@@ -27,6 +27,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 import Crypto
 
 // MARK: - PSK Identity

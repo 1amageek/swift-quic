@@ -4,6 +4,7 @@
 /// Destination Connection ID and a version-specific salt.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import QUICCore
 

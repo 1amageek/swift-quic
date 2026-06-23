@@ -3,6 +3,7 @@
 /// Output events from TLS processing during QUIC handshake.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import QUICCore
 

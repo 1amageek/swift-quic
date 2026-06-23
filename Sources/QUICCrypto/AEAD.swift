@@ -14,6 +14,7 @@
 /// boundary that the connection/codec layers still use.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import QUICCore
 import QUICPacketProtectionCore

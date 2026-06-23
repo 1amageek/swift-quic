@@ -3,6 +3,7 @@
 /// Wrapper around swift-certificates' Certificate type for QUIC/TLS integration.
 
 import Foundation
+import QUICTLSCore
 @preconcurrency import X509
 import SwiftASN1
 

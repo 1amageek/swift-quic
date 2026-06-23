@@ -15,6 +15,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - Supported Versions Extension (wrapper)
 

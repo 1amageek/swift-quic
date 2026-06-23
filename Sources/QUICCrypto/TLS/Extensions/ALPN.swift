@@ -9,6 +9,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - ALPN Extension
 

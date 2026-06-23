@@ -3,6 +3,7 @@
 /// Implements the client-side TLS 1.3 handshake for QUIC.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import Synchronization
 import QUICCore

@@ -4,6 +4,7 @@
 /// Handles initial, handshake, application, and key update secrets.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import QUICCore
 

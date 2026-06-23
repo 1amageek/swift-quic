@@ -15,6 +15,7 @@
 /// a result (no silent fallback).
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import P2PCoreCrypto
 

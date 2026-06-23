@@ -12,6 +12,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 /// TLS 1.3 ServerHello message
 public struct ServerHello: Sendable {

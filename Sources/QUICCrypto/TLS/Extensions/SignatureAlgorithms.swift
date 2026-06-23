@@ -7,6 +7,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - Signature Algorithms Extension
 

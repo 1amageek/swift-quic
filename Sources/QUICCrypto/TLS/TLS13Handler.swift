@@ -4,6 +4,7 @@
 /// Designed specifically for QUIC (no TLS record layer).
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import Synchronization
 import QUICCore

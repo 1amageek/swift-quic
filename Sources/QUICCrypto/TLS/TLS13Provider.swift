@@ -5,6 +5,7 @@
 /// and mocking for tests.
 
 import Foundation
+import QUICTLSCore
 import QUICCore
 
 // MARK: - TLS 1.3 Provider Protocol

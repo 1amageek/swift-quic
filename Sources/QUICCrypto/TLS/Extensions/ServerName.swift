@@ -14,6 +14,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - Server Name Extension
 

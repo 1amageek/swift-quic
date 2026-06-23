@@ -10,6 +10,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 /// TLS 1.3 CertificateRequest message
 public struct CertificateRequest: Sendable {

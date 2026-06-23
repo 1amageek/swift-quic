@@ -17,6 +17,7 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - Certificate Verify Message
 

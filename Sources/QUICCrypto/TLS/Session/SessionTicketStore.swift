@@ -4,6 +4,7 @@
 /// Stores encrypted session state that can be used to derive PSKs.
 
 import Foundation
+import QUICTLSCore
 import Crypto
 import Synchronization
 

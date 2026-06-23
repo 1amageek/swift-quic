@@ -24,6 +24,7 @@
 /// is set to 0xFFFFFFFF to indicate unlimited.
 
 import Foundation
+import QUICTLSCore
 
 // MARK: - Early Data Extension
 
