@@ -3,10 +3,19 @@
 /// Path validation is used to verify reachability after a change in address.
 /// An endpoint validates a path by sending a PATH_CHALLENGE frame and receiving
 /// a PATH_RESPONSE frame containing the same data.
+///
+/// This is the host adapter over the Embedded-clean value type
+/// `QUICConnectionCore.PathValidationCore`. It keeps the `Mutex`, fixes a
+/// `ContinuousClock` epoch, owns the RNG (`ConnectionSecureRandom`) that generates
+/// the 8-byte PATH_CHALLENGE data, converts `Instant`/`Duration` to/from monotonic
+/// nanoseconds, and bridges `Data`/`Frame` at the boundary. Anti-spoofing
+/// (fail-closed match) and anti-amplification budgeting live in the core, so
+/// observable behavior is identical to the prior implementation.
 
 import Foundation
 import Synchronization
 import QUICCore
+import QUICConnectionCore
 
 // MARK: - Path Validation State
 
@@ -25,42 +34,23 @@ public enum PathValidationState: Sendable {
     case failed(reason: String)
 }
 
-/// Represents a network path (local + remote address pair)
-public struct NetworkPath: Hashable, Sendable {
-    public let localAddress: String
-    public let remoteAddress: String
-
-    public init(localAddress: String, remoteAddress: String) {
-        self.localAddress = localAddress
-        self.remoteAddress = remoteAddress
-    }
-}
+/// Represents a network path (local + remote address pair).
+/// Re-exported from the Embedded-clean core so the wire/value type is shared.
+public typealias NetworkPath = PathValidationCore.NetworkPath
 
 // MARK: - Path Validation Manager
 
 /// Manages path validation for connection migration
 public final class PathValidationManager: Sendable {
 
-    private let state = Mutex<ValidationState>(ValidationState())
+    private let state: Mutex<PathValidationCore>
 
-    private struct ValidationState: Sendable {
-        /// Pending path validations (path -> validation state)
-        var pendingValidations: [NetworkPath: PathValidationState] = [:]
-
-        /// Challenge data we've sent (for matching responses)
-        var pendingChallenges: [Data: NetworkPath] = [:]
-
-        /// Successfully validated paths
-        var validatedPaths: Set<NetworkPath> = []
-
-        /// Challenges received that still need a PATH_RESPONSE, paired with the path on which
-        /// they arrived (RFC 9000 §8.2.1: the response is sent on the path it arrived on).
-        var pendingResponses: [(data: Data, path: NetworkPath?)] = []
-    }
+    /// The epoch against which all `Instant`s are converted to monotonic nanos.
+    private let epoch: ContinuousClock.Instant
 
     /// Size in bytes of a PATH_RESPONSE frame on the wire: 1 type byte + 8 data bytes
     /// (RFC 9000 §19.18). Used to charge the response against the anti-amplification budget.
-    public static let pathResponseFrameSize: UInt64 = 9
+    public static let pathResponseFrameSize: UInt64 = PathValidationCore.pathResponseFrameSize
 
     /// Timeout for path validation (RFC 9000 recommends 3 * PTO)
     public let validationTimeout: Duration
@@ -68,7 +58,10 @@ public final class PathValidationManager: Sendable {
     // MARK: - Initialization
 
     public init(validationTimeout: Duration = .seconds(3)) {
+        let epoch = ContinuousClock.now
+        self.epoch = epoch
         self.validationTimeout = validationTimeout
+        self.state = Mutex(PathValidationCore(validationTimeoutNanos: Self.nanos(of: validationTimeout)))
     }
 
     // MARK: - Initiating Validation
@@ -77,16 +70,10 @@ public final class PathValidationManager: Sendable {
     /// - Parameter path: The network path to validate
     /// - Returns: PATH_CHALLENGE frame data (8 bytes random)
     public func startValidation(for path: NetworkPath) -> Data {
+        // RNG lives in the adapter; the core stores the supplied challenge bytes.
         let challengeData = generateChallengeData()
-
-        state.withLock { s in
-            s.pendingValidations[path] = .pending(
-                challengeData: challengeData,
-                sentAt: .now
-            )
-            s.pendingChallenges[challengeData] = path
-        }
-
+        let nowNanos = currentNanos()
+        state.withLock { $0.startValidation(challengeData: [UInt8](challengeData), for: path, nowNanos: nowNanos) }
         return challengeData
     }
 
@@ -123,18 +110,12 @@ public final class PathValidationManager: Sendable {
         on path: NetworkPath,
         remainingAmplificationBudget: UInt64
     ) -> Frame? {
-        return state.withLock { s in
-            let isValidated = s.validatedPaths.contains(path)
-            // A validated path is not subject to the anti-amplification limit.
-            if isValidated || remainingAmplificationBudget >= Self.pathResponseFrameSize {
-                // PATH_RESPONSE payload is `[UInt8]` in the Embedded-clean Frame enum.
-                return .pathResponse([UInt8](data))
-            }
-            // Budget exhausted: defer the response (associated with its path) rather than
-            // dropping it. It will be re-attempted via getPendingResponses() when credit grows.
-            s.pendingResponses.append((data: data, path: path))
-            return nil
+        let payload = state.withLock {
+            $0.handleChallenge([UInt8](data), on: path, remainingAmplificationBudget: remainingAmplificationBudget)
         }
+        guard let payload else { return nil }
+        // PATH_RESPONSE payload is `[UInt8]` in the Embedded-clean Frame enum.
+        return .pathResponse(payload)
     }
 
     /// Processes a received PATH_CHALLENGE without a path/budget context.
@@ -146,70 +127,63 @@ public final class PathValidationManager: Sendable {
     /// - Returns: PATH_RESPONSE frame to send back
     public func handleChallenge(_ data: Data) -> Frame {
         // RFC 9000: MUST respond with PATH_RESPONSE containing identical data
-        state.withLock { s in
-            s.pendingResponses.append((data: data, path: nil))
-        }
+        let payload = state.withLock { $0.handleChallenge([UInt8](data)) }
         // PATH_RESPONSE payload is `[UInt8]` in the Embedded-clean Frame enum.
-        return .pathResponse([UInt8](data))
+        return .pathResponse(payload)
     }
 
     /// Processes a received PATH_RESPONSE
     /// - Parameter data: The 8-byte response data
     /// - Returns: The validated path if this completes a validation, nil otherwise
     public func handleResponse(_ data: Data) -> NetworkPath? {
-        return state.withLock { s in
-            guard let path = s.pendingChallenges.removeValue(forKey: data) else {
-                // Response doesn't match any pending challenge
-                return nil
-            }
-
-            // Path validated successfully
-            s.pendingValidations[path] = .validated(at: .now)
-            s.validatedPaths.insert(path)
-
-            return path
-        }
+        let nowNanos = currentNanos()
+        return state.withLock { $0.handleResponse([UInt8](data), nowNanos: nowNanos) }
     }
 
     // MARK: - Query State
 
     /// Checks if a path is validated
     public func isValidated(_ path: NetworkPath) -> Bool {
-        state.withLock { s in
-            s.validatedPaths.contains(path)
-        }
+        state.withLock { $0.isValidated(path) }
     }
 
     /// Gets the validation state for a path
     public func validationState(for path: NetworkPath) -> PathValidationState? {
-        state.withLock { s in
-            s.pendingValidations[path]
+        state.withLock { core in
+            guard let coreState = core.validationState(for: path) else { return nil }
+            switch coreState {
+            case .initial:
+                return .initial
+            case .pending(let challengeData, let sentAtNanos):
+                return .pending(challengeData: Data(challengeData), sentAt: Self.instant(from: epoch, nanos: sentAtNanos))
+            case .validated(let atNanos):
+                return .validated(at: Self.instant(from: epoch, nanos: atNanos))
+            case .failed(let reason):
+                switch reason {
+                case .timeout:
+                    return .failed(reason: "timeout")
+                }
+            }
         }
     }
 
     /// Gets all validated paths
     public var validatedPaths: Set<NetworkPath> {
-        state.withLock { $0.validatedPaths }
+        Set(state.withLock { $0.validatedPaths })
     }
 
     /// Gets and clears pending responses (challenges we received but have not yet responded to,
     /// e.g. because the anti-amplification budget was exhausted when they arrived).
     /// - Returns: The challenge-data values still awaiting a PATH_RESPONSE.
     public func getPendingResponses() -> [Data] {
-        state.withLock { s in
-            let responses = s.pendingResponses.map { $0.data }
-            s.pendingResponses.removeAll()
-            return responses
-        }
+        state.withLock { $0.takePendingResponses().map { Data($0) } }
     }
 
     /// Gets and clears pending responses together with the path each arrived on.
     /// - Returns: Pairs of (challenge data, path) still awaiting a PATH_RESPONSE.
     public func getPendingResponsesWithPaths() -> [(data: Data, path: NetworkPath?)] {
-        state.withLock { s in
-            let responses = s.pendingResponses
-            s.pendingResponses.removeAll()
-            return responses
+        state.withLock { core in
+            core.takePendingResponsesWithPaths().map { (data: Data($0.data), path: $0.path) }
         }
     }
 
@@ -218,43 +192,21 @@ public final class PathValidationManager: Sendable {
     /// Checks for timed-out validations and marks them as failed
     /// - Returns: Paths that failed due to timeout
     public func checkTimeouts() -> [NetworkPath] {
-        let now = ContinuousClock.now
-        var failedPaths: [NetworkPath] = []
-
-        state.withLock { s in
-            for (path, validationState) in s.pendingValidations {
-                if case .pending(let data, let sentAt) = validationState {
-                    if now - sentAt > validationTimeout {
-                        s.pendingValidations[path] = .failed(reason: "timeout")
-                        s.pendingChallenges.removeValue(forKey: data)
-                        failedPaths.append(path)
-                    }
-                }
-            }
-        }
-
-        return failedPaths
+        let nowNanos = currentNanos()
+        return state.withLock { $0.checkTimeouts(nowNanos: nowNanos) }
     }
 
     /// Retries validation for a path that timed out
     /// - Parameter path: The path to retry
     /// - Returns: New challenge data, or nil if path wasn't in failed state
     public func retryValidation(for path: NetworkPath) -> Data? {
-        return state.withLock { s in
-            guard let currentState = s.pendingValidations[path],
-                  case .failed = currentState else {
-                return nil
-            }
-
-            let challengeData = generateChallengeData()
-            s.pendingValidations[path] = .pending(
-                challengeData: challengeData,
-                sentAt: .now
-            )
-            s.pendingChallenges[challengeData] = path
-
-            return challengeData
+        // RNG lives in the adapter; only commit the new challenge if the core accepts the retry.
+        let challengeData = generateChallengeData()
+        let nowNanos = currentNanos()
+        let accepted = state.withLock {
+            $0.retryValidation(challengeData: [UInt8](challengeData), for: path, nowNanos: nowNanos)
         }
+        return accepted ? challengeData : nil
     }
 
     // MARK: - Private Helpers
@@ -262,6 +214,27 @@ public final class PathValidationManager: Sendable {
     /// Generates random 8-byte challenge data
     private func generateChallengeData() -> Data {
         ConnectionSecureRandom.bytes(count: 8)
+    }
+
+    // MARK: - Clock seam
+
+    /// Current epoch-relative time in monotonic nanoseconds.
+    private func currentNanos() -> UInt64 {
+        Self.nanos(of: epoch.duration(to: ContinuousClock.now))
+    }
+
+    /// Converts a `Duration` to whole nanoseconds (negative clamps to 0).
+    @inline(__always)
+    private static func nanos(of duration: Duration) -> UInt64 {
+        let (seconds, attoseconds) = duration.components
+        let ns = seconds * 1_000_000_000 + attoseconds / 1_000_000_000
+        return ns < 0 ? 0 : UInt64(ns)
+    }
+
+    /// Reconstructs an `Instant` from epoch-relative nanoseconds.
+    @inline(__always)
+    private static func instant(from epoch: ContinuousClock.Instant, nanos: UInt64) -> ContinuousClock.Instant {
+        epoch + .nanoseconds(Int64(clamping: nanos))
     }
 }
 

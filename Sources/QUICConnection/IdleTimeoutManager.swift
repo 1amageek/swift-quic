@@ -5,10 +5,17 @@
 /// - Tracks last activity time
 /// - Provides keep-alive scheduling
 /// - Signals when timeout has occurred
+///
+/// This is the host adapter over the Embedded-clean value type
+/// `QUICConnectionCore.IdleTimeoutCore`. It keeps the `Mutex`, fixes a
+/// `ContinuousClock` epoch, converts `Duration`/`Instant` to/from monotonic
+/// nanoseconds, and drives the core under the lock. Observable behavior is
+/// identical to the prior `Duration`/`ContinuousClock` implementation.
 
 import Foundation
 import Synchronization
 import QUICCore
+import QUICConnectionCore
 
 // MARK: - Idle Timeout State
 
@@ -22,105 +29,69 @@ public enum IdleTimeoutState: Sendable {
     case closed
 }
 
+extension IdleTimeoutState {
+    /// Maps the Embedded core's lifecycle state to the public adapter state.
+    init(_ coreState: IdleTimeoutCore.State) {
+        switch coreState {
+        case .active:
+            self = .active
+        case .timedOut:
+            self = .timedOut
+        case .closed:
+            self = .closed
+        }
+    }
+}
+
 // MARK: - Idle Timeout Manager
 
 /// Manages idle timeout for a single connection
 public final class IdleTimeoutManager: Sendable {
 
-    private let state = Mutex<TimeoutState>(TimeoutState())
+    private let state: Mutex<IdleTimeoutCore>
 
-    private struct TimeoutState: Sendable {
-        /// Last activity time (packet sent or received)
-        var lastActivity: ContinuousClock.Instant = .now
-
-        /// Effective idle timeout (min of local and peer)
-        var effectiveTimeout: Duration = .seconds(30)
-
-        /// Local max idle timeout from configuration
-        var localTimeout: Duration = .seconds(30)
-
-        /// Peer's max idle timeout from transport parameters
-        var peerTimeout: Duration?
-
-        /// Current state
-        var currentState: IdleTimeoutState = .active
-
-        /// Whether keep-alive is enabled
-        var keepAliveEnabled: Bool = false
-
-        /// Keep-alive interval (typically effectiveTimeout / 2)
-        var keepAliveInterval: Duration?
-    }
+    /// The epoch against which all `Instant`s are converted to monotonic nanos.
+    private let epoch: ContinuousClock.Instant
 
     // MARK: - Initialization
 
     /// Creates an idle timeout manager
     /// - Parameter localTimeout: Local max idle timeout from configuration
     public init(localTimeout: Duration = .seconds(30)) {
-        state.withLock { s in
-            s.localTimeout = localTimeout
-            s.effectiveTimeout = localTimeout
-        }
+        let epoch = ContinuousClock.now
+        self.epoch = epoch
+        let localNanos = Self.nanos(of: localTimeout)
+        self.state = Mutex(IdleTimeoutCore(localTimeoutNanos: localNanos, nowNanos: 0))
     }
 
     // MARK: - Configuration
 
     /// Sets the peer's max idle timeout from transport parameters
-    /// - Parameter timeout: Peer's max_idle_timeout in milliseconds (0 means no timeout)
+    /// - Parameter timeoutMs: Peer's max_idle_timeout in milliseconds (0 means no timeout)
     public func setPeerTimeout(_ timeoutMs: UInt64) {
-        state.withLock { s in
-            if timeoutMs == 0 {
-                // Peer advertises no timeout - use local only
-                s.peerTimeout = nil
-                s.effectiveTimeout = s.localTimeout
-            } else {
-                let peerDuration = Duration.milliseconds(Int64(timeoutMs))
-                s.peerTimeout = peerDuration
-
-                // Effective timeout is minimum of local and peer
-                // If local is 0, it means no timeout from our side
-                if s.localTimeout == .zero {
-                    s.effectiveTimeout = peerDuration
-                } else {
-                    s.effectiveTimeout = min(s.localTimeout, peerDuration)
-                }
-            }
-
-            // Update keep-alive interval
-            if s.keepAliveEnabled {
-                s.keepAliveInterval = s.effectiveTimeout / 2
-            }
-        }
+        // The host stored the peer timeout as `Duration.milliseconds(Int64(timeoutMs))`;
+        // mirror that conversion exactly so the effective-timeout math is unchanged.
+        let peerNanos = timeoutMs == 0 ? 0 : Self.nanos(of: .milliseconds(Int64(timeoutMs)))
+        state.withLock { $0.setPeerTimeout(peerNanos) }
     }
 
     /// Enables keep-alive PINGs
     /// - Parameter enabled: Whether to enable keep-alive
     public func setKeepAlive(enabled: Bool) {
-        state.withLock { s in
-            s.keepAliveEnabled = enabled
-            if enabled {
-                s.keepAliveInterval = s.effectiveTimeout / 2
-            } else {
-                s.keepAliveInterval = nil
-            }
-        }
+        state.withLock { $0.setKeepAlive(enabled: enabled) }
     }
 
     // MARK: - Activity Tracking
 
     /// Records activity (packet sent or received)
     public func recordActivity() {
-        state.withLock { s in
-            guard s.currentState == .active else { return }
-            s.lastActivity = .now
-        }
+        let nowNanos = currentNanos()
+        state.withLock { $0.recordActivity(nowNanos: nowNanos) }
     }
 
     /// Marks the connection as closed
     public func markClosed() {
-        state.withLock { s in
-            s.currentState = .closed
-        }
+        state.withLock { $0.markClosed() }
     }
 
     // MARK: - Timeout Checking
@@ -128,67 +99,35 @@ public final class IdleTimeoutManager: Sendable {
     /// Checks if the connection has timed out
     /// - Returns: true if timed out
     public func checkTimeout() -> Bool {
-        return state.withLock { s in
-            guard s.currentState == .active else {
-                return s.currentState == .timedOut
-            }
-
-            // No timeout if effective timeout is 0
-            guard s.effectiveTimeout > .zero else {
-                return false
-            }
-
-            let deadline = s.lastActivity + s.effectiveTimeout
-            if ContinuousClock.now >= deadline {
-                s.currentState = .timedOut
-                return true
-            }
-            return false
-        }
+        let nowNanos = currentNanos()
+        return state.withLock { $0.checkTimeout(nowNanos: nowNanos) }
     }
 
     /// Gets the time until idle timeout
     /// - Returns: Duration until timeout, or nil if already timed out or no timeout configured
     public func timeUntilTimeout() -> Duration? {
-        return state.withLock { s in
-            guard s.currentState == .active else { return nil }
-            guard s.effectiveTimeout > .zero else { return nil }
-
-            let deadline = s.lastActivity + s.effectiveTimeout
-            let now = ContinuousClock.now
-            if deadline <= now {
-                return .zero
-            }
-            return deadline - now
+        let nowNanos = currentNanos()
+        return state.withLock { core in
+            guard let nanos = core.timeUntilTimeoutNanos(nowNanos: nowNanos) else { return nil }
+            return .nanoseconds(Int64(clamping: nanos))
         }
     }
 
     /// Gets the time until next keep-alive should be sent
     /// - Returns: Duration until keep-alive needed, or nil if not enabled
     public func timeUntilKeepAlive() -> Duration? {
-        return state.withLock { s in
-            guard s.currentState == .active else { return nil }
-            guard let interval = s.keepAliveInterval else { return nil }
-
-            let keepAliveDeadline = s.lastActivity + interval
-            let now = ContinuousClock.now
-            if keepAliveDeadline <= now {
-                return .zero
-            }
-            return keepAliveDeadline - now
+        let nowNanos = currentNanos()
+        return state.withLock { core in
+            guard let nanos = core.timeUntilKeepAliveNanos(nowNanos: nowNanos) else { return nil }
+            return .nanoseconds(Int64(clamping: nanos))
         }
     }
 
     /// Checks if a keep-alive PING should be sent
     /// - Returns: true if keep-alive is due
     public func shouldSendKeepAlive() -> Bool {
-        return state.withLock { s in
-            guard s.currentState == .active else { return false }
-            guard let interval = s.keepAliveInterval else { return false }
-
-            let keepAliveDeadline = s.lastActivity + interval
-            return ContinuousClock.now >= keepAliveDeadline
-        }
+        let nowNanos = currentNanos()
+        return state.withLock { $0.shouldSendKeepAlive(nowNanos: nowNanos) }
     }
 
     // MARK: - Deadline Computation
@@ -196,22 +135,9 @@ public final class IdleTimeoutManager: Sendable {
     /// Gets the next deadline (timeout or keep-alive)
     /// - Returns: The earliest deadline, or nil if no deadline
     public func nextDeadline() -> ContinuousClock.Instant? {
-        return state.withLock { s in
-            guard s.currentState == .active else { return nil }
-
-            var deadlines: [ContinuousClock.Instant] = []
-
-            // Timeout deadline
-            if s.effectiveTimeout > .zero {
-                deadlines.append(s.lastActivity + s.effectiveTimeout)
-            }
-
-            // Keep-alive deadline
-            if let interval = s.keepAliveInterval {
-                deadlines.append(s.lastActivity + interval)
-            }
-
-            return deadlines.min()
+        return state.withLock { core in
+            guard let nanos = core.nextDeadlineNanos() else { return nil }
+            return Self.instant(from: epoch, nanos: nanos)
         }
     }
 
@@ -219,32 +145,57 @@ public final class IdleTimeoutManager: Sendable {
 
     /// Current state
     public var currentState: IdleTimeoutState {
-        state.withLock { $0.currentState }
+        IdleTimeoutState(state.withLock { $0.currentState })
     }
 
     /// Effective idle timeout
     public var effectiveTimeout: Duration {
-        state.withLock { $0.effectiveTimeout }
+        .nanoseconds(Int64(clamping: state.withLock { $0.effectiveTimeoutNanos }))
     }
 
     /// Local idle timeout
     public var localTimeout: Duration {
-        state.withLock { $0.localTimeout }
+        .nanoseconds(Int64(clamping: state.withLock { $0.localTimeoutNanos }))
     }
 
     /// Peer's idle timeout (if received)
     public var peerTimeout: Duration? {
-        state.withLock { $0.peerTimeout }
+        state.withLock { core in
+            guard let nanos = core.peerTimeoutNanos else { return nil }
+            return .nanoseconds(Int64(clamping: nanos))
+        }
     }
 
     /// Last activity time
     public var lastActivity: ContinuousClock.Instant {
-        state.withLock { $0.lastActivity }
+        Self.instant(from: epoch, nanos: state.withLock { $0.lastActivityNanos })
     }
 
     /// Whether keep-alive is enabled
     public var keepAliveEnabled: Bool {
         state.withLock { $0.keepAliveEnabled }
+    }
+
+    // MARK: - Clock seam
+
+    /// Current epoch-relative time in monotonic nanoseconds.
+    private func currentNanos() -> UInt64 {
+        Self.nanos(of: epoch.duration(to: ContinuousClock.now))
+    }
+
+    /// Converts a `Duration` to whole nanoseconds (negative clamps to 0), matching
+    /// the host's `components`-based decomposition.
+    @inline(__always)
+    private static func nanos(of duration: Duration) -> UInt64 {
+        let (seconds, attoseconds) = duration.components
+        let ns = seconds * 1_000_000_000 + attoseconds / 1_000_000_000
+        return ns < 0 ? 0 : UInt64(ns)
+    }
+
+    /// Reconstructs an `Instant` from epoch-relative nanoseconds.
+    @inline(__always)
+    private static func instant(from epoch: ContinuousClock.Instant, nanos: UInt64) -> ContinuousClock.Instant {
+        epoch + .nanoseconds(Int64(clamping: nanos))
     }
 }
 
@@ -261,8 +212,8 @@ extension IdleTimeoutManager {
     /// Creates transport parameters value
     /// - Returns: The max_idle_timeout value to send in milliseconds
     public func maxIdleTimeoutValue() -> UInt64 {
-        let timeout = state.withLock { $0.localTimeout }
-        let ms = timeout.components.seconds * 1000 + timeout.components.attoseconds / 1_000_000_000_000_000
-        return UInt64(ms)
+        let nanos = state.withLock { $0.localTimeoutNanos }
+        // Match the host's `seconds * 1000 + attoseconds / 1e15` millisecond reduction.
+        return nanos / 1_000_000
     }
 }
