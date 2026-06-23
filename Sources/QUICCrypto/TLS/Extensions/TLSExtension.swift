@@ -9,22 +9,11 @@
 /// ```
 
 import Foundation
+import QUICTLSCore
 
-// MARK: - Extension Type
-
-/// TLS extension types (RFC 8446 Section 4.2)
-public enum TLSExtensionType: UInt16, Sendable {
-    case serverName = 0                     // SNI
-    case supportedGroups = 10               // Supported elliptic curves
-    case signatureAlgorithms = 13           // Supported signature algorithms
-    case alpn = 16                          // Application-Layer Protocol Negotiation
-    case preSharedKey = 41                  // Pre-shared key
-    case earlyData = 42                     // Early data (0-RTT)
-    case supportedVersions = 43             // TLS versions supported
-    case pskKeyExchangeModes = 45           // PSK key exchange modes
-    case keyShare = 51                      // Key share for (EC)DHE
-    case quicTransportParameters = 57       // QUIC transport parameters (0x0039)
-}
+// `TLSExtensionType` now lives in the Embedded-clean `QUICTLSCore`; it is imported
+// above (and re-exported by HandshakeMessage.swift) so this file and call sites
+// see it unchanged.
 
 // MARK: - Extension Value Protocol
 

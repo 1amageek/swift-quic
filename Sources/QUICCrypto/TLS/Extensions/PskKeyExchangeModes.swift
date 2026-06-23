@@ -16,19 +16,11 @@
 /// TLS 1.3 MUST use psk_dhe_ke for QUIC (RFC 9001 Section 4.4).
 
 import Foundation
+import QUICTLSCore
 
-// MARK: - PSK Key Exchange Mode
-
-/// PSK key exchange modes (RFC 8446 Section 4.2.9)
-public enum PskKeyExchangeMode: UInt8, Sendable, CaseIterable {
-    /// PSK-only key establishment
-    /// No forward secrecy - compromise of PSK reveals past sessions
-    case psk_ke = 0
-
-    /// PSK with (EC)DHE key establishment
-    /// Provides forward secrecy via ephemeral DH
-    case psk_dhe_ke = 1
-}
+// `PskKeyExchangeMode` now lives in the Embedded-clean `QUICTLSCore`; it is
+// imported above (and re-exported by HandshakeMessage.swift) so this file and
+// call sites see it unchanged.
 
 // MARK: - PSK Key Exchange Modes Extension
 

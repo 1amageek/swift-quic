@@ -10,23 +10,11 @@
 /// ```
 
 import Foundation
+@_exported import QUICTLSCore
 
-// MARK: - Handshake Type
-
-/// TLS 1.3 handshake message types (RFC 8446 Section 4)
-public enum HandshakeType: UInt8, Sendable {
-    case clientHello = 1
-    case serverHello = 2
-    case newSessionTicket = 4
-    case endOfEarlyData = 5
-    case encryptedExtensions = 8
-    case certificate = 11
-    case certificateRequest = 13
-    case certificateVerify = 15
-    case finished = 20
-    case keyUpdate = 24
-    case messageHash = 254
-}
+// `HandshakeType`, `CipherSuite`, `NamedGroup`, and `SignatureScheme` now live in
+// the Embedded-clean `QUICTLSCore` and are re-exported above so existing call
+// sites and tests continue to see them as `QUICCrypto` symbols unchanged.
 
 // MARK: - TLS Constants
 
@@ -56,73 +44,14 @@ public enum TLSConstants {
     ])
 }
 
-// MARK: - Cipher Suite
-
-/// TLS 1.3 cipher suites (RFC 8446 Section B.4)
-public enum CipherSuite: UInt16, Sendable, CaseIterable {
-    case tls_aes_128_gcm_sha256 = 0x1301
-    case tls_aes_256_gcm_sha384 = 0x1302
-    case tls_chacha20_poly1305_sha256 = 0x1303
-
-    /// Key length in bytes
-    public var keyLength: Int {
-        switch self {
-        case .tls_aes_128_gcm_sha256: return 16
-        case .tls_aes_256_gcm_sha384: return 32
-        case .tls_chacha20_poly1305_sha256: return 32
-        }
-    }
-
-    /// IV length in bytes (all TLS 1.3 cipher suites use 12 bytes)
-    public var ivLength: Int { 12 }
-
-    /// Hash output length in bytes
-    public var hashLength: Int {
-        switch self {
-        case .tls_aes_128_gcm_sha256, .tls_chacha20_poly1305_sha256: return 32
-        case .tls_aes_256_gcm_sha384: return 48
-        }
-    }
-}
-
-// MARK: - Named Group
-
-/// Named groups for key exchange (RFC 8446 Section 4.2.7)
-public enum NamedGroup: UInt16, Sendable {
-    case secp256r1 = 0x0017
-    case secp384r1 = 0x0018
-    case secp521r1 = 0x0019
-    case x25519 = 0x001D
-    case x448 = 0x001E
-}
-
-// MARK: - Signature Scheme
-
-/// Signature schemes (RFC 8446 Section 4.2.3)
-public enum SignatureScheme: UInt16, Sendable {
-    // ECDSA
-    case ecdsa_secp256r1_sha256 = 0x0403
-    case ecdsa_secp384r1_sha384 = 0x0503
-    case ecdsa_secp521r1_sha512 = 0x0603
-
-    // RSASSA-PSS with rsaEncryption OID
-    case rsa_pss_rsae_sha256 = 0x0804
-    case rsa_pss_rsae_sha384 = 0x0805
-    case rsa_pss_rsae_sha512 = 0x0806
-
-    // EdDSA
-    case ed25519 = 0x0807
-    case ed448 = 0x0808
-
-    // RSASSA-PKCS1-v1_5 (for certificates only)
-    case rsa_pkcs1_sha256 = 0x0401
-    case rsa_pkcs1_sha384 = 0x0501
-    case rsa_pkcs1_sha512 = 0x0601
-}
-
 // MARK: - Handshake Codec
 
-/// Encoder/decoder for TLS handshake messages
+/// `Data`-based convenience surface for the handshake message framing.
+///
+/// The Embedded-clean core (``HandshakeMessageCodec`` in `QUICTLSCore`) does the
+/// byte work on `[UInt8]`/`ByteReader`; this enum keeps the historical `Data`
+/// API and maps the core's typed ``TLSWireError`` back to ``TLSDecodeError`` at
+/// the boundary so existing call sites and tests are unchanged.
 public enum HandshakeCodec {
 
     /// Encodes a handshake message with header
@@ -152,34 +81,41 @@ public enum HandshakeCodec {
     /// - Parameter data: Data containing at least 4 bytes
     /// - Returns: Tuple of (messageType, contentLength)
     public static func decodeHeader(from data: Data) throws -> (HandshakeType, Int) {
-        guard data.count >= 4 else {
-            throw TLSDecodeError.insufficientData(expected: 4, actual: data.count)
+        do {
+            return try HandshakeMessageCodec.decodeHeader(from: [UInt8](data))
+        } catch {
+            throw Self.mapWireError(error)
         }
-
-        guard let messageType = HandshakeType(rawValue: data[data.startIndex]) else {
-            throw TLSDecodeError.unknownHandshakeType(data[data.startIndex])
-        }
-
-        let length = Int(data[data.startIndex + 1]) << 16 |
-                     Int(data[data.startIndex + 2]) << 8 |
-                     Int(data[data.startIndex + 3])
-
-        return (messageType, length)
     }
 
     /// Decodes a complete handshake message
     /// - Parameter data: Data containing header and content
     /// - Returns: Tuple of (messageType, content, totalBytesConsumed)
     public static func decodeMessage(from data: Data) throws -> (HandshakeType, Data, Int) {
-        let (messageType, contentLength) = try decodeHeader(from: data)
-
-        let totalLength = 4 + contentLength
-        guard data.count >= totalLength else {
-            throw TLSDecodeError.insufficientData(expected: totalLength, actual: data.count)
+        do {
+            let result = try HandshakeMessageCodec.decodeMessage(from: [UInt8](data))
+            return (result.type, Data(result.content), result.consumed)
+        } catch {
+            throw Self.mapWireError(error)
         }
+    }
 
-        let content = data.subdata(in: (data.startIndex + 4)..<(data.startIndex + totalLength))
-        return (messageType, content, totalLength)
+    /// Maps the core's typed ``TLSWireError`` back to the historical
+    /// ``TLSDecodeError`` so callers and tests observe the same error surface.
+    static func mapWireError(_ error: TLSWireError) -> TLSDecodeError {
+        switch error {
+        case .insufficientData(let expected, let actual):
+            return .insufficientData(expected: expected, actual: actual)
+        case .unknownHandshakeType(let byte):
+            return .unknownHandshakeType(byte)
+        case .invalidFormat(let reason):
+            return .invalidFormat(reason)
+        case .bytes(let byteError):
+            // The header/message decoders never raise `.bytes` (they use explicit
+            // count guards, not a ByteReader), but map it faithfully rather than
+            // fabricating a fallback so no information is silently dropped.
+            return .invalidFormat("byte codec error: \(byteError)")
+        }
     }
 }
 
