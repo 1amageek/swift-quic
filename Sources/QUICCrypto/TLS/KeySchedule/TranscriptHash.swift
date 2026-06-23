@@ -1,63 +1,45 @@
-/// TLS 1.3 Transcript Hash (RFC 8446 Section 4.4.1)
+/// TLS 1.3 Transcript Hash (RFC 8446 Section 4.4.1) — QUICCrypto host adapter.
 ///
-/// The transcript hash maintains a running hash of all handshake messages.
-/// It is used in key derivation and message verification.
+/// The running-hash logic lives in `QUICTLSCore` (`TLSTranscriptHashCore<C>`),
+/// Embedded-clean and generic over the `CryptoProvider` seam. This adapter
+/// specialises it at `C = QUICFoundationProvider` and bridges the public `Data`
+/// surface so existing call sites and tests are unchanged.
 ///
-/// For TLS 1.3, this is:
+/// For TLS 1.3, the transcript hash is:
 /// ```
 /// Transcript-Hash(M1, M2, ... Mn) = Hash(M1 || M2 || ... || Mn)
 /// ```
 
 import Foundation
 import Crypto
+import QUICTLSCore
 
 // MARK: - Transcript Hash
 
 /// Maintains a running hash of handshake messages
 /// Supports both SHA-256 and SHA-384 based on cipher suite
 public struct TranscriptHash: Sendable {
-    /// Hash function variant
-    private enum Hasher: Sendable {
-        case sha256(SHA256)
-        case sha384(SHA384)
-    }
-
-    /// The hash function context
-    private var hasher: Hasher
-
-    /// Accumulated messages (for debugging/verification)
-    private var messageCount: Int
+    /// The Embedded-clean transcript hash, specialised at the host provider.
+    private var core: TLSTranscriptHashCore<QUICFoundationProvider>
 
     /// Hash output length in bytes
-    public let hashLength: Int
+    public var hashLength: Int { core.hashLength }
 
     // MARK: - Initialization
 
     /// Initialize with default SHA-256
     public init() {
-        self.hasher = .sha256(SHA256())
-        self.messageCount = 0
-        self.hashLength = 32
+        self.core = TLSTranscriptHashCore(hash: .sha256)
     }
 
     /// Initialize with specific cipher suite
     public init(cipherSuite: CipherSuite) {
-        switch cipherSuite {
-        case .tls_aes_256_gcm_sha384:
-            self.hasher = .sha384(SHA384())
-            self.hashLength = 48
-        default:
-            self.hasher = .sha256(SHA256())
-            self.hashLength = 32
-        }
-        self.messageCount = 0
+        self.core = TLSTranscriptHashCore(hash: cipherSuite.coreCipherSuite.hash)
     }
 
-    /// Internal init for copy operations
-    private init(hasher: Hasher, messageCount: Int, hashLength: Int) {
-        self.hasher = hasher
-        self.messageCount = messageCount
-        self.hashLength = hashLength
+    /// Internal init wrapping an existing core (for copy / message-hash operations)
+    private init(core: TLSTranscriptHashCore<QUICFoundationProvider>) {
+        self.core = core
     }
 
     // MARK: - Update
@@ -65,28 +47,13 @@ public struct TranscriptHash: Sendable {
     /// Update the transcript with a handshake message
     /// - Parameter message: The complete handshake message (including 4-byte header)
     public mutating func update(with message: Data) {
-        switch hasher {
-        case .sha256(var h):
-            h.update(data: message)
-            hasher = .sha256(h)
-        case .sha384(var h):
-            h.update(data: message)
-            hasher = .sha384(h)
-        }
-        messageCount += 1
+        core.update(with: [UInt8](message))
     }
 
     /// Update the transcript with raw data
     /// - Parameter data: Raw data to hash
     public mutating func updateRaw(with data: Data) {
-        switch hasher {
-        case .sha256(var h):
-            h.update(data: data)
-            hasher = .sha256(h)
-        case .sha384(var h):
-            h.update(data: data)
-            hasher = .sha384(h)
-        }
+        core.updateRaw(with: [UInt8](data))
     }
 
     // MARK: - Hash Value
@@ -94,18 +61,11 @@ public struct TranscriptHash: Sendable {
     /// Get the current transcript hash value
     /// - Returns: The hash (32 bytes for SHA-256, 48 bytes for SHA-384)
     public func currentHash() -> Data {
-        switch hasher {
-        case .sha256(let h):
-            let copy = h
-            return Data(copy.finalize())
-        case .sha384(let h):
-            let copy = h
-            return Data(copy.finalize())
-        }
+        Data(core.currentHash())
     }
 
     /// Number of messages hashed
-    public var count: Int { messageCount }
+    public var count: Int { core.messageCount }
 
     // MARK: - Special Operations
 
@@ -122,23 +82,18 @@ public struct TranscriptHash: Sendable {
         clientHello1Hash: Data,
         cipherSuite: CipherSuite = .tls_aes_128_gcm_sha256
     ) -> TranscriptHash {
-        var transcript = TranscriptHash(cipherSuite: cipherSuite)
-
-        // Construct synthetic message_hash message
-        var syntheticMessage = Data(capacity: 4 + clientHello1Hash.count)
-        syntheticMessage.append(HandshakeType.messageHash.rawValue)  // Type
-        syntheticMessage.append(0x00)  // Length high byte
-        syntheticMessage.append(0x00)  // Length mid byte
-        syntheticMessage.append(UInt8(clientHello1Hash.count))  // Length low byte
-        syntheticMessage.append(clientHello1Hash)
-
-        transcript.update(with: syntheticMessage)
-        return transcript
+        let core = TLSTranscriptHashCore<QUICFoundationProvider>.fromMessageHash(
+            clientHello1Hash: [UInt8](clientHello1Hash),
+            hash: cipherSuite.coreCipherSuite.hash
+        )
+        return TranscriptHash(core: core)
     }
 
     /// Create a copy of the transcript hash
     public func copy() -> TranscriptHash {
-        TranscriptHash(hasher: hasher, messageCount: messageCount, hashLength: hashLength)
+        // `core` is a value type; assigning it produces an independent copy of the
+        // running hash state.
+        TranscriptHash(core: core)
     }
 }
 
@@ -146,26 +101,30 @@ public struct TranscriptHash: Sendable {
 
 /// Transcript hash using SHA-384 (for TLS_AES_256_GCM_SHA384)
 public struct TranscriptHashSHA384: Sendable {
-    private var hasher: SHA384
+    private var core: TLSTranscriptHashCore<QUICFoundationProvider>
     private var messageCount: Int
 
     public init() {
-        self.hasher = SHA384()
+        self.core = TLSTranscriptHashCore(hash: .sha384)
         self.messageCount = 0
     }
 
+    private init(core: TLSTranscriptHashCore<QUICFoundationProvider>, messageCount: Int) {
+        self.core = core
+        self.messageCount = messageCount
+    }
+
     public mutating func update(with message: Data) {
-        hasher.update(data: message)
+        core.update(with: [UInt8](message))
         messageCount += 1
     }
 
     public mutating func updateRaw(with data: Data) {
-        hasher.update(data: data)
+        core.updateRaw(with: [UInt8](data))
     }
 
     public func currentHash() -> Data {
-        let copy = hasher
-        return Data(copy.finalize())
+        Data(core.currentHash())
     }
 
     public static var hashLength: Int { 48 }
@@ -173,9 +132,6 @@ public struct TranscriptHashSHA384: Sendable {
     public var count: Int { messageCount }
 
     public func copy() -> TranscriptHashSHA384 {
-        var newTranscript = TranscriptHashSHA384()
-        newTranscript.hasher = self.hasher
-        newTranscript.messageCount = self.messageCount
-        return newTranscript
+        TranscriptHashSHA384(core: core, messageCount: messageCount)
     }
 }

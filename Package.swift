@@ -50,6 +50,11 @@ let package = Package(
             name: "QUICStreamCore",
             targets: ["QUICStreamCore"]
         ),
+        // Embedded-clean TLS 1.3 key schedule + transcript hash (RFC 8446 §7.1)
+        .library(
+            name: "QUICTLSCore",
+            targets: ["QUICTLSCore"]
+        ),
         // Core types (no I/O dependencies) — Foundation adapter over QUICCoreCodec
         .library(
             name: "QUICCore",
@@ -136,6 +141,26 @@ let package = Package(
             swiftSettings: coreSettings
         ),
 
+        // MARK: - Embedded-clean TLS 1.3 key schedule (dual-build: host + Embedded)
+
+        // The TLS 1.3 key schedule (RFC 8446 §7.1) generic over `C: CryptoProvider`:
+        // early/handshake/master secrets, HKDF-Expand-Label, Derive-Secret, traffic
+        // secrets, finished key/verify-data, and the incremental transcript hash, all
+        // over `[UInt8]` secrets via the CryptoProvider / KeyDerivation / HashFunction
+        // / MessageAuthenticationCode seam. No Foundation/any/Mutex/ContinuousClock/
+        // direct-Crypto. The QUICCrypto adapter specialises at C = QUICFoundationProvider
+        // and bridges Data / SymmetricKey / SharedSecret so existing tests are unchanged.
+        .target(
+            name: "QUICTLSCore",
+            dependencies: [
+                "QUICCoreCodec",
+                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+            ],
+            path: "Sources/QUICTLSCore",
+            swiftSettings: coreSettings
+        ),
+
         // MARK: - Core Types (Foundation adapter over QUICCoreCodec)
 
         .target(
@@ -154,6 +179,7 @@ let package = Package(
             dependencies: [
                 "QUICCore",
                 "QUICPacketProtectionCore",
+                "QUICTLSCore",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "X509", package: "swift-certificates"),
                 .product(name: "SwiftASN1", package: "swift-asn1"),
@@ -243,6 +269,7 @@ let package = Package(
             dependencies: [
                 "QUICCrypto",
                 "QUICPacketProtectionCore",
+                "QUICTLSCore",
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
             ],
             path: "Tests/QUICCryptoTests"
