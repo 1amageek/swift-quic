@@ -530,6 +530,18 @@ public final class ServerStateMachine: Sendable {
     private struct ServerState: Sendable {
         var handshakeState: ServerHandshakeState = .start
         var context: HandshakeContext = HandshakeContext()
+
+        /// The Embedded-clean server handshake FSM. It owns the running transcript +
+        /// key schedule by value and performs the ServerHello…Finished flight
+        /// mechanics (transcript folding, handshake/application/exporter/resumption
+        /// derivations, the HRR `message_hash` transform, the client
+        /// CertificateVerify proof-of-possession check, and the client Finished MAC).
+        /// The adapter keeps the Mutex, the TLSConfiguration-dependent negotiation +
+        /// wire-message assembly, the swift-crypto (EC)DHE + signing, X.509, and the
+        /// PSK-binder validation; it specialises the core at
+        /// `C = QUICFoundationProvider` and drives it under its lock so transcripts /
+        /// secrets and behaviour stay byte-identical.
+        var serverHandshake: QUICServerHandshake<QUICFoundationProvider> = .init()
     }
 
     public init(configuration: TLSConfiguration, sessionTicketStore: SessionTicketStore? = nil) {
@@ -690,58 +702,42 @@ public final class ServerStateMachine: Sendable {
                 }
             }
 
-            // Update transcript with ClientHello (after PSK validation which needs truncated transcript)
+            // Resolve PSK / early-data acceptance (adapter-side negotiation). The
+            // accepted PSK material is passed to the core, which installs the early
+            // secret and derives the 0-RTT secret.
             let clientHelloMessage = HandshakeCodec.encode(type: .clientHello, content: data)
-            state.context.transcriptHash.update(with: clientHelloMessage)
+            var acceptedPSK: QUICServerHandshake<QUICFoundationProvider>.AcceptedPSK?
+            var earlyDataAccepted = false
 
-            // If PSK was validated, derive early secret in the main key schedule
             if selectedPskIndex != nil,
                case .valid(_, let session, let psk) = pskValidationResult {
-                state.context.keySchedule = TLSKeySchedule(cipherSuite: session.cipherSuite)
-                state.context.keySchedule.deriveEarlySecret(psk: psk)
+                acceptedPSK = .init(
+                    psk: psk.withUnsafeBytes { [UInt8]($0) },
+                    cipherSuite: session.cipherSuite.coreCipherSuite
+                )
 
-                // Check if client offered early_data and session allows it
+                // Check if client offered early_data and session allows it.
                 if clientHello.earlyData && session.maxEarlyDataSize > 0 {
-                    // Check replay protection if configured (RFC 8446 Section 8)
-                    // 0-RTT data can be replayed, so servers should track ticket usage
+                    // Check replay protection if configured (RFC 8446 Section 8). 0-RTT
+                    // data can be replayed, so servers should track ticket usage.
                     var acceptEarlyData = true
                     if let replayProtection = configuration.replayProtection {
-                        // Create ticket identifier from ticket nonce (unique per ticket)
                         let ticketIdentifier = ReplayProtection.createIdentifier(from: session.ticketNonce)
                         acceptEarlyData = replayProtection.shouldAcceptEarlyData(ticketIdentifier: ticketIdentifier)
                     }
-
                     if acceptEarlyData {
-                        // Accept early data
                         state.context.earlyDataState.attemptingEarlyData = true
-                        state.context.earlyDataState.earlyDataAccepted = true
                         state.context.earlyDataState.maxEarlyDataSize = session.maxEarlyDataSize
-
-                        // Derive client early traffic secret (RFC 8446 Section 7.1)
-                        let earlyTranscript = state.context.transcriptHash.currentHash()
-                        do {
-                            let earlyTrafficSecret = try state.context.keySchedule.deriveClientEarlyTrafficSecret(
-                                transcriptHash: earlyTranscript
-                            )
-                            state.context.clientEarlyTrafficSecret = earlyTrafficSecret
-                            let secretData = earlyTrafficSecret.withUnsafeBytes { Data($0) }
-                            state.context.earlyDataState.clientEarlyTrafficSecret = secretData
-                        } catch {
-                            state.context.earlyDataState.earlyDataAccepted = false
-                        }
+                        earlyDataAccepted = true
                     }
-                    // If replay detected, early data is rejected but handshake continues with 1-RTT
+                    // If replay detected, early data is rejected but handshake continues with 1-RTT.
                 }
-            } else {
-                // No PSK - derive early secret with nil PSK
-                state.context.keySchedule.deriveEarlySecret(psk: nil)
             }
 
-            // Generate server key pair for selected group
+            // Generate server key pair for selected group + perform key agreement
+            // (adapter-side, swift-crypto ephemeral key).
             let serverKeyExchange = try KeyExchange.generate(for: selectedGroup)
             state.context.keyExchange = serverKeyExchange
-
-            // Perform key agreement
             let sharedSecret = try serverKeyExchange.sharedSecret(with: peerKeyShareEntry.keyExchangeData)
             state.context.sharedSecret = sharedSecret
 
@@ -756,44 +752,88 @@ public final class ServerStateMachine: Sendable {
                 throw TLSHandshakeError.noALPNMatch
             }
 
-            var messages: [(Data, EncryptionLevel)] = []
-            var outputs: [TLSOutput] = []
+            let negotiatedCipherSuite = state.context.cipherSuite ?? .tls_aes_128_gcm_sha256
+            let pskAccepted = acceptedPSK != nil
 
-            // Build ServerHello extensions
+            // Assemble the server flight messages (adapter-side wire assembly).
             var serverHelloExtensions: [TLSExtension] = [
                 .supportedVersionsServer(TLSConstants.version13),
                 .keyShareServer(serverKeyExchange.keyShareEntry())
             ]
-
-            // Add pre_shared_key extension if PSK was accepted
             if let pskIndex = selectedPskIndex {
                 serverHelloExtensions.append(.preSharedKeyServer(selectedIdentity: pskIndex))
             }
-
-            // Generate ServerHello
             let serverHello = ServerHello(
                 legacySessionIDEcho: Data(clientHello.legacySessionID),
-                cipherSuite: state.context.cipherSuite ?? .tls_aes_128_gcm_sha256,
+                cipherSuite: negotiatedCipherSuite,
                 extensions: serverHelloExtensions
             )
-
             let serverHelloMessage = serverHello.encodeAsHandshake()
-            state.context.transcriptHash.update(with: serverHelloMessage)
-            messages.append((serverHelloMessage, .initial))
 
-            // Derive handshake secrets
-            let transcriptHash = state.context.transcriptHash.currentHash()
-            let (clientSecret, serverSecret) = try state.context.keySchedule.deriveHandshakeSecrets(
-                sharedSecret: sharedSecret,
-                transcriptHash: transcriptHash
+            var eeExtensions: [TLSExtension] = []
+            if let alpn = state.context.negotiatedALPN {
+                eeExtensions.append(.alpn(ALPNExtension(protocols: [alpn])))
+            }
+            eeExtensions.append(.quicTransportParameters(transportParameters))
+            if earlyDataAccepted {
+                eeExtensions.append(.earlyData(.encryptedExtensions))
+            }
+            let eeMessage = EncryptedExtensions(extensions: eeExtensions).encodeAsHandshake()
+
+            // CertificateRequest (mTLS), only for non-PSK handshakes.
+            var certRequestMessage: Data?
+            var certRequestSignatureAlgorithms: [SignatureScheme]?
+            if !pskAccepted && self.configuration.requireClientCertificate {
+                let certRequest = CertificateRequest.withDefaultSignatureAlgorithms()
+                certRequestMessage = certRequest.encodeAsHandshake()
+                certRequestSignatureAlgorithms = certRequest.signatureAlgorithms
+                state.context.expectingClientCertificate = true
+            }
+
+            // Server Certificate (non-PSK).
+            var serverCertificateMessage: Data?
+            var signingKeyForCV: SigningKey?
+            if !pskAccepted {
+                guard let signingKey = self.configuration.signingKey,
+                      let certChain = self.configuration.certificateChain,
+                      !certChain.isEmpty else {
+                    throw TLSHandshakeError.certificateRequired
+                }
+                serverCertificateMessage = Certificate(certificates: certChain).encodeAsHandshake()
+                signingKeyForCV = signingKey
+            }
+
+            // Drive the server FSM: fold CH → install early secret → derive 0-RTT →
+            // fold SH → derive handshake secrets → fold EE/CR/Cert → (non-PSK) request
+            // a CertificateVerify signature.
+            let flightParameters = QUICServerHandshake<QUICFoundationProvider>.FlightParameters(
+                cipherSuite: negotiatedCipherSuite.coreCipherSuite,
+                acceptedPSK: acceptedPSK,
+                sharedSecret: sharedSecret.withUnsafeBytes { [UInt8]($0) },
+                earlyDataAccepted: earlyDataAccepted,
+                requestClientCertificate: state.context.expectingClientCertificate,
+                certificateRequestSignatureAlgorithms: certRequestSignatureAlgorithms
+            )
+            let flight = try Self.beginServerFlight(
+                &state.serverHandshake,
+                clientHelloBytes: [UInt8](clientHelloMessage),
+                parameters: flightParameters,
+                serverHelloBytes: [UInt8](serverHelloMessage),
+                encryptedExtensionsBytes: [UInt8](eeMessage),
+                certificateRequestBytes: certRequestMessage.map { [UInt8]($0) },
+                serverCertificateBytes: serverCertificateMessage.map { [UInt8]($0) }
             )
 
+            let clientSecret = SymmetricKey(data: flight.handshakeSecrets.client)
+            let serverSecret = SymmetricKey(data: flight.handshakeSecrets.server)
             state.context.clientHandshakeSecret = clientSecret
             state.context.serverHandshakeSecret = serverSecret
 
-            // Get cipher suite for packet protection
-            let cipherSuite = (state.context.cipherSuite ?? .tls_aes_128_gcm_sha256).toQUICCipherSuite
+            var messages: [(Data, EncryptionLevel)] = []
+            var outputs: [TLSOutput] = []
+            let cipherSuite = negotiatedCipherSuite.toQUICCipherSuite
 
+            messages.append((serverHelloMessage, .initial))
             outputs.append(.keysAvailable(KeysAvailableInfo(
                 level: .handshake,
                 clientSecret: clientSecret,
@@ -801,106 +841,54 @@ public final class ServerStateMachine: Sendable {
                 cipherSuite: cipherSuite
             )))
 
-            // Generate EncryptedExtensions
-            var eeExtensions: [TLSExtension] = []
-            if let alpn = state.context.negotiatedALPN {
-                eeExtensions.append(.alpn(ALPNExtension(protocols: [alpn])))
-            }
-            eeExtensions.append(.quicTransportParameters(transportParameters))
-
-            // Add early_data extension if we accepted it (RFC 8446 Section 4.2.10)
-            if state.context.earlyDataState.earlyDataAccepted {
-                eeExtensions.append(.earlyData(.encryptedExtensions))
-
-                // Output 0-RTT keys
-                if let earlyTrafficSecret = state.context.clientEarlyTrafficSecret {
-                    outputs.append(.keysAvailable(KeysAvailableInfo(
-                        level: .zeroRTT,
-                        clientSecret: earlyTrafficSecret,
-                        serverSecret: nil,  // Server doesn't send 0-RTT
-                        cipherSuite: cipherSuite
-                    )))
-                }
+            // 0-RTT keys (after ServerHello / handshake keys, matching the legacy order).
+            if earlyDataAccepted, let earlySecretBytes = flight.clientEarlyTrafficSecret {
+                let earlyTrafficSecret = SymmetricKey(data: earlySecretBytes)
+                state.context.clientEarlyTrafficSecret = earlyTrafficSecret
+                state.context.earlyDataState.earlyDataAccepted = true
+                state.context.earlyDataState.clientEarlyTrafficSecret = Data(earlySecretBytes)
+                outputs.append(.keysAvailable(KeysAvailableInfo(
+                    level: .zeroRTT,
+                    clientSecret: earlyTrafficSecret,
+                    serverSecret: nil,  // Server doesn't send 0-RTT
+                    cipherSuite: cipherSuite
+                )))
             }
 
-            let encryptedExtensions = EncryptedExtensions(extensions: eeExtensions)
-            let eeMessage = encryptedExtensions.encodeAsHandshake()
-            state.context.transcriptHash.update(with: eeMessage)
             messages.append((eeMessage, .handshake))
-
-            // Send CertificateRequest if mutual TLS is required (RFC 8446 Section 4.3.2)
-            // CertificateRequest is sent after EncryptedExtensions, before Certificate
-            // Only for non-PSK handshakes (PSK implies pre-established identity)
-            if !state.context.pskUsed && self.configuration.requireClientCertificate {
-                let certRequest = CertificateRequest.withDefaultSignatureAlgorithms()
-                let crMessage = certRequest.encodeAsHandshake()
-                state.context.transcriptHash.update(with: crMessage)
-                messages.append((crMessage, .handshake))
-
-                // Remember we requested client certificate
-                state.context.expectingClientCertificate = true
+            if let certRequestMessage {
+                messages.append((certRequestMessage, .handshake))
+            }
+            if let serverCertificateMessage {
+                messages.append((serverCertificateMessage, .handshake))
             }
 
-            // Generate Certificate and CertificateVerify for non-PSK handshakes
-            // RFC 8446 Section 4.4.2: Server MUST send Certificate in non-PSK handshakes
-            if !state.context.pskUsed {
-                guard let signingKey = self.configuration.signingKey,
-                      let certChain = self.configuration.certificateChain,
-                      !certChain.isEmpty else {
-                    throw TLSHandshakeError.certificateRequired
-                }
-
-                // Generate Certificate message
-                let certificate = Certificate(certificates: certChain)
-                let certMessage = certificate.encodeAsHandshake()
-                state.context.transcriptHash.update(with: certMessage)
-                messages.append((certMessage, .handshake))
-
-                // Generate CertificateVerify signature
-                // The signature is over the transcript up to (but not including) CertificateVerify
-                let transcriptForCV = state.context.transcriptHash.currentHash()
+            // Non-PSK: sign the CertificateVerify over the requested transcript hash
+            // (adapter-side signing-key path) and fold it back through the core.
+            if let cvRequest = flight.certificateVerifyRequest, let signingKey = signingKeyForCV {
                 let signatureContent = CertificateVerify.constructSignatureContent(
-                    transcriptHash: transcriptForCV,
+                    transcriptHash: Data(cvRequest.transcriptHash),
                     isServer: true
                 )
-
                 let signature = try signingKey.sign(signatureContent)
                 let certificateVerify = CertificateVerify(
                     algorithm: signingKey.scheme,
                     signature: signature
                 )
                 let cvMessage = certificateVerify.encodeAsHandshake()
-                state.context.transcriptHash.update(with: cvMessage)
+                try Self.foldServerCertificateVerify(&state.serverHandshake, messageBytes: [UInt8](cvMessage))
                 messages.append((cvMessage, .handshake))
             }
 
-            // Generate server Finished
-            let serverFinishedKey = state.context.keySchedule.finishedKey(from: serverSecret)
-            let finishedTranscript = state.context.transcriptHash.currentHash()
-            let serverVerifyData = state.context.keySchedule.finishedVerifyData(
-                forKey: serverFinishedKey,
-                transcriptHash: finishedTranscript
-            )
+            // Build the server Finished + derive application/exporter secrets.
+            let finished = try Self.finishServerFlight(&state.serverHandshake)
+            messages.append((Data(finished.serverFinished), .handshake))
 
-            let serverFinished = Finished(verifyData: serverVerifyData)
-            let serverFinishedMessage = serverFinished.encodeAsHandshake()
-            state.context.transcriptHash.update(with: serverFinishedMessage)
-            messages.append((serverFinishedMessage, .handshake))
-
-            // Derive application secrets
-            let appTranscriptHash = state.context.transcriptHash.currentHash()
-            let (clientAppSecret, serverAppSecret) = try state.context.keySchedule.deriveApplicationSecrets(
-                transcriptHash: appTranscriptHash
-            )
-
+            let clientAppSecret = SymmetricKey(data: finished.applicationSecrets.client)
+            let serverAppSecret = SymmetricKey(data: finished.applicationSecrets.server)
             state.context.clientApplicationSecret = clientAppSecret
             state.context.serverApplicationSecret = serverAppSecret
-
-            // Derive exporter master secret
-            let exporterMasterSecret = try state.context.keySchedule.deriveExporterMasterSecret(
-                transcriptHash: appTranscriptHash
-            )
-            state.context.exporterMasterSecret = exporterMasterSecret
+            state.context.exporterMasterSecret = SymmetricKey(data: finished.exporterMasterSecret)
 
             outputs.append(.keysAvailable(KeysAvailableInfo(
                 level: .application,
@@ -909,7 +897,7 @@ public final class ServerStateMachine: Sendable {
                 cipherSuite: cipherSuite
             )))
 
-            // Transition state - wait for client certificate if we requested it
+            // Mirror the FSM's transition onto the adapter's observable state.
             if state.context.expectingClientCertificate {
                 state.handshakeState = .waitClientCertificate
             } else {
@@ -937,21 +925,9 @@ public final class ServerStateMachine: Sendable {
         state.context.sentHelloRetryRequest = true
         state.context.helloRetryRequestGroup = requestedGroup
 
-        // RFC 8446 Section 4.4.1: Transcript hash special handling for HRR
-        // First, compute hash of ClientHello1
+        // Generate HelloRetryRequest. HRR is a ServerHello with special random
+        // (SHA-256 of "HelloRetryRequest").
         let clientHelloMessage = HandshakeCodec.encode(type: .clientHello, content: clientHelloData)
-        state.context.transcriptHash.update(with: clientHelloMessage)
-        let ch1Hash = state.context.transcriptHash.currentHash()
-
-        // Replace transcript with message_hash synthetic message
-        // message_hash = Handshake(254) + 00 00 Hash.length + Hash(ClientHello1)
-        state.context.transcriptHash = TranscriptHash.fromMessageHash(
-            clientHello1Hash: ch1Hash,
-            cipherSuite: .tls_aes_128_gcm_sha256
-        )
-
-        // Generate HelloRetryRequest
-        // HRR is a ServerHello with special random (SHA-256 of "HelloRetryRequest")
         let hrr = ServerHello.helloRetryRequest(
             legacySessionIDEcho: Data(clientHello.legacySessionID),
             cipherSuite: .tls_aes_128_gcm_sha256,
@@ -960,9 +936,17 @@ public final class ServerStateMachine: Sendable {
                 .keyShare(.helloRetryRequest(KeyShareHelloRetryRequest(selectedGroup: requestedGroup)))
             ]
         )
-
         let hrrMessage = hrr.encodeAsHandshake()
-        state.context.transcriptHash.update(with: hrrMessage)
+
+        // RFC 8446 Section 4.4.1: the server FSM applies the special `message_hash`
+        // transcript transform (fold CH1 → message_hash(CH1) → fold HRR). The core
+        // owns the transcript, so the synthetic-message bytes stay byte-identical.
+        try Self.applyHelloRetryRequest(
+            &state.serverHandshake,
+            cipherSuite: CipherSuite.tls_aes_128_gcm_sha256.coreCipherSuite,
+            clientHello1Bytes: [UInt8](clientHelloMessage),
+            helloRetryRequestBytes: [UInt8](hrrMessage)
+        )
 
         // Store cipher suite for later
         state.context.cipherSuite = .tls_aes_128_gcm_sha256
@@ -987,45 +971,41 @@ public final class ServerStateMachine: Sendable {
             }
 
             let certificate = try Certificate.decode(from: data)
-
-            // Verify certificate_request_context matches (should be empty for post-handshake auth)
-            // For initial handshake, context is typically empty
+            let message = HandshakeCodec.encode(type: .certificate, content: data)
 
             // Check if client sent any certificates
-            guard !certificate.certificates.isEmpty else {
+            if certificate.certificates.isEmpty {
                 // Client sent empty certificate - fail if we require client auth
                 if configuration.requireClientCertificate {
                     throw TLSHandshakeError.certificateRequired
                 }
-                // No client cert, skip to waiting for Finished
+                // No client cert: the FSM folds it and transitions to waitFinished.
+                _ = try Self.ingestClientCertificate(
+                    &state.serverHandshake,
+                    certificatePresented: false,
+                    rawMessageBytes: [UInt8](message)
+                )
                 state.handshakeState = .waitFinished
-
-                // Update transcript
-                let message = HandshakeCodec.encode(type: .certificate, content: data)
-                state.context.transcriptHash.update(with: message)
-
                 return []
             }
 
             // Store client certificates
             state.context.clientCertificates = certificate.certificatesData
 
-            // Parse leaf certificate for verification
+            // Parse leaf certificate for verification (X.509 stays adapter-side).
             guard let leafCertData = certificate.certificatesData.first else {
                 throw TLSHandshakeError.certificateVerificationFailed("No leaf certificate")
             }
-
             let leafCert = try X509Certificate.parse(from: leafCertData)
             state.context.clientCertificate = leafCert
-
-            // Extract verification key from certificate
             state.context.clientVerificationKey = try leafCert.extractPublicKey()
 
-            // Update transcript
-            let message = HandshakeCodec.encode(type: .certificate, content: data)
-            state.context.transcriptHash.update(with: message)
-
-            // Transition to wait for CertificateVerify
+            // The FSM folds the Certificate and transitions to waitClientCertificateVerify.
+            _ = try Self.ingestClientCertificate(
+                &state.serverHandshake,
+                certificatePresented: true,
+                rawMessageBytes: [UInt8](message)
+            )
             state.handshakeState = .waitClientCertificateVerify
 
             return []
@@ -1044,37 +1024,25 @@ public final class ServerStateMachine: Sendable {
 
             let certificateVerify = try CertificateVerify.decode(from: data)
 
-            // Get verification key from client's certificate
+            // Get verification key from client's certificate (X.509 stays adapter-side).
             guard let verificationKey = state.context.clientVerificationKey else {
                 throw TLSHandshakeError.internalError("Missing client verification key")
             }
 
-            // Verify the signature scheme matches the key type
-            guard verificationKey.scheme == certificateVerify.algorithm else {
-                throw TLSHandshakeError.signatureVerificationFailed
-            }
-
-            // Construct signature content (transcript hash + context string)
-            // isServer: false because this is CLIENT's CertificateVerify
-            let transcriptHash = state.context.transcriptHash.currentHash()
-            let signatureContent = TLSSignature.certificateVerifyContent(
-                transcriptHash: transcriptHash,
-                isServer: false
-            )
-
-            // Verify signature
-            let isValid = try verificationKey.verify(
-                signature: certificateVerify.signatureData,
-                for: signatureContent
-            )
-
-            guard isValid else {
-                throw TLSHandshakeError.signatureVerificationFailed
-            }
-
-            // Update transcript AFTER using it for signature verification
+            // Verify (fail-closed) + fold via the FSM. The FSM holds the live
+            // transcript, so the signed content is byte-identical; the
+            // proof-of-possession check runs through the seam verifier.
             let message = HandshakeCodec.encode(type: .certificateVerify, content: data)
-            state.context.transcriptHash.update(with: message)
+            try Self.ingestClientCertificateVerify(
+                &state.serverHandshake,
+                algorithm: certificateVerify.algorithm,
+                signature: certificateVerify.signature,
+                clientPublicKey: .init(
+                    bytes: [UInt8](verificationKey.publicKeyBytes),
+                    scheme: verificationKey.scheme
+                ),
+                rawMessageBytes: [UInt8](message)
+            )
 
             // Call custom certificate validator if configured
             if let validator = configuration.certificateValidator,
@@ -1099,32 +1067,19 @@ public final class ServerStateMachine: Sendable {
 
             let clientFinished = try Finished.decode(from: data)
 
-            // Verify client Finished
-            guard let clientHandshakeSecret = state.context.clientHandshakeSecret else {
-                throw TLSHandshakeError.internalError("Missing client handshake secret")
+            // Verify the client Finished MAC (constant-time), fold it, and derive the
+            // resumption master secret — all inside the FSM, fail-closed.
+            try Self.ingestClientFinished(
+                &state.serverHandshake,
+                verifyData: [UInt8](clientFinished.verifyData)
+            )
+            if let resumption = state.serverHandshake.resumptionMasterSecret {
+                state.context.resumptionMasterSecret = SymmetricKey(data: resumption)
             }
 
-            let clientFinishedKey = state.context.keySchedule.finishedKey(from: clientHandshakeSecret)
-            let transcriptHash = state.context.transcriptHash.currentHash()
-            let expectedVerifyData = state.context.keySchedule.finishedVerifyData(
-                forKey: clientFinishedKey,
-                transcriptHash: transcriptHash
-            )
-
-            guard clientFinished.verify(expected: expectedVerifyData) else {
-                throw TLSHandshakeError.finishedVerificationFailed
-            }
-
-            // Update transcript
-            let message = HandshakeCodec.encode(type: .finished, content: data)
-            state.context.transcriptHash.update(with: message)
-
-            // Derive resumption master secret (RFC 8446 Section 7.1)
-            let resumptionTranscript = state.context.transcriptHash.currentHash()
-            let resumptionMasterSecret = try state.context.keySchedule.deriveResumptionMasterSecret(
-                transcriptHash: resumptionTranscript
-            )
-            state.context.resumptionMasterSecret = resumptionMasterSecret
+            // Keep the adapter's key-schedule bridge in sync so post-handshake paths
+            // (NewSessionTicket) observe the completed state.
+            state.context.keySchedule.coreValue = state.serverHandshake.currentKeySchedule
 
             // Transition state
             state.handshakeState = .connected
@@ -1237,6 +1192,135 @@ public final class ServerStateMachine: Sendable {
     /// Parsed peer leaf certificate
     public var peerCertificate: X509Certificate? {
         state.withLock { $0.context.peerCertificate }
+    }
+
+    // MARK: - Server FSM bridges
+    //
+    // The mutating core calls live in dedicated `inout`-FSM helpers (not driven via
+    // the `inout ServerState`/`withLock` closures) so the typed error mapping is
+    // isolated and the FSM ownership transfer stays simple for the compiler. Each
+    // helper uses a bare `catch` (no `as`) because the wrapped call uses typed
+    // throws, so `error` is statically a `QUICServerHandshakeError`.
+
+    /// Applies the HelloRetryRequest `message_hash` transform on the FSM.
+    private static func applyHelloRetryRequest(
+        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        cipherSuite: TLSCipherSuiteCore,
+        clientHello1Bytes: [UInt8],
+        helloRetryRequestBytes: [UInt8]
+    ) throws {
+        do {
+            try handshake.applyHelloRetryRequest(
+                cipherSuite: cipherSuite,
+                clientHello1Bytes: clientHello1Bytes,
+                helloRetryRequestBytes: helloRetryRequestBytes
+            )
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Begins the server flight through the FSM.
+    private static func beginServerFlight(
+        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        clientHelloBytes: [UInt8],
+        parameters: QUICServerHandshake<QUICFoundationProvider>.FlightParameters,
+        serverHelloBytes: [UInt8],
+        encryptedExtensionsBytes: [UInt8],
+        certificateRequestBytes: [UInt8]?,
+        serverCertificateBytes: [UInt8]?
+    ) throws -> (
+        handshakeSecrets: (client: [UInt8], server: [UInt8]),
+        clientEarlyTrafficSecret: [UInt8]?,
+        certificateVerifyRequest: QUICServerHandshake<QUICFoundationProvider>.ServerCertificateVerifyRequest?
+    ) {
+        do {
+            return try handshake.beginServerFlight(
+                clientHelloBytes: clientHelloBytes,
+                parameters: parameters,
+                serverHelloBytes: serverHelloBytes,
+                encryptedExtensionsBytes: encryptedExtensionsBytes,
+                certificateRequestBytes: certificateRequestBytes,
+                serverCertificateBytes: serverCertificateBytes
+            )
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Folds the adapter-signed server CertificateVerify through the FSM.
+    private static func foldServerCertificateVerify(
+        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        messageBytes: [UInt8]
+    ) throws {
+        do {
+            try handshake.foldServerCertificateVerify(messageBytes: messageBytes)
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Finishes the server flight (Finished + application/exporter secrets).
+    private static func finishServerFlight(
+        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>
+    ) throws -> (
+        serverFinished: [UInt8],
+        applicationSecrets: (client: [UInt8], server: [UInt8]),
+        exporterMasterSecret: [UInt8]
+    ) {
+        do {
+            return try handshake.finishServerFlight()
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Ingests the client Certificate through the FSM.
+    private static func ingestClientCertificate(
+        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        certificatePresented: Bool,
+        rawMessageBytes: [UInt8]
+    ) throws -> Bool {
+        do {
+            return try handshake.ingestClientCertificate(
+                certificatePresented: certificatePresented,
+                rawMessageBytes: rawMessageBytes
+            )
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Ingests + verifies the client CertificateVerify through the FSM.
+    private static func ingestClientCertificateVerify(
+        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        algorithm: SignatureScheme,
+        signature: [UInt8],
+        clientPublicKey: QUICServerHandshake<QUICFoundationProvider>.ClientPublicKey,
+        rawMessageBytes: [UInt8]
+    ) throws {
+        do {
+            try handshake.ingestClientCertificateVerify(
+                algorithm: algorithm,
+                signature: signature,
+                clientPublicKey: clientPublicKey,
+                rawMessageBytes: rawMessageBytes
+            )
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
+    }
+
+    /// Ingests + verifies the client Finished through the FSM.
+    private static func ingestClientFinished(
+        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        verifyData: [UInt8]
+    ) throws {
+        do {
+            try handshake.ingestClientFinished(verifyData: verifyData)
+        } catch {
+            throw TLSHandshakeError.from(error)
+        }
     }
 }
 

@@ -1171,6 +1171,32 @@ extension TLSHandshakeError {
         }
     }
 
+    /// Maps an Embedded-clean ``QUICServerHandshakeError`` from the server FSM core
+    /// onto the adapter's `TLSHandshakeError` so existing error-handling / alert
+    /// mapping and the server handshake tests observe identical behaviour.
+    static func from(_ error: QUICServerHandshakeError) -> TLSHandshakeError {
+        switch error {
+        case .unexpectedMessage(let tag):
+            return .unexpectedMessage("Unexpected message in state \(tag)")
+        case .signatureVerificationFailed:
+            return .signatureVerificationFailed
+        case .finishedVerificationFailed:
+            return .finishedVerificationFailed
+        case .missingClientVerificationKey:
+            return .internalError("Missing client verification key")
+        case .keyExchange(let kxError):
+            return .keyExchangeFailed("\(kxError)")
+        case .signature:
+            return .signatureVerificationFailed
+        case .wire(let wireError):
+            return .decodeError("\(wireError)")
+        case .keySchedule(let scheduleError):
+            return .internalError("Key schedule error: \(scheduleError)")
+        case .internalInvariant(let tag):
+            return .internalError("Server FSM invariant violated: \(tag)")
+        }
+    }
+
     /// Maps an Embedded-clean ``TLSClientAuthError`` from the auth FSM core onto the
     /// adapter's `TLSHandshakeError` so existing error-handling / alert mapping and
     /// the auth tests observe identical behaviour.
