@@ -27,4 +27,13 @@ public enum TLSWireError: Error, Equatable, Sendable {
 
     /// A structure violated its RFC 8446 encoding rules. `reason` names the field.
     case invalidFormat(String)
+
+    /// A `legacy_version` field did not carry the expected TLS 1.2 sentinel
+    /// (0x0303). Mirrors the historical `TLSDecodeError.unsupportedVersion`.
+    case unsupportedVersion(UInt16)
+
+    /// A handshake message structure was malformed at the message level (used by
+    /// the manual-offset ``CertificateRequest`` parser). Mirrors the historical
+    /// `TLSHandshakeError.decodeError`; the adapter maps it back to that type.
+    case handshakeDecodeError(String)
 }
