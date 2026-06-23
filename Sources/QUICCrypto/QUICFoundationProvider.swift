@@ -10,9 +10,11 @@
 /// pulls a vendored swift-crypto whose `.macOS(.v26)` platform floor is
 /// incompatible with swift-quic's swift-certificates (`.macOS(.v12)`) graph. The
 /// AEAD / HKDF / header-protection paths used by packet protection are implemented
-/// faithfully; the key-agreement / signature primitives are not used by packet
-/// protection and throw ``CryptoError/unsupportedParameter`` rather than fabricate
-/// a result (no silent fallback).
+/// faithfully. The key-agreement (X25519 / P-256 / P-384) and signature
+/// (ECDSA-P256 / ECDSA-P384 / Ed25519) primitives are implemented faithfully over
+/// swift-crypto too: `QUICTLSCore`'s `TLSKeyExchange` / `TLSSignatureSigner` /
+/// `TLSSignatureVerifier` specialise at `C = QUICFoundationProvider` for the TLS 1.3
+/// handshake (EC)DHE and CertificateVerify operations.
 
 import Foundation
 import QUICTLSCore
@@ -41,13 +43,13 @@ public enum QUICFoundationProvider: CryptoProvider {
     public typealias HMACSHA256 = QUICFoundationHMACSHA256
     public typealias HMACSHA384 = QUICFoundationHMACSHA384
 
-    public typealias X25519        = QUICFoundationUnsupportedAgreement
-    public typealias P256Agreement = QUICFoundationUnsupportedAgreement
-    public typealias P384Agreement = QUICFoundationUnsupportedAgreement
+    public typealias X25519        = QUICFoundationX25519
+    public typealias P256Agreement = QUICFoundationP256Agreement
+    public typealias P384Agreement = QUICFoundationP384Agreement
 
-    public typealias Ed25519       = QUICFoundationUnsupportedSignature
-    public typealias P256Signature = QUICFoundationUnsupportedSignature
-    public typealias P384Signature = QUICFoundationUnsupportedSignature
+    public typealias Ed25519       = QUICFoundationEd25519
+    public typealias P256Signature = QUICFoundationP256Signature
+    public typealias P384Signature = QUICFoundationP384Signature
 
     public typealias Random           = QUICFoundationRandom
     public typealias Clock            = QUICFoundationClock
@@ -377,41 +379,11 @@ public struct QUICFoundationClock: P2PCoreCrypto.MonotonicClock {
     }
 }
 
-// MARK: - Unsupported agreement / signature (not used by packet protection)
+// MARK: - Key agreement / signature
 
-/// Packet protection never performs key agreement; this placeholder throws rather
-/// than fabricate a key (no silent fallback). TLS key exchange uses swift-crypto
-/// directly in the QUICCrypto/TLS subtree, not this seam.
-public enum QUICFoundationUnsupportedAgreement: P2PCoreCrypto.KeyAgreement {
-    public struct PrivateKey: Sendable {}
-    public struct PublicKey: Sendable {}
-    public static func generatePrivateKey() throws(P2PCoreCrypto.CryptoError) -> PrivateKey { throw .unsupportedParameter }
-    public static func privateKey(rawRepresentation: Span<UInt8>) throws(P2PCoreCrypto.CryptoError) -> PrivateKey { throw .unsupportedParameter }
-    public static func publicKey(rawRepresentation: Span<UInt8>) throws(P2PCoreCrypto.CryptoError) -> PublicKey { throw .unsupportedParameter }
-    public static func publicKey(for privateKey: PrivateKey) -> PublicKey { PublicKey() }
-    public static func rawRepresentation(of privateKey: PrivateKey) -> [UInt8] { [] }
-    public static func rawRepresentation(of publicKey: PublicKey) -> [UInt8] { [] }
-    public static func sharedSecret(privateKey: PrivateKey, peerPublicKey: PublicKey) throws(P2PCoreCrypto.CryptoError) -> [UInt8] {
-        throw .keyAgreementFailure
-    }
-}
-
-/// Packet protection never signs; this placeholder throws rather than fabricate a
-/// signature (no silent fallback). TLS CertificateVerify uses swift-crypto directly
-/// in the QUICCrypto/TLS subtree, not this seam.
-public enum QUICFoundationUnsupportedSignature: P2PCoreCrypto.SignatureScheme {
-    public struct SigningKey: Sendable {}
-    public struct VerifyingKey: Sendable {}
-    public static func generateSigningKey() throws(P2PCoreCrypto.CryptoError) -> SigningKey { throw .unsupportedParameter }
-    public static func signingKey(rawRepresentation: Span<UInt8>) throws(P2PCoreCrypto.CryptoError) -> SigningKey { throw .unsupportedParameter }
-    public static func verifyingKey(rawRepresentation: Span<UInt8>) throws(P2PCoreCrypto.CryptoError) -> VerifyingKey { throw .unsupportedParameter }
-    public static func verifyingKey(for signingKey: SigningKey) -> VerifyingKey { VerifyingKey() }
-    public static func rawRepresentation(of signingKey: SigningKey) -> [UInt8] { [] }
-    public static func rawRepresentation(of verifyingKey: VerifyingKey) -> [UInt8] { [] }
-    public static func sign(_ message: Span<UInt8>, with signingKey: SigningKey) throws(P2PCoreCrypto.CryptoError) -> [UInt8] {
-        throw .unsupportedParameter
-    }
-    public static func isValid(signature: Span<UInt8>, for message: Span<UInt8>, with verifyingKey: VerifyingKey) -> Bool {
-        false
-    }
-}
+// X25519 / P-256 / P-384 ECDH and ECDSA-P256 / ECDSA-P384 / Ed25519 are
+// implemented in their own files (QUICFoundationX25519 / QUICFoundationP256Agreement
+// / QUICFoundationP384Agreement / QUICFoundationP256Signature /
+// QUICFoundationP384Signature / QUICFoundationEd25519) and wired into the provider's
+// typealiases above. They back QUICTLSCore's TLS 1.3 handshake (EC)DHE +
+// CertificateVerify seam.
