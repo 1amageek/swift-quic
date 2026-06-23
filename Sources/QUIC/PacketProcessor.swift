@@ -192,8 +192,8 @@ public final class PacketProcessor: Sendable {
         clientSecret: SymmetricKey,
         serverSecret: SymmetricKey,
         cipherSuite: QUICCipherSuite,
-        opener: any PacketOpener,
-        sealer: any PacketSealer,
+        opener: QUICPacketProtector,
+        sealer: QUICPacketProtector,
         isClient: Bool
     ) throws {
         var schedule = KeySchedule()

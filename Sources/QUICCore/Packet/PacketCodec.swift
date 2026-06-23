@@ -81,8 +81,10 @@ public struct ParsedPacket: Sendable {
 /// update is only committed once the returned opener has successfully opened the packet
 /// (the codec never accepts a forged packet, see RFC 9001 §6.3). Returning `nil` causes the
 /// decode to fail with `PacketCodecError.noOpener`.
-public typealias ShortHeaderOpenerSelector =
-    (_ keyPhase: UInt8) throws -> (any PacketOpenerProtocol)?
+///
+/// The selector is expressed as a generic closure `(_ keyPhase: UInt8) throws -> O?` at the
+/// `decodePacket` call site (where `O: PacketOpenerProtocol` is the connection's concrete
+/// opener type), so the codec carries no `any PacketOpenerProtocol` existential.
 
 // MARK: - Packet Opener Protocol
 
@@ -97,6 +99,24 @@ public protocol PacketOpenerProtocol: Sendable {
 
     /// Decrypts packet payload
     func open(ciphertext: Data, packetNumber: UInt64, header: Data) throws -> Data
+}
+
+/// A trivial opener that never opens a packet, used only for the unprotected decode path
+/// (Version Negotiation / Retry), which returns before any opener method is invoked. Calling
+/// either method indicates a protected packet reached the no-opener path and fails closed with
+/// `PacketCodecError.noOpener` — never a silent fallback.
+struct NoPacketOpener: PacketOpenerProtocol {
+    func removeHeaderProtection(
+        sample: Data,
+        firstByte: UInt8,
+        packetNumberBytes: Data
+    ) throws -> (UInt8, Data) {
+        throw PacketCodecError.noOpener
+    }
+
+    func open(ciphertext: Data, packetNumber: UInt64, header: Data) throws -> Data {
+        throw PacketCodecError.noOpener
+    }
 }
 
 // MARK: - Packet Sealer Protocol
@@ -142,11 +162,11 @@ public struct PacketEncoder: Sendable {
     ///   - maxPacketSize: Maximum packet size (default: 1200)
     ///   - padToMinimum: If true and this is an Initial packet, pad to 1200 bytes (default: true)
     /// - Returns: The fully encoded and protected packet
-    public func encodeLongHeaderPacket(
+    public func encodeLongHeaderPacket<S: PacketSealerProtocol>(
         frames: [Frame],
         header: LongHeader,
         packetNumber: UInt64,
-        sealer: any PacketSealerProtocol,
+        sealer: S,
         maxPacketSize: Int = defaultMTU,
         padToMinimum: Bool = true
     ) throws -> Data {
@@ -231,11 +251,11 @@ public struct PacketEncoder: Sendable {
     ///   - sealer: The sealer for encryption
     ///   - maxPacketSize: Maximum packet size
     /// - Returns: The fully encoded and protected packet
-    public func encodeShortHeaderPacket(
+    public func encodeShortHeaderPacket<S: PacketSealerProtocol>(
         frames: [Frame],
         header: ShortHeader,
         packetNumber: UInt64,
-        sealer: any PacketSealerProtocol,
+        sealer: S,
         maxPacketSize: Int = defaultMTU
     ) throws -> Data {
         var header = header
@@ -372,10 +392,10 @@ public struct PacketDecoder: Sendable {
     ///   - opener: The opener for decryption (nil for unprotected packets)
     ///   - largestPN: Largest packet number received (for PN decoding)
     /// - Returns: The parsed packet
-    public func decodePacket(
+    public func decodePacket<O: PacketOpenerProtocol>(
         data: Data,
         dcidLength: Int,
-        opener: (any PacketOpenerProtocol)?,
+        opener: O?,
         largestPN: UInt64 = 0
     ) throws -> ParsedPacket {
         guard !data.isEmpty else {
@@ -401,6 +421,39 @@ public struct PacketDecoder: Sendable {
         }
     }
 
+    /// Decodes an unprotected packet (no opener), e.g. Version Negotiation / Retry.
+    ///
+    /// This overload disambiguates the `opener: nil` call site: a bare `nil` cannot infer the
+    /// generic opener type, so the no-opener path takes `Never?`. It only handles long-header
+    /// packets that carry no encryption (Version Negotiation / Retry); a protected packet with no
+    /// opener fails with `PacketCodecError.noOpener`, matching the generic path's behaviour.
+    public func decodePacket(
+        data: Data,
+        dcidLength: Int,
+        opener: Never?,
+        largestPN: UInt64 = 0
+    ) throws -> ParsedPacket {
+        guard !data.isEmpty else {
+            throw PacketCodecError.insufficientData
+        }
+
+        let firstByte = data[data.startIndex]
+        let isLongHeader = (firstByte & 0x80) != 0
+
+        if isLongHeader {
+            return try decodeLongHeaderPacket(
+                data: data, opener: NoPacketOpener?.none, largestPN: largestPN)
+        } else {
+            return try decodeShortHeaderPacket(
+                data: data,
+                dcidLength: dcidLength,
+                largestPN: largestPN,
+                headerProtectionOpener: NoPacketOpener?.none,
+                openerSelector: { _ in NoPacketOpener?.none }
+            )
+        }
+    }
+
     /// Decodes a packet, selecting the 1-RTT opener by Key Phase bit (RFC 9001 §6).
     ///
     /// For long-header packets this behaves exactly like the single-opener `decodePacket` using
@@ -421,12 +474,12 @@ public struct PacketDecoder: Sendable {
     ///   - shortHeaderOpenerSelector: Phase-aware AEAD opener selection for 1-RTT packets
     ///   - largestPN: Largest packet number received (for PN decoding)
     /// - Returns: The parsed packet
-    public func decodePacket(
+    public func decodePacket<O: PacketOpenerProtocol>(
         data: Data,
         dcidLength: Int,
-        longHeaderOpener: (any PacketOpenerProtocol)?,
-        headerProtectionOpener: (any PacketOpenerProtocol)?,
-        shortHeaderOpenerSelector: ShortHeaderOpenerSelector,
+        longHeaderOpener: O?,
+        headerProtectionOpener: O?,
+        shortHeaderOpenerSelector: (_ keyPhase: UInt8) throws -> O?,
         largestPN: UInt64 = 0
     ) throws -> ParsedPacket {
         guard !data.isEmpty else {
@@ -450,9 +503,9 @@ public struct PacketDecoder: Sendable {
     }
 
     /// Decodes a Long Header packet
-    private func decodeLongHeaderPacket(
+    private func decodeLongHeaderPacket<O: PacketOpenerProtocol>(
         data: Data,
-        opener: (any PacketOpenerProtocol)?,
+        opener: O?,
         largestPN: UInt64
     ) throws -> ParsedPacket {
         // Step 1: Parse protected header (no validation of protected bits)
@@ -601,12 +654,12 @@ public struct PacketDecoder: Sendable {
     ///    selection. The selector — not the codec — decides whether new keys are derived; the
     ///    codec never commits a key update, so a forged packet that fails AEAD here cannot change
     ///    committed key state (RFC 9001 §6.3).
-    private func decodeShortHeaderPacket(
+    private func decodeShortHeaderPacket<O: PacketOpenerProtocol>(
         data: Data,
         dcidLength: Int,
         largestPN: UInt64,
-        headerProtectionOpener: (any PacketOpenerProtocol)?,
-        openerSelector: ShortHeaderOpenerSelector
+        headerProtectionOpener: O?,
+        openerSelector: (_ keyPhase: UInt8) throws -> O?
     ) throws -> ParsedPacket {
         // Step 1: Parse protected header (no validation of protected bits)
         let (protectedHeader, headerLength) = try ProtectedShortHeader.parse(from: data, dcidLength: dcidLength)

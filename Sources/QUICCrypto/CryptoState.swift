@@ -50,13 +50,18 @@ public protocol PacketSealer: PacketSealerProtocol {}
 
 // MARK: - Crypto Context
 
-/// Cryptographic context for a single encryption level
+/// Cryptographic context for a single encryption level.
+///
+/// Holds the concrete ``QUICPacketProtector`` (a closed ``SuiteProtector`` over
+/// `QUICFoundationProvider`) for each direction rather than the former
+/// `any PacketOpener` / `any PacketSealer` existentials, so the generic crypto
+/// seam flows through the connection layer without `any`.
 public struct CryptoContext: Sendable {
     /// The opener for this level (decryption)
-    public let opener: (any PacketOpener)?
+    public let opener: QUICPacketProtector?
 
     /// The sealer for this level (encryption)
-    public let sealer: (any PacketSealer)?
+    public let sealer: QUICPacketProtector?
 
     /// Creates an empty crypto context
     public init() {
@@ -65,14 +70,14 @@ public struct CryptoContext: Sendable {
     }
 
     /// Creates a crypto context with opener and sealer
-    public init(opener: any PacketOpener, sealer: any PacketSealer) {
+    public init(opener: QUICPacketProtector, sealer: QUICPacketProtector) {
         self.opener = opener
         self.sealer = sealer
     }
 
     /// Creates a crypto context with optional opener and/or sealer
     /// Used for 0-RTT where only one direction is available
-    public init(opener: (any PacketOpener)?, sealer: (any PacketSealer)?) {
+    public init(opener: QUICPacketProtector?, sealer: QUICPacketProtector?) {
         self.opener = opener
         self.sealer = sealer
     }

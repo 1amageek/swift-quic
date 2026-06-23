@@ -55,6 +55,11 @@ let package = Package(
             name: "QUICTLSCore",
             targets: ["QUICTLSCore"]
         ),
+        // Embedded-clean connection state machines (DPLPMTUD search core)
+        .library(
+            name: "QUICConnectionCore",
+            targets: ["QUICConnectionCore"]
+        ),
         // Core types (no I/O dependencies) — Foundation adapter over QUICCoreCodec
         .library(
             name: "QUICCore",
@@ -161,6 +166,18 @@ let package = Package(
             swiftSettings: coreSettings
         ),
 
+        // MARK: - Embedded-clean connection state machines (dual-build: host + Embedded)
+
+        // The pure value-type connection state machines that are neither codec nor
+        // crypto: currently the DPLPMTUD search core (RFC 8899 / RFC 9000 §14), a
+        // `struct` state machine over `Int`/`UInt64`. No Foundation/any/Mutex/
+        // ContinuousClock/Data. The QUICConnection adapter holds it under a Mutex.
+        .target(
+            name: "QUICConnectionCore",
+            path: "Sources/QUICConnectionCore",
+            swiftSettings: coreSettings
+        ),
+
         // MARK: - Core Types (Foundation adapter over QUICCoreCodec)
 
         .target(
@@ -194,6 +211,7 @@ let package = Package(
             name: "QUICConnection",
             dependencies: [
                 "QUICCore",
+                "QUICConnectionCore",
                 "QUICCrypto",
                 "QUICStream",
                 "QUICRecovery",

@@ -180,19 +180,16 @@ public struct KeyMaterial: Sendable {
         )
     }
 
-    /// Creates opener and sealer for this key material
+    /// Creates opener and sealer for this key material.
+    ///
+    /// Both directions wrap the same ``SuiteProtector`` (RFC 9001 §5.1 derives one
+    /// key set per secret), dispatched on the negotiated cipher suite so the
+    /// correct AEAD is used rather than a hardcoded one. The returned values are
+    /// the concrete ``QUICPacketProtector`` — no `any PacketOpener`/`PacketSealer`.
     /// - Returns: Tuple of (opener, sealer)
-    public func createCrypto() throws -> (opener: any PacketOpener, sealer: any PacketSealer) {
-        switch cipherSuite {
-        case .aes128GcmSha256:
-            let opener = try AES128GCMOpener(keyMaterial: self)
-            let sealer = try AES128GCMSealer(keyMaterial: self)
-            return (opener, sealer)
-        case .chacha20Poly1305Sha256:
-            let opener = try ChaCha20Poly1305Opener(keyMaterial: self)
-            let sealer = try ChaCha20Poly1305Sealer(keyMaterial: self)
-            return (opener, sealer)
-        }
+    public func createCrypto() throws -> (opener: QUICPacketProtector, sealer: QUICPacketProtector) {
+        let protector = try QUICPacketProtector(keyMaterial: self)
+        return (protector, protector)
     }
 }
 

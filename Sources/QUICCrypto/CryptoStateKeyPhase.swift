@@ -16,24 +16,24 @@ public struct KeyPhaseContext: Sendable {
     public let currentPhase: UInt8
 
     /// Opener for current key phase
-    public let currentOpener: any PacketOpener
+    public let currentOpener: QUICPacketProtector
 
     /// Sealer for current key phase
-    public let currentSealer: any PacketSealer
+    public let currentSealer: QUICPacketProtector
 
     /// Opener for previous key phase (for in-flight packets during transition)
-    public let previousOpener: (any PacketOpener)?
+    public let previousOpener: QUICPacketProtector?
 
     /// Opener for next key phase (speculatively derived for incoming key updates)
-    public let nextOpener: (any PacketOpener)?
+    public let nextOpener: QUICPacketProtector?
 
     /// Number of key updates performed
     public let updateCount: UInt64
 
     /// Creates an initial key phase context
     public init(
-        opener: any PacketOpener,
-        sealer: any PacketSealer
+        opener: QUICPacketProtector,
+        sealer: QUICPacketProtector
     ) {
         self.currentPhase = 0
         self.currentOpener = opener
@@ -46,10 +46,10 @@ public struct KeyPhaseContext: Sendable {
     /// Creates a key phase context with all components
     public init(
         currentPhase: UInt8,
-        currentOpener: any PacketOpener,
-        currentSealer: any PacketSealer,
-        previousOpener: (any PacketOpener)?,
-        nextOpener: (any PacketOpener)?,
+        currentOpener: QUICPacketProtector,
+        currentSealer: QUICPacketProtector,
+        previousOpener: QUICPacketProtector?,
+        nextOpener: QUICPacketProtector?,
         updateCount: UInt64
     ) {
         self.currentPhase = currentPhase
@@ -63,7 +63,7 @@ public struct KeyPhaseContext: Sendable {
     /// Gets the opener for a specific key phase bit
     /// - Parameter phase: The key phase bit from the packet header
     /// - Returns: The appropriate opener, or nil if not available
-    public func opener(for phase: UInt8) -> (any PacketOpener)? {
+    public func opener(for phase: UInt8) -> QUICPacketProtector? {
         if phase == currentPhase {
             return currentOpener
         } else if let prev = previousOpener {
@@ -178,7 +178,7 @@ public final class KeyPhaseManager: Sendable {
     /// - Parameter receivedPhase: The key phase bit from the received packet
     /// - Returns: The opener to use for decryption
     /// - Throws: KeyPhaseError if keys are not available
-    public func handleReceivedKeyPhase(_ receivedPhase: UInt8) throws -> any PacketOpener {
+    public func handleReceivedKeyPhase(_ receivedPhase: UInt8) throws -> QUICPacketProtector {
         try state.withLock { state in
             guard let currentContext = state.context else {
                 throw KeyPhaseError.noApplicationKeys
@@ -238,7 +238,7 @@ public final class KeyPhaseManager: Sendable {
             }
 
             // Complete the transition
-            let newSealer: any PacketSealer
+            let newSealer: QUICPacketProtector
             do {
                 let (clientKey, serverKey) = try keySchedule.withLock { schedule in
                     // Keys were already updated in handleReceivedKeyPhase
@@ -294,11 +294,11 @@ public final class KeyPhaseManager: Sendable {
     /// on the cipher suite carried in the key material, so a connection negotiated with
     /// ChaCha20-Poly1305 (or any other supported suite) uses the correct AEAD rather than a
     /// hardcoded AES-128-GCM, which would mis-decrypt under a different suite.
-    private func createOpener(from keys: KeyMaterial) throws -> any PacketOpener {
+    private func createOpener(from keys: KeyMaterial) throws -> QUICPacketProtector {
         try keys.createCrypto().opener
     }
 
-    private func createSealer(from keys: KeyMaterial) throws -> any PacketSealer {
+    private func createSealer(from keys: KeyMaterial) throws -> QUICPacketProtector {
         try keys.createCrypto().sealer
     }
 }

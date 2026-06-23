@@ -222,9 +222,12 @@ public final class QUICConnectionHandler: Sendable {
         let (readKeys, writeKeys) = role == .client ?
             (serverKeys, clientKeys) : (clientKeys, serverKeys)
 
-        // Initial keys always use AES-128-GCM per RFC 9001 Section 5.2
-        let opener = try AES128GCMOpener(keyMaterial: readKeys)
-        let sealer = try AES128GCMSealer(keyMaterial: writeKeys)
+        // Initial keys always use AES-128-GCM per RFC 9001 Section 5.2. The key
+        // material's cipher suite is fixed to AES-128-GCM, so the protector built
+        // from it selects the AES-128-GCM AEAD — byte-identical to the former
+        // explicit AES128GCMOpener/Sealer, now without the `any` boundary.
+        let opener = try QUICPacketProtector(keyMaterial: readKeys)
+        let sealer = try QUICPacketProtector(keyMaterial: writeKeys)
 
         cryptoContexts.withLock { contexts in
             contexts[.initial] = CryptoContext(opener: opener, sealer: sealer)

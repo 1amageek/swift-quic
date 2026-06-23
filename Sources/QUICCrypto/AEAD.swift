@@ -9,9 +9,12 @@
 /// unchanged), but all AEAD and header-protection crypto now routes through the
 /// `CryptoProvider` / `HeaderProtectionProvider` seam, specialised at
 /// `C = FoundationCryptoProvider`. The generic `PacketProtector<C, A>` /
-/// `SuiteProtector<C>` value types live in `QUICPacketProtectionCore`; here they
-/// are wrapped behind the historical `any PacketOpener` / `any PacketSealer`
-/// boundary that the connection/codec layers still use.
+/// `SuiteProtector<C>` value types live in `QUICPacketProtectionCore`; the
+/// connection/codec layers now hold the concrete ``QUICPacketProtector`` (a
+/// `SuiteProtector<QUICFoundationProvider>` wrapper) directly, so no
+/// `any PacketOpener` / `any PacketSealer` existential remains on the crypto path.
+/// These concrete `AES128GCMOpener`/`Sealer` and `ChaCha20…Opener`/`Sealer` types
+/// remain for the existing unit tests and direct callers.
 
 import Foundation
 import QUICTLSCore
@@ -37,7 +40,7 @@ extension QUICCipherSuite {
 /// AEAD construction + header-protection through the seam. Surfaces a typed
 /// ``CryptoError`` instead of the core's ``PacketProtectionError`` so the adapter
 /// API is unchanged — no silent fallback.
-private func makeSuiteProtector(from keyMaterial: KeyMaterial) throws -> SuiteProtector<QUICFoundationProvider> {
+func makeSuiteProtector(from keyMaterial: KeyMaterial) throws -> SuiteProtector<QUICFoundationProvider> {
     let suite = keyMaterial.cipherSuite.protectionSuite
     guard keyMaterial.iv.count == 12 else {
         throw CryptoError.invalidIVLength(expected: 12, actual: keyMaterial.iv.count)
