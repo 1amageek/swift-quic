@@ -615,12 +615,12 @@ public final class ServerStateMachine: Sendable {
             guard let peerTransportParams = clientHello.quicTransportParameters else {
                 throw TLSHandshakeError.missingExtension("quic_transport_parameters")
             }
-            state.context.peerTransportParameters = peerTransportParams
+            state.context.peerTransportParameters = Data(peerTransportParams)
             state.context.localTransportParameters = transportParameters
 
             // Store client values
-            state.context.clientRandom = clientHello.random
-            state.context.sessionID = clientHello.legacySessionID
+            state.context.clientRandom = Data(clientHello.random)
+            state.context.sessionID = Data(clientHello.legacySessionID)
 
             // Try PSK validation if offered
             var pskValidationResult: PSKValidationResult = .noPskOffered
@@ -637,7 +637,7 @@ public final class ServerStateMachine: Sendable {
 
                 // Try each offered PSK identity
                 for (index, identity) in offeredPsks.identities.enumerated() {
-                    guard let session = store.lookupSession(ticketId: identity.identity) else {
+                    guard let session = store.lookupSession(ticketId: identity.identityData) else {
                         continue
                     }
 
@@ -668,7 +668,7 @@ public final class ServerStateMachine: Sendable {
                         // Use cipher suite's hash algorithm (SHA-256 or SHA-384)
                         let transcriptHash = session.cipherSuite.transcriptHash(of: truncatedTranscript)
 
-                        if helper.isValidBinder(forKey: binderKeyData, transcriptHash: transcriptHash, expected: binder) {
+                        if helper.isValidBinder(forKey: binderKeyData, transcriptHash: transcriptHash, expected: Data(binder)) {
                             // PSK validated successfully
                             selectedPskIndex = UInt16(index)
                             state.context.pskUsed = true
@@ -735,7 +735,7 @@ public final class ServerStateMachine: Sendable {
             state.context.keyExchange = serverKeyExchange
 
             // Perform key agreement
-            let sharedSecret = try serverKeyExchange.sharedSecret(with: peerKeyShareEntry.keyExchange)
+            let sharedSecret = try serverKeyExchange.sharedSecret(with: peerKeyShareEntry.keyExchangeData)
             state.context.sharedSecret = sharedSecret
 
             // Negotiate ALPN (required for QUIC per RFC 9001)
@@ -765,7 +765,7 @@ public final class ServerStateMachine: Sendable {
 
             // Generate ServerHello
             let serverHello = ServerHello(
-                legacySessionIDEcho: clientHello.legacySessionID,
+                legacySessionIDEcho: Data(clientHello.legacySessionID),
                 cipherSuite: state.context.cipherSuite ?? .tls_aes_128_gcm_sha256,
                 extensions: serverHelloExtensions
             )
@@ -946,7 +946,7 @@ public final class ServerStateMachine: Sendable {
         // Generate HelloRetryRequest
         // HRR is a ServerHello with special random (SHA-256 of "HelloRetryRequest")
         let hrr = ServerHello.helloRetryRequest(
-            legacySessionIDEcho: clientHello.legacySessionID,
+            legacySessionIDEcho: Data(clientHello.legacySessionID),
             cipherSuite: .tls_aes_128_gcm_sha256,
             extensions: [
                 .supportedVersionsServer(TLSConstants.version13),
@@ -1001,10 +1001,10 @@ public final class ServerStateMachine: Sendable {
             }
 
             // Store client certificates
-            state.context.clientCertificates = certificate.certificates
+            state.context.clientCertificates = certificate.certificatesData
 
             // Parse leaf certificate for verification
-            guard let leafCertData = certificate.certificates.first else {
+            guard let leafCertData = certificate.certificatesData.first else {
                 throw TLSHandshakeError.certificateVerificationFailed("No leaf certificate")
             }
 
@@ -1057,7 +1057,7 @@ public final class ServerStateMachine: Sendable {
 
             // Verify signature
             let isValid = try verificationKey.verify(
-                signature: certificateVerify.signature,
+                signature: certificateVerify.signatureData,
                 for: signatureContent
             )
 

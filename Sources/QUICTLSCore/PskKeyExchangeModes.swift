@@ -14,13 +14,10 @@
 /// - psk_dhe_ke: PSK with (EC)DHE (has forward secrecy)
 ///
 /// TLS 1.3 MUST use psk_dhe_ke for QUIC (RFC 9001 Section 4.4).
+///
+/// `PskKeyExchangeMode` lives in `PskKeyExchangeMode.swift` in this module.
 
-import Foundation
-import QUICTLSCore
-
-// `PskKeyExchangeMode` now lives in the Embedded-clean `QUICTLSCore`; it is
-// imported above (and re-exported by HandshakeMessage.swift) so this file and
-// call sites see it unchanged.
+import P2PCoreBytes
 
 // MARK: - PSK Key Exchange Modes Extension
 
@@ -49,27 +46,27 @@ public struct PskKeyExchangeModesExtension: Sendable, TLSExtensionValue {
 
     // MARK: - Encoding
 
-    public func encode() -> Data {
-        var writer = TLSWriter(capacity: keModes.count + 1)
+    public func encodeBytes() throws(TLSWireError) -> [UInt8] {
+        var writer = ByteWriter(reservingCapacity: keModes.count + 1)
 
         // ke_modes<1..255>
-        var modesData = Data()
+        var modesData = [UInt8]()
         for mode in keModes {
             modesData.append(mode.rawValue)
         }
-        writer.writeVector8(modesData)
+        try writer.wWriteVector8(modesData)
 
-        return writer.finish()
+        return writer.finishArray()
     }
 
     // MARK: - Decoding
 
-    public static func decode(from data: Data) throws -> PskKeyExchangeModesExtension {
-        var reader = TLSReader(data: data)
+    public static func decode(from data: [UInt8]) throws(TLSWireError) -> PskKeyExchangeModesExtension {
+        var reader = ByteReader(data)
 
-        let modesData = try reader.readVector8()
+        let modesData = try reader.wReadVector8()
         guard !modesData.isEmpty else {
-            throw TLSDecodeError.invalidFormat("PskKeyExchangeModes: empty")
+            throw TLSWireError.invalidFormat("PskKeyExchangeModes: empty")
         }
 
         var keModes: [PskKeyExchangeMode] = []
@@ -81,7 +78,7 @@ public struct PskKeyExchangeModesExtension: Sendable, TLSExtensionValue {
         }
 
         guard !keModes.isEmpty else {
-            throw TLSDecodeError.invalidFormat("PskKeyExchangeModes: no supported modes")
+            throw TLSWireError.invalidFormat("PskKeyExchangeModes: no supported modes")
         }
 
         return PskKeyExchangeModesExtension(keModes: keModes)

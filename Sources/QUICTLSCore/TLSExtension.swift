@@ -7,20 +7,25 @@
 ///     opaque extension_data<0..2^16-1>;
 /// } Extension;
 /// ```
+///
+/// Embedded-clean: ``TLSExtension`` is a closed enum (each case carries its
+/// concrete value type), so the codec never uses an `any TLSExtensionValue`
+/// existential. The `value` accessor and the generic `findExtension<T>(as?)`
+/// lookup that required an existential live in the `QUICCrypto` adapter.
 
-import Foundation
-import QUICTLSCore
+import P2PCoreBytes
 
-// `TLSExtensionType` now lives in the Embedded-clean `QUICTLSCore`; it is imported
-// above (and re-exported by HandshakeMessage.swift) so this file and call sites
-// see it unchanged.
+// `TLSExtensionType` lives in `TLSExtensionType.swift` in this module.
 
 // MARK: - Extension Value Protocol
 
-/// Protocol for extension values
+/// Protocol for extension values.
+///
+/// Used as a generic constraint (`some`/`<T: TLSExtensionValue>`), never as an
+/// existential — Embedded Swift forbids `any` values.
 public protocol TLSExtensionValue: Sendable {
     static var extensionType: TLSExtensionType { get }
-    func encode() -> Data
+    func encodeBytes() throws(TLSWireError) -> [UInt8]
 }
 
 // MARK: - TLS Extension Enum
@@ -36,8 +41,8 @@ public enum TLSExtension: Sendable {
     case supportedVersions(SupportedVersionsExtension)
     case pskKeyExchangeModes(PskKeyExchangeModesExtension)
     case keyShare(KeyShareExtension)
-    case quicTransportParameters(Data)
-    case unknown(type: UInt16, data: Data)
+    case quicTransportParameters([UInt8])
+    case unknown(type: UInt16, data: [UInt8])
 
     // MARK: - Properties
 
@@ -75,54 +80,37 @@ public enum TLSExtension: Sendable {
         }
     }
 
-    /// Get the underlying value if it matches the expected type
-    public var value: any TLSExtensionValue {
-        switch self {
-        case .serverName(let v): return v
-        case .supportedGroups(let v): return v
-        case .signatureAlgorithms(let v): return v
-        case .alpn(let v): return v
-        case .preSharedKey(let v): return v
-        case .earlyData(let v): return v
-        case .supportedVersions(let v): return v
-        case .pskKeyExchangeModes(let v): return v
-        case .keyShare(let v): return v
-        case .quicTransportParameters(let data): return QUICTransportParametersExtension(data: data)
-        case .unknown(let type, let data): return UnknownExtension(type: type, data: data)
-        }
-    }
-
     // MARK: - Encoding
 
     /// Encode the extension (type + length + data)
-    public func encode() -> Data {
-        let extensionData: Data
+    public func encodeBytes() throws(TLSWireError) -> [UInt8] {
+        let extensionData: [UInt8]
         switch self {
-        case .serverName(let ext): extensionData = ext.encode()
-        case .supportedGroups(let ext): extensionData = ext.encode()
-        case .signatureAlgorithms(let ext): extensionData = ext.encode()
-        case .alpn(let ext): extensionData = ext.encode()
-        case .preSharedKey(let ext): extensionData = ext.encode()
-        case .earlyData(let ext): extensionData = ext.encode()
-        case .supportedVersions(let ext): extensionData = ext.encode()
-        case .pskKeyExchangeModes(let ext): extensionData = ext.encode()
-        case .keyShare(let ext): extensionData = ext.encode()
+        case .serverName(let ext): extensionData = try ext.encodeBytes()
+        case .supportedGroups(let ext): extensionData = try ext.encodeBytes()
+        case .signatureAlgorithms(let ext): extensionData = try ext.encodeBytes()
+        case .alpn(let ext): extensionData = try ext.encodeBytes()
+        case .preSharedKey(let ext): extensionData = try ext.encodeBytes()
+        case .earlyData(let ext): extensionData = ext.encodeBytes()
+        case .supportedVersions(let ext): extensionData = try ext.encodeBytes()
+        case .pskKeyExchangeModes(let ext): extensionData = try ext.encodeBytes()
+        case .keyShare(let ext): extensionData = try ext.encodeBytes()
         case .quicTransportParameters(let data): extensionData = data
         case .unknown(_, let data): extensionData = data
         }
 
-        var writer = TLSWriter(capacity: 4 + extensionData.count)
+        var writer = ByteWriter(reservingCapacity: 4 + extensionData.count)
         writer.writeUInt16(rawType)
-        writer.writeVector16(extensionData)
-        return writer.finish()
+        try writer.wWriteVector16(extensionData)
+        return writer.finishArray()
     }
 
     // MARK: - Decoding
 
     /// Decode an extension from a reader
-    public static func decode(from reader: inout TLSReader) throws -> TLSExtension {
-        let type = try reader.readUInt16()
-        let data = try reader.readVector16()
+    public static func decode(from reader: inout ByteReader) throws(TLSWireError) -> TLSExtension {
+        let type = try reader.wReadUInt16()
+        let data = try reader.wReadVector16()
 
         guard let extensionType = TLSExtensionType(rawValue: type) else {
             return .unknown(type: type, data: data)
@@ -157,9 +145,9 @@ public enum TLSExtension: Sendable {
 
     /// Decode an extension from a reader in NewSessionTicket context
     /// This handles early_data differently (contains max_early_data_size)
-    public static func decodeForNewSessionTicket(from reader: inout TLSReader) throws -> TLSExtension {
-        let type = try reader.readUInt16()
-        let data = try reader.readVector16()
+    public static func decodeForNewSessionTicket(from reader: inout ByteReader) throws(TLSWireError) -> TLSExtension {
+        let type = try reader.wReadUInt16()
+        let data = try reader.wReadVector16()
 
         guard let extensionType = TLSExtensionType(rawValue: type) else {
             return .unknown(type: type, data: data)
@@ -175,15 +163,15 @@ public enum TLSExtension: Sendable {
         }
     }
 
-    /// Decode multiple extensions from a Data blob
+    /// Decode multiple extensions from a byte blob
     ///
     /// - Parameter data: The raw extensions data (without length prefix)
     /// - Returns: Array of decoded extensions
     /// - Throws: If decoding fails
-    public static func decodeExtensions(from data: Data) throws -> [TLSExtension] {
-        var reader = TLSReader(data: data)
+    public static func decodeExtensions(from data: [UInt8]) throws(TLSWireError) -> [TLSExtension] {
+        var reader = ByteReader(data)
         var extensions: [TLSExtension] = []
-        while reader.hasMore {
+        while !reader.isAtEnd {
             let ext = try decode(from: &reader)
             extensions.append(ext)
         }
@@ -191,7 +179,7 @@ public enum TLSExtension: Sendable {
     }
 
     /// Helper to decode extension with known type and data
-    private static func decodeWithTypeAndData(extensionType: TLSExtensionType, data: Data) throws -> TLSExtension {
+    private static func decodeWithTypeAndData(extensionType: TLSExtensionType, data: [UInt8]) throws(TLSWireError) -> TLSExtension {
         switch extensionType {
         case .serverName:
             return .serverName(try ServerNameExtension.decode(from: data))
@@ -279,25 +267,4 @@ extension TLSExtension {
     public static func preSharedKeyServer(selectedIdentity: UInt16) -> TLSExtension {
         .preSharedKey(.serverHello(SelectedPsk(selectedIdentity: selectedIdentity)))
     }
-}
-
-// MARK: - Unknown Extension
-
-/// Placeholder for unknown extensions
-public struct UnknownExtension: TLSExtensionValue {
-    public static var extensionType: TLSExtensionType { fatalError("Unknown extension has no type") }
-    public let type: UInt16
-    public let data: Data
-
-    public func encode() -> Data { data }
-}
-
-// MARK: - QUIC Transport Parameters Extension
-
-/// QUIC transport parameters extension (type 0x0039)
-public struct QUICTransportParametersExtension: TLSExtensionValue {
-    public static var extensionType: TLSExtensionType { .quicTransportParameters }
-    public let data: Data
-
-    public func encode() -> Data { data }
 }

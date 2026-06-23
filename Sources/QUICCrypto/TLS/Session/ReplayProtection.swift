@@ -169,7 +169,7 @@ extension ReplayProtection {
     /// - Parameter ticket: The NewSessionTicket
     /// - Returns: A 32-byte identifier
     public static func createIdentifier(from ticket: NewSessionTicket) -> Data {
-        createIdentifier(from: ticket.ticket)
+        createIdentifier(from: ticket.ticketData)
     }
 }
 

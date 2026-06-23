@@ -6,7 +6,7 @@
 /// } EncryptedExtensions;
 /// ```
 
-import Foundation
+import P2PCoreBytes
 
 /// TLS 1.3 EncryptedExtensions message
 public struct EncryptedExtensions: Sendable {
@@ -23,32 +23,32 @@ public struct EncryptedExtensions: Sendable {
     // MARK: - Encoding
 
     /// Encodes the EncryptedExtensions content (without handshake header)
-    public func encode() -> Data {
-        var extensionData = Data()
+    public func encodeBytes() throws(TLSWireError) -> [UInt8] {
+        var extensionData = [UInt8]()
         for ext in extensions {
-            extensionData.append(ext.encode())
+            extensionData.append(contentsOf: try ext.encodeBytes())
         }
 
-        var writer = TLSWriter(capacity: 2 + extensionData.count)
-        writer.writeVector16(extensionData)
-        return writer.finish()
+        var writer = ByteWriter(reservingCapacity: 2 + extensionData.count)
+        try writer.wWriteVector16(extensionData)
+        return writer.finishArray()
     }
 
     /// Encodes as a complete handshake message (with header)
-    public func encodeAsHandshake() -> Data {
-        HandshakeCodec.encode(type: .encryptedExtensions, content: encode())
+    public func encodeAsHandshakeBytes() throws(TLSWireError) -> [UInt8] {
+        try HandshakeMessageCodec.encode(type: .encryptedExtensions, content: try encodeBytes())
     }
 
     // MARK: - Decoding
 
     /// Decodes EncryptedExtensions from content data (without handshake header)
-    public static func decode(from data: Data) throws -> EncryptedExtensions {
-        var reader = TLSReader(data: data)
-        let extensionData = try reader.readVector16()
+    public static func decode(from data: [UInt8]) throws(TLSWireError) -> EncryptedExtensions {
+        var reader = ByteReader(data)
+        let extensionData = try reader.wReadVector16()
 
         var extensions: [TLSExtension] = []
-        var extReader = TLSReader(data: extensionData)
-        while extReader.hasMore {
+        var extReader = ByteReader(extensionData)
+        while !extReader.isAtEnd {
             let ext = try TLSExtension.decode(from: &extReader)
             extensions.append(ext)
         }
@@ -58,19 +58,14 @@ public struct EncryptedExtensions: Sendable {
 
     // MARK: - Extension Helpers
 
-    /// Find an extension by type
-    public func findExtension<T: TLSExtensionValue>(_ type: T.Type) -> T? {
+    /// Get ALPN extension
+    public var alpn: ALPNExtension? {
         for ext in extensions {
-            if let value = ext.value as? T {
-                return value
+            if case .alpn(let alpn) = ext {
+                return alpn
             }
         }
         return nil
-    }
-
-    /// Get ALPN extension
-    public var alpn: ALPNExtension? {
-        findExtension(ALPNExtension.self)
     }
 
     /// Get selected ALPN protocol
@@ -79,7 +74,7 @@ public struct EncryptedExtensions: Sendable {
     }
 
     /// Get QUIC transport parameters
-    public var quicTransportParameters: Data? {
+    public var quicTransportParameters: [UInt8]? {
         for ext in extensions {
             if case .quicTransportParameters(let data) = ext {
                 return data
@@ -90,6 +85,11 @@ public struct EncryptedExtensions: Sendable {
 
     /// Get server name extension
     public var serverName: ServerNameExtension? {
-        findExtension(ServerNameExtension.self)
+        for ext in extensions {
+            if case .serverName(let serverName) = ext {
+                return serverName
+            }
+        }
+        return nil
     }
 }

@@ -17,44 +17,44 @@
 /// } CertificateEntry;
 /// ```
 
-import Foundation
+import P2PCoreBytes
 
 // MARK: - Certificate Entry
 
 /// A certificate entry in the Certificate message
 public struct CertificateEntry: Sendable {
     /// The certificate data (DER-encoded X.509)
-    public let certData: Data
+    public let certData: [UInt8]
 
     /// Extensions for this certificate (e.g., OCSP status)
     public let extensions: [TLSExtension]
 
-    public init(certData: Data, extensions: [TLSExtension] = []) {
+    public init(certData: [UInt8], extensions: [TLSExtension] = []) {
         self.certData = certData
         self.extensions = extensions
     }
 
-    public func encode() -> Data {
-        var extensionData = Data()
+    public func encodeBytes() throws(TLSWireError) -> [UInt8] {
+        var extensionData = [UInt8]()
         for ext in extensions {
-            extensionData.append(ext.encode())
+            extensionData.append(contentsOf: try ext.encodeBytes())
         }
 
-        var writer = TLSWriter(capacity: 3 + certData.count + 2 + extensionData.count)
+        var writer = ByteWriter(reservingCapacity: 3 + certData.count + 2 + extensionData.count)
         // cert_data<1..2^24-1>
-        writer.writeVector24(certData)
+        try writer.wWriteVector24(certData)
         // extensions<0..2^16-1>
-        writer.writeVector16(extensionData)
-        return writer.finish()
+        try writer.wWriteVector16(extensionData)
+        return writer.finishArray()
     }
 
-    public static func decode(from reader: inout TLSReader) throws -> CertificateEntry {
-        let certData = try reader.readVector24()
-        let extensionData = try reader.readVector16()
+    public static func decode(from reader: inout ByteReader) throws(TLSWireError) -> CertificateEntry {
+        let certData = try reader.wReadVector24()
+        let extensionData = try reader.wReadVector16()
 
         var extensions: [TLSExtension] = []
-        var extReader = TLSReader(data: extensionData)
-        while extReader.hasMore {
+        var extReader = ByteReader(extensionData)
+        while !extReader.isAtEnd {
             let ext = try TLSExtension.decode(from: &extReader)
             extensions.append(ext)
         }
@@ -69,20 +69,20 @@ public struct CertificateEntry: Sendable {
 public struct Certificate: Sendable {
 
     /// The certificate request context (empty for server certificates)
-    public let certificateRequestContext: Data
+    public let certificateRequestContext: [UInt8]
 
     /// The certificate chain (leaf first)
     public let certificateList: [CertificateEntry]
 
     // MARK: - Initialization
 
-    public init(certificateRequestContext: Data = Data(), certificateList: [CertificateEntry]) {
+    public init(certificateRequestContext: [UInt8] = [], certificateList: [CertificateEntry]) {
         self.certificateRequestContext = certificateRequestContext
         self.certificateList = certificateList
     }
 
     /// Create from raw certificate data (DER-encoded)
-    public init(certificateRequestContext: Data = Data(), certificates: [Data]) {
+    public init(certificateRequestContext: [UInt8] = [], certificates: [[UInt8]]) {
         self.certificateRequestContext = certificateRequestContext
         self.certificateList = certificates.map { CertificateEntry(certData: $0) }
     }
@@ -90,39 +90,39 @@ public struct Certificate: Sendable {
     // MARK: - Encoding
 
     /// Encodes the Certificate content (without handshake header)
-    public func encode() -> Data {
-        var certListData = Data()
+    public func encodeBytes() throws(TLSWireError) -> [UInt8] {
+        var certListData = [UInt8]()
         for entry in certificateList {
-            certListData.append(entry.encode())
+            certListData.append(contentsOf: try entry.encodeBytes())
         }
 
-        var writer = TLSWriter(capacity: 1 + certificateRequestContext.count + 3 + certListData.count)
+        var writer = ByteWriter(reservingCapacity: 1 + certificateRequestContext.count + 3 + certListData.count)
         // certificate_request_context<0..2^8-1>
-        writer.writeVector8(certificateRequestContext)
+        try writer.wWriteVector8(certificateRequestContext)
         // certificate_list<0..2^24-1>
-        writer.writeVector24(certListData)
-        return writer.finish()
+        try writer.wWriteVector24(certListData)
+        return writer.finishArray()
     }
 
     /// Encodes as a complete handshake message (with header)
-    public func encodeAsHandshake() -> Data {
-        HandshakeCodec.encode(type: .certificate, content: encode())
+    public func encodeAsHandshakeBytes() throws(TLSWireError) -> [UInt8] {
+        try HandshakeMessageCodec.encode(type: .certificate, content: try encodeBytes())
     }
 
     // MARK: - Decoding
 
     /// Decodes Certificate from content data (without handshake header)
-    public static func decode(from data: Data) throws -> Certificate {
-        var reader = TLSReader(data: data)
+    public static func decode(from data: [UInt8]) throws(TLSWireError) -> Certificate {
+        var reader = ByteReader(data)
 
         // certificate_request_context
-        let certificateRequestContext = try reader.readVector8()
+        let certificateRequestContext = try reader.wReadVector8()
 
         // certificate_list
-        let certListData = try reader.readVector24()
+        let certListData = try reader.wReadVector24()
         var certificateList: [CertificateEntry] = []
-        var listReader = TLSReader(data: certListData)
-        while listReader.hasMore {
+        var listReader = ByteReader(certListData)
+        while !listReader.isAtEnd {
             certificateList.append(try CertificateEntry.decode(from: &listReader))
         }
 
@@ -135,12 +135,12 @@ public struct Certificate: Sendable {
     // MARK: - Helpers
 
     /// Get the leaf (end-entity) certificate
-    public var leafCertificate: Data? {
+    public var leafCertificate: [UInt8]? {
         certificateList.first?.certData
     }
 
     /// Get all certificate data (without extensions)
-    public var certificates: [Data] {
+    public var certificates: [[UInt8]] {
         certificateList.map { $0.certData }
     }
 

@@ -185,7 +185,7 @@ public final class ClientStateMachine: Sendable {
                 )
 
                 // Second pass: Rebuild ClientHello with correct binders
-                offeredPsks.binders = [binder]
+                offeredPsks.binders = [[UInt8](binder)]
 
                 var finalExtensions = extensions
                 finalExtensions.append(.preSharedKeyClient(offeredPsks))
@@ -316,12 +316,12 @@ public final class ClientStateMachine: Sendable {
             }
 
             // Perform key agreement
-            let sharedSecret = try ourKeyExchange.sharedSecret(with: serverKeyShare.serverShare.keyExchange)
+            let sharedSecret = try ourKeyExchange.sharedSecret(with: serverKeyShare.serverShare.keyExchangeData)
             state.context.sharedSecret = sharedSecret
 
             // Store cipher suite
             state.context.cipherSuite = serverHello.cipherSuite
-            state.context.serverRandom = serverHello.random
+            state.context.serverRandom = serverHello.randomData
 
             // Update transcript with ServerHello
             let serverHelloMessage = HandshakeCodec.encode(type: .serverHello, content: data)
@@ -510,7 +510,7 @@ public final class ClientStateMachine: Sendable {
             guard let params = encryptedExtensions.quicTransportParameters else {
                 throw TLSHandshakeError.missingExtension("quic_transport_parameters")
             }
-            state.context.peerTransportParameters = params
+            state.context.peerTransportParameters = Data(params)
 
             // Check for early_data acceptance
             let earlyDataAccepted = encryptedExtensions.extensions.contains {
@@ -557,7 +557,7 @@ public final class ClientStateMachine: Sendable {
             let certRequest = try CertificateRequest.decode(from: data)
 
             // Store context to echo back in client's Certificate message
-            state.context.certificateRequestContext = certRequest.certificateRequestContext
+            state.context.certificateRequestContext = certRequest.certificateRequestContextData
             state.context.clientCertificateRequested = true
 
             // Update transcript
@@ -587,11 +587,11 @@ public final class ClientStateMachine: Sendable {
             let certificate = try Certificate.decode(from: data)
 
             // Store raw certificates
-            state.context.peerCertificates = certificate.certificates
+            state.context.peerCertificates = certificate.certificatesData
 
             // X.509 path (skip if expectedPeerPublicKey is set — raw public key mode).
             if state.configuration.expectedPeerPublicKey == nil {
-                guard let leafCertData = certificate.leafCertificate else {
+                guard let leafCertData = certificate.leafCertificateData else {
                     throw TLSHandshakeError.certificateVerificationFailed("No certificate provided")
                 }
 
@@ -620,7 +620,7 @@ public final class ClientStateMachine: Sendable {
                 // X.509 chain/trust-anchor validation is gated by verifyPeer.
                 if state.configuration.verifyPeer {
                     // Parse intermediate certificates
-                    let intermediateCerts = try certificate.certificates.dropFirst().compactMap { certData -> X509Certificate? in
+                    let intermediateCerts = try certificate.certificatesData.dropFirst().compactMap { certData -> X509Certificate? in
                         try X509Certificate.parse(from: certData)
                     }
 
@@ -704,7 +704,7 @@ public final class ClientStateMachine: Sendable {
 
                 // Verify the signature
                 let isValid = try key.verify(
-                    signature: certificateVerify.signature,
+                    signature: certificateVerify.signatureData,
                     for: signedContent
                 )
 
@@ -918,7 +918,7 @@ public final class ClientStateMachine: Sendable {
             // Derive PSK from resumption master secret and ticket nonce
             let resumptionPSK = state.context.keySchedule.deriveResumptionPSK(
                 resumptionMasterSecret: resumptionMasterSecret,
-                ticketNonce: ticket.ticketNonce
+                ticketNonce: ticket.ticketNonceData
             )
 
             // Extract max early data size from extensions
@@ -933,7 +933,7 @@ public final class ClientStateMachine: Sendable {
 
             // Create session ticket data
             let ticketData = SessionTicketData(
-                ticket: ticket.ticket,
+                ticket: ticket.ticketData,
                 resumptionPSK: resumptionPSK.withUnsafeBytes { Data($0) },
                 maxEarlyDataSize: maxEarlyDataSize,
                 ticketAgeAdd: ticket.ticketAgeAdd,

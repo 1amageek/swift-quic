@@ -11,37 +11,27 @@
 
 import Foundation
 @_exported import QUICTLSCore
+// Re-export QUICCore so its `[UInt8] ⇄ Data` equality bridges (used to compare
+// moved core `[UInt8]` byte fields against `Data` literals) are visible to
+// `@testable import QUICCrypto` consumers without per-test `import QUICCore`.
+@_exported import QUICCore
 
-// `HandshakeType`, `CipherSuite`, `NamedGroup`, and `SignatureScheme` now live in
-// the Embedded-clean `QUICTLSCore` and are re-exported above so existing call
-// sites and tests continue to see them as `QUICCrypto` symbols unchanged.
+// `HandshakeType`, `CipherSuite`, `NamedGroup`, `SignatureScheme`, `TLSConstants`,
+// and the TLS 1.3 handshake message/extension wire types now live in the
+// Embedded-clean `QUICTLSCore` and are re-exported above so existing call sites
+// and tests continue to see them as `QUICCrypto` symbols unchanged.
 
-// MARK: - TLS Constants
+// MARK: - TLS Constants (Data view)
 
-/// TLS protocol constants
-public enum TLSConstants {
-    /// TLS 1.3 version (0x0304)
-    public static let version13: UInt16 = 0x0304
-
-    /// TLS 1.2 version for legacy compatibility (0x0303)
-    public static let legacyVersion: UInt16 = 0x0303
-
-    /// Random bytes length
-    public static let randomLength = 32
-
-    /// Session ID max length
-    public static let sessionIDMaxLength = 32
-
-    /// Verify data length for Finished message (SHA-256)
-    public static let verifyDataLength = 32
-
-    /// HelloRetryRequest magic random value (SHA-256 of "HelloRetryRequest")
-    public static let helloRetryRequestRandom = Data([
-        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
-        0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
-        0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
-        0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C
-    ])
+extension TLSConstants {
+    /// HelloRetryRequest magic random value as `Data`.
+    ///
+    /// The core stores the sentinel as `[UInt8]`; this restores the historical
+    /// `Data` surface for call sites that compare against `ServerHello.random`
+    /// (whose `Data` view is provided by the message `Data`-compat shim).
+    public static var helloRetryRequestRandomData: Data {
+        Data(helloRetryRequestRandom)
+    }
 }
 
 // MARK: - Handshake Codec
@@ -109,6 +99,12 @@ public enum HandshakeCodec {
         case .unknownHandshakeType(let byte):
             return .unknownHandshakeType(byte)
         case .invalidFormat(let reason):
+            return .invalidFormat(reason)
+        case .unsupportedVersion(let version):
+            return .unsupportedVersion(version)
+        case .handshakeDecodeError(let reason):
+            // The header/message framing decoders never raise this (it is the
+            // message-level CertificateRequest parser case); map it faithfully.
             return .invalidFormat(reason)
         case .bytes(let byteError):
             // The header/message decoders never raise `.bytes` (they use explicit

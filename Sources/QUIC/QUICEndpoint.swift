@@ -542,7 +542,7 @@ public actor QUICEndpoint {
         // Create TLS provider with session ticket for resumption (fails if not configured)
         let tlsProvider = try createTLSProvider(
             isClient: true,
-            sessionTicket: session.ticket.ticket,
+            sessionTicket: session.ticket.ticketData,
             maxEarlyDataSize: session.maxEarlyDataSize
         )
 

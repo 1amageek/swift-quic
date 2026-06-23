@@ -101,7 +101,7 @@ public final class ClientSessionCache: Sendable {
         public func derivePSK(keySchedule: TLSKeySchedule) -> SymmetricKey {
             keySchedule.deriveResumptionPSK(
                 resumptionMasterSecret: resumptionMasterSecret,
-                ticketNonce: ticket.ticketNonce
+                ticketNonce: ticket.ticketNonceData
             )
         }
 
@@ -114,11 +114,11 @@ public final class ClientSessionCache: Sendable {
             let keySchedule = TLSKeySchedule(cipherSuite: cipherSuite)
             let psk = keySchedule.deriveResumptionPSK(
                 resumptionMasterSecret: resumptionMasterSecret,
-                ticketNonce: ticket.ticketNonce
+                ticketNonce: ticket.ticketNonceData
             )
 
             return SessionTicketData(
-                ticket: ticket.ticket,
+                ticket: ticket.ticketData,
                 resumptionPSK: psk.withUnsafeBytes { Data($0) },
                 maxEarlyDataSize: maxEarlyDataSize,
                 ticketAgeAdd: ticket.ticketAgeAdd,
@@ -262,7 +262,7 @@ public final class ClientSessionCache: Sendable {
             guard var sessions = s.sessions[serverIdentity] else {
                 return
             }
-            sessions.removeAll { $0.ticket.ticket == ticketData }
+            sessions.removeAll { $0.ticket.ticketData == ticketData }
             s.sessions[serverIdentity] = sessions
         }
     }

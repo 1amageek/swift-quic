@@ -17,7 +17,7 @@
 /// } Alert;
 /// ```
 
-import Foundation
+import P2PCoreBytes
 
 // MARK: - Alert Level
 
@@ -210,38 +210,39 @@ public struct TLSAlert: Sendable, Equatable {
     // MARK: - Encoding
 
     /// Encode the alert as 2 bytes
-    public func encode() -> Data {
-        Data([level.rawValue, alertDescription.rawValue])
+    public func encodeBytes() -> [UInt8] {
+        [level.rawValue, alertDescription.rawValue]
     }
 
-    /// Encode as a complete handshake message (rarely used - alerts have their own content type)
-    public func encodeAsRecord() -> Data {
+    /// Encode as a complete TLS record (rarely used - alerts have their own content type)
+    public func encodeAsRecordBytes() -> [UInt8] {
         // TLS record: content_type(21=alert) + version + length + alert
-        var data = Data(capacity: 7)
+        var data = [UInt8]()
+        data.reserveCapacity(7)
         data.append(21)  // ContentType.alert
         data.append(0x03)  // Version high byte (TLS 1.2 for compatibility)
         data.append(0x03)  // Version low byte
         data.append(0x00)  // Length high byte
         data.append(0x02)  // Length low byte (2 bytes)
-        data.append(contentsOf: encode())
+        data.append(contentsOf: encodeBytes())
         return data
     }
 
     // MARK: - Decoding
 
-    /// Decode an alert from data
-    public static func decode(from data: Data) throws -> TLSAlert {
+    /// Decode an alert from bytes
+    public static func decode(from data: [UInt8]) throws(TLSWireError) -> TLSAlert {
         guard data.count >= 2 else {
-            throw TLSDecodeError.invalidFormat("Alert too short")
+            throw TLSWireError.invalidFormat("Alert too short")
         }
 
         guard let level = AlertLevel(rawValue: data[0]) else {
-            throw TLSDecodeError.invalidFormat("Unknown alert level: \(data[0])")
+            throw TLSWireError.invalidFormat("Unknown alert level: \(data[0])")
         }
 
         guard let description = AlertDescription(rawValue: data[1]) else {
             // Unknown alert description - treat as unknown
-            throw TLSDecodeError.invalidFormat("Unknown alert description: \(data[1])")
+            throw TLSWireError.invalidFormat("Unknown alert description: \(data[1])")
         }
 
         return TLSAlert(level: level, description: description)

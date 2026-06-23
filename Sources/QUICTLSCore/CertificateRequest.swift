@@ -8,16 +8,20 @@
 ///     Extension extensions<2..2^16-1>;
 /// } CertificateRequest;
 /// ```
+///
+/// The manual-offset parser uses `[UInt8]` (always zero-based) so the historical
+/// absolute-index logic is preserved without the slice-index hazard. Message-level
+/// failures throw ``TLSWireError/handshakeDecodeError(_:)``, which the `QUICCrypto`
+/// adapter maps back to the historical `TLSHandshakeError.decodeError`.
 
-import Foundation
-import QUICTLSCore
+import P2PCoreBytes
 
 /// TLS 1.3 CertificateRequest message
 public struct CertificateRequest: Sendable {
 
     /// The certificate_request_context is an opaque string that identifies
     /// the certificate request and is echoed in the client's Certificate message.
-    public let certificateRequestContext: Data
+    public let certificateRequestContext: [UInt8]
 
     /// Extensions in this message indicate parameters the server wants
     /// for the client's certificate (e.g., signature_algorithms).
@@ -31,7 +35,7 @@ public struct CertificateRequest: Sendable {
     ///   - certificateRequestContext: Context to be echoed by client (can be empty)
     ///   - extensions: Extensions specifying certificate requirements
     public init(
-        certificateRequestContext: Data = Data(),
+        certificateRequestContext: [UInt8] = [],
         extensions: [TLSExtension] = []
     ) {
         self.certificateRequestContext = certificateRequestContext
@@ -43,7 +47,7 @@ public struct CertificateRequest: Sendable {
     /// - Parameter certificateRequestContext: Context to be echoed by client
     /// - Returns: A CertificateRequest with standard signature algorithms
     public static func withDefaultSignatureAlgorithms(
-        certificateRequestContext: Data = Data()
+        certificateRequestContext: [UInt8] = []
     ) -> CertificateRequest {
         // RFC 8446: signature_algorithms extension is REQUIRED
         let signatureAlgorithms = SignatureAlgorithmsExtension(supportedSignatureAlgorithms: [
@@ -64,31 +68,31 @@ public struct CertificateRequest: Sendable {
     // MARK: - Encoding
 
     /// Encodes the CertificateRequest content (without handshake header)
-    public func encode() -> Data {
-        var data = Data()
+    public func encodeBytes() throws(TLSWireError) -> [UInt8] {
+        var data = [UInt8]()
 
         // certificate_request_context<0..2^8-1>
         data.append(UInt8(certificateRequestContext.count))
-        data.append(certificateRequestContext)
+        data.append(contentsOf: certificateRequestContext)
 
         // extensions<2..2^16-1>
-        var extensionsData = Data()
+        var extensionsData = [UInt8]()
         for ext in extensions {
-            extensionsData.append(ext.encode())
+            extensionsData.append(contentsOf: try ext.encodeBytes())
         }
 
         // Extensions length (2 bytes)
         data.append(UInt8((extensionsData.count >> 8) & 0xFF))
         data.append(UInt8(extensionsData.count & 0xFF))
-        data.append(extensionsData)
+        data.append(contentsOf: extensionsData)
 
         return data
     }
 
     /// Encodes the CertificateRequest as a complete handshake message
-    public func encodeAsHandshake() -> Data {
-        let content = encode()
-        return HandshakeCodec.encode(type: .certificateRequest, content: content)
+    public func encodeAsHandshakeBytes() throws(TLSWireError) -> [UInt8] {
+        let content = try encodeBytes()
+        return try HandshakeMessageCodec.encode(type: .certificateRequest, content: content)
     }
 
     // MARK: - Decoding
@@ -98,11 +102,11 @@ public struct CertificateRequest: Sendable {
     /// - Parameter data: The raw CertificateRequest content (without handshake header)
     /// - Returns: Decoded CertificateRequest
     /// - Throws: If decoding fails
-    public static func decode(from data: Data) throws -> CertificateRequest {
+    public static func decode(from data: [UInt8]) throws(TLSWireError) -> CertificateRequest {
         var offset = 0
 
         guard data.count >= 1 else {
-            throw TLSHandshakeError.decodeError("CertificateRequest too short")
+            throw TLSWireError.handshakeDecodeError("CertificateRequest too short")
         }
 
         // certificate_request_context<0..2^8-1>
@@ -110,25 +114,25 @@ public struct CertificateRequest: Sendable {
         offset += 1
 
         guard data.count >= offset + contextLength else {
-            throw TLSHandshakeError.decodeError("CertificateRequest context truncated")
+            throw TLSWireError.handshakeDecodeError("CertificateRequest context truncated")
         }
 
-        let context = Data(data[offset..<(offset + contextLength)])
+        let context = Array(data[offset..<(offset + contextLength)])
         offset += contextLength
 
         // extensions<2..2^16-1>
         guard data.count >= offset + 2 else {
-            throw TLSHandshakeError.decodeError("CertificateRequest extensions length truncated")
+            throw TLSWireError.handshakeDecodeError("CertificateRequest extensions length truncated")
         }
 
         let extensionsLength = Int(data[offset]) << 8 | Int(data[offset + 1])
         offset += 2
 
         guard data.count >= offset + extensionsLength else {
-            throw TLSHandshakeError.decodeError("CertificateRequest extensions truncated")
+            throw TLSWireError.handshakeDecodeError("CertificateRequest extensions truncated")
         }
 
-        let extensionsData = Data(data[offset..<(offset + extensionsLength)])
+        let extensionsData = Array(data[offset..<(offset + extensionsLength)])
         let extensions = try TLSExtension.decodeExtensions(from: extensionsData)
 
         return CertificateRequest(
