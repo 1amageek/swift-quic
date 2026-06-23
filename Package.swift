@@ -176,10 +176,20 @@ let package = Package(
 
         // The pure value-type connection state machines that are neither codec nor
         // crypto: currently the DPLPMTUD search core (RFC 8899 / RFC 9000 §14), a
-        // `struct` state machine over `Int`/`UInt64`. No Foundation/any/Mutex/
-        // ContinuousClock/Data. The QUICConnection adapter holds it under a Mutex.
+        // `struct` state machine over `Int`/`UInt64`; the transport-parameters codec
+        // core (RFC 9000 §18) with a Foundation-free IPv4/IPv6 parser for
+        // preferred_address; and the packet parse/serialize core (RFC 9000 §12/§17,
+        // RFC 9001 §5) over `[UInt8]`/`ByteReader` driving the cored
+        // `SuiteProtector<C>`. No Foundation/any/Mutex/ContinuousClock/inet_pton.
+        // The QUICConnection / QUICCore / QUICCrypto adapters hold these and bridge Data.
         .target(
             name: "QUICConnectionCore",
+            dependencies: [
+                "QUICCoreCodec",
+                "QUICPacketProtectionCore",
+                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+            ],
             path: "Sources/QUICConnectionCore",
             swiftSettings: coreSettings
         ),
@@ -190,6 +200,7 @@ let package = Package(
             name: "QUICCore",
             dependencies: [
                 "QUICCoreCodec",
+                "QUICConnectionCore",
                 .product(name: "P2PCoreFoundation", package: "swift-p2p-core"),
             ],
             path: "Sources/QUICCore"
@@ -201,6 +212,7 @@ let package = Package(
             name: "QUICCrypto",
             dependencies: [
                 "QUICCore",
+                "QUICConnectionCore",
                 "QUICPacketProtectionCore",
                 "QUICTLSCore",
                 .product(name: "Crypto", package: "swift-crypto"),
