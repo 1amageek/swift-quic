@@ -45,6 +45,11 @@ let package = Package(
             name: "QUICRecoveryCore",
             targets: ["QUICRecoveryCore"]
         ),
+        // Embedded-clean STREAM state machine (send/recv FSM + reassembly + flow control)
+        .library(
+            name: "QUICStreamCore",
+            targets: ["QUICStreamCore"]
+        ),
         // Core types (no I/O dependencies) — Foundation adapter over QUICCoreCodec
         .library(
             name: "QUICCore",
@@ -115,6 +120,22 @@ let package = Package(
             swiftSettings: coreSettings
         ),
 
+        // MARK: - Embedded-clean STREAM state machine (dual-build: host + Embedded)
+
+        // The value-type QUIC STREAM cores (RFC 9000 §2–4): SendStreamCore /
+        // ReceiveStreamCore FSMs, StreamReassemblyBuffer, and FlowControllerCore, over
+        // `[UInt8]` payloads. No Foundation/any/Mutex/ContinuousClock. The QUICStream
+        // adapter holds these under a Mutex and bridges Data.
+        .target(
+            name: "QUICStreamCore",
+            dependencies: [
+                "QUICCoreCodec",
+                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+            ],
+            path: "Sources/QUICStreamCore",
+            swiftSettings: coreSettings
+        ),
+
         // MARK: - Core Types (Foundation adapter over QUICCoreCodec)
 
         .target(
@@ -162,6 +183,7 @@ let package = Package(
             name: "QUICStream",
             dependencies: [
                 "QUICCore",
+                "QUICStreamCore",
             ],
             path: "Sources/QUICStream",
             exclude: ["CONTEXT.md"]

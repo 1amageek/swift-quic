@@ -1,99 +1,55 @@
 /// Data Stream (RFC 9000 Section 2-3)
 ///
-/// Manages a single QUIC stream with send/receive buffers and state tracking.
+/// `Data`-facing, `Mutex`-held host adapter over the Embedded-clean stream cores
+/// (`SendStreamCore` + `ReceiveStreamCore` in `QUICStreamCore`). The send/receive FSMs,
+/// reassembly buffer, offset / flow-control accounting, and STOP_SENDING / RESET_STREAM
+/// handling all live in those value-type cores over `[UInt8]`. This class owns
+/// synchronization (one `Mutex` over both cores plus the mutable priority), bridges
+/// `Data` to/from `[UInt8]`, and synthesizes the unified `StreamState` view, so the
+/// public API and observable behavior are unchanged.
+///
+/// Bidirectional streams have both send and receive sides. Unidirectional streams have
+/// only one side active.
 
 import Foundation
 import Synchronization
 import QUICCore
+import QUICStreamCore
 
-/// Error types for DataStream operations
-public enum StreamError: Error, Sendable {
-    /// Stream is in an invalid state for the operation
-    case invalidState(current: String, operation: String)
-    /// Flow control violation
-    case flowControlViolation(limit: UInt64, requested: UInt64)
-    /// Stream has been reset
-    case streamReset(errorCode: UInt64)
-    /// Cannot send on receive-only stream
-    case cannotSendOnReceiveOnlyStream
-    /// Cannot receive on send-only stream
-    case cannotReceiveOnSendOnlyStream
-    /// Data buffer error
-    case bufferError(DataBufferError)
-    /// Final size mismatch
-    case finalSizeMismatch(expected: UInt64, received: UInt64)
-    /// Stream ID mismatch (internal error)
-    case streamIDMismatch(expected: UInt64, received: UInt64)
-}
-
-/// Internal state for DataStream (protected by Mutex)
+/// Internal state for DataStream (protected by Mutex).
 private struct DataStreamInternalState: Sendable {
-    /// Stream state machine
-    var state: StreamState
+    /// Send-stream FSM core.
+    var send: SendStreamCore
 
-    /// Receive buffer (incoming data reassembly)
-    var recvBuffer: DataBuffer
+    /// Receive-stream FSM core.
+    var recv: ReceiveStreamCore
 
-    /// Send buffer (outgoing data queue)
-    var sendBuffer: Data
-
-    /// Bytes consumed from the front of sendBuffer (lazy compaction)
-    var sendBufferConsumed: Int
-
-    /// Offset of first unconsumed byte in the stream
-    var sendBufferOffset: UInt64
-
-    /// Whether FIN has been queued for sending
-    var finQueued: Bool
-
-    /// Whether we received STOP_SENDING from peer
-    var stopSendingReceived: Bool
-
-    /// Error code if STOP_SENDING received
-    var stopSendingErrorCode: UInt64?
-
-    /// Whether we sent RESET_STREAM
-    var resetStreamSent: Bool
-
-    /// Error code if we sent RESET_STREAM
-    var resetStreamErrorCode: UInt64?
-
-    /// Whether we received RESET_STREAM from peer
-    var resetStreamReceived: Bool
-
-    /// Error code if peer sent RESET_STREAM
-    var peerResetErrorCode: UInt64?
-
-    /// Stream priority for scheduling
+    /// Stream priority for scheduling.
     var priority: StreamPriority
 }
 
-/// A single QUIC stream with send/receive buffers
-///
-/// Bidirectional streams have both send and receive sides.
-/// Unidirectional streams have only one side active.
+/// A single QUIC stream with send/receive buffers.
 public final class DataStream: Sendable {
-    /// Maximum permitted stream final offset (RFC 9000 §4.5): the stream final offset
-    /// MUST stay within the QUIC varint range (2^62-1).
-    static let maxFinalOffset: UInt64 = (1 << 62) - 1
+    /// Maximum permitted stream final offset (RFC 9000 §4.5).
+    static let maxFinalOffset: UInt64 = SendStreamCore.maxFinalOffset
 
-    /// Stream identifier
+    /// Stream identifier.
     public let id: UInt64
 
-    /// Whether this is a locally-initiated stream
+    /// Whether this is a locally-initiated stream.
     public let isLocallyInitiated: Bool
 
-    /// Internal state protected by Mutex
+    /// Internal state protected by Mutex.
     private let _internal: Mutex<DataStreamInternalState>
 
-    /// Creates a new DataStream
+    /// Creates a new DataStream.
     /// - Parameters:
-    ///   - id: Stream identifier
-    ///   - isClient: Whether local endpoint is client
-    ///   - initialSendMaxData: Initial send flow control limit
-    ///   - initialRecvMaxData: Initial receive flow control limit
-    ///   - maxBufferSize: Maximum receive buffer size
-    ///   - priority: Initial stream priority (default: .default)
+    ///   - id: Stream identifier.
+    ///   - isClient: Whether local endpoint is client.
+    ///   - initialSendMaxData: Initial send flow control limit.
+    ///   - initialRecvMaxData: Initial receive flow control limit.
+    ///   - maxBufferSize: Maximum receive buffer size.
+    ///   - priority: Initial stream priority (default: .default).
     public init(
         id: UInt64,
         isClient: Bool,
@@ -104,41 +60,54 @@ public final class DataStream: Sendable {
     ) {
         self.id = id
 
-        // Determine if locally initiated
+        // Determine if locally initiated.
         let isClientInitiated = StreamID.isClientInitiated(id)
-        self.isLocallyInitiated = (isClient && isClientInitiated) || (!isClient && !isClientInitiated)
-
-        let state = StreamState(
-            id: id,
-            initialSendMaxData: initialSendMaxData,
-            initialRecvMaxData: initialRecvMaxData
-        )
+        let locallyInitiated = (isClient && isClientInitiated) || (!isClient && !isClientInitiated)
+        self.isLocallyInitiated = locallyInitiated
 
         self._internal = Mutex(DataStreamInternalState(
-            state: state,
-            recvBuffer: DataBuffer(maxBufferSize: maxBufferSize),
-            sendBuffer: Data(),
-            sendBufferConsumed: 0,
-            sendBufferOffset: 0,
-            finQueued: false,
-            stopSendingReceived: false,
-            stopSendingErrorCode: nil,
-            resetStreamSent: false,
-            resetStreamErrorCode: nil,
-            resetStreamReceived: false,
-            peerResetErrorCode: nil,
+            send: SendStreamCore(
+                id: id,
+                isLocallyInitiated: locallyInitiated,
+                initialSendMaxData: initialSendMaxData
+            ),
+            recv: ReceiveStreamCore(
+                id: id,
+                isLocallyInitiated: locallyInitiated,
+                initialRecvMaxData: initialRecvMaxData,
+                maxBufferSize: maxBufferSize
+            ),
             priority: priority
         ))
     }
 
     // MARK: - Stream Properties
 
-    /// Stream state machine
+    /// Stream state machine (unified send + receive view).
     public var state: StreamState {
-        _internal.withLock { $0.state }
+        _internal.withLock { Self.makeState($0) }
     }
 
-    /// Stream priority for scheduling (mutable)
+    /// Synthesizes the unified `StreamState` from the send and receive cores.
+    private static func makeState(_ s: DataStreamInternalState) -> StreamState {
+        var st = StreamState(
+            id: s.send.id,
+            initialSendMaxData: s.send.sendMaxData,
+            initialRecvMaxData: s.recv.recvMaxData
+        )
+        st.sendState = s.send.sendState
+        st.recvState = s.recv.recvState
+        st.sendOffset = s.send.sendOffset
+        st.recvOffset = s.recv.recvOffset
+        st.sendMaxData = s.send.sendMaxData
+        st.recvMaxData = s.recv.recvMaxData
+        st.finSent = s.send.finSent
+        st.finReceived = s.recv.finReceived
+        st.finalSize = s.recv.finalSize
+        return st
+    }
+
+    /// Stream priority for scheduling (mutable).
     ///
     /// Streams with lower urgency values are scheduled first.
     public var priority: StreamPriority {
@@ -146,47 +115,31 @@ public final class DataStream: Sendable {
         set { _internal.withLock { $0.priority = newValue } }
     }
 
-    /// Whether this stream is bidirectional
+    /// Whether this stream is bidirectional.
     public var isBidirectional: Bool {
         StreamID.isBidirectional(id)
     }
 
-    /// Whether this stream is unidirectional
+    /// Whether this stream is unidirectional.
     public var isUnidirectional: Bool {
         StreamID.isUnidirectional(id)
     }
 
-    /// Whether this stream can send data (based on type and initiator)
+    /// Whether this stream can send data (based on type and initiator).
     public var canSend: Bool {
-        _internal.withLock { `internal` in
-            // Bidirectional: both sides can send
-            // Unidirectional: only initiator can send
-            if StreamID.isBidirectional(id) {
-                return `internal`.state.canSend
-            } else {
-                return isLocallyInitiated && `internal`.state.canSend
-            }
-        }
+        _internal.withLock { $0.send.canSendOnStream }
     }
 
-    /// Whether this stream can receive data (based on type and initiator)
+    /// Whether this stream can receive data (based on type and initiator).
     public var canReceive: Bool {
-        _internal.withLock { `internal` in
-            // Bidirectional: both sides can receive
-            // Unidirectional: only non-initiator can receive
-            if StreamID.isBidirectional(id) {
-                return `internal`.state.canReceive
-            } else {
-                return !isLocallyInitiated && `internal`.state.canReceive
-            }
-        }
+        _internal.withLock { $0.recv.canReceiveOnStream }
     }
 
-    /// Whether the stream is fully closed
+    /// Whether the stream is fully closed.
     public var isClosed: Bool {
         _internal.withLock { `internal` in
-            let sendClosed = `internal`.state.sendState == .dataRecvd || `internal`.state.sendState == .resetRecvd
-            let recvClosed = `internal`.state.recvState == .dataRead || `internal`.state.recvState == .resetRead
+            let sendClosed = `internal`.send.isSendClosed
+            let recvClosed = `internal`.recv.isReceiveClosed
 
             if StreamID.isBidirectional(id) {
                 return sendClosed && recvClosed
@@ -198,451 +151,168 @@ public final class DataStream: Sendable {
         }
     }
 
-    /// Available send window
+    /// Available send window.
     public var sendWindow: UInt64 {
-        _internal.withLock { `internal` in
-            guard `internal`.state.sendMaxData > `internal`.state.sendOffset else { return 0 }
-            return `internal`.state.sendMaxData - `internal`.state.sendOffset
-        }
+        _internal.withLock { $0.send.sendWindow }
     }
 
-    /// Bytes pending to send
+    /// Bytes pending to send.
     public var pendingSendBytes: Int {
-        _internal.withLock { `internal` in
-            `internal`.sendBuffer.count - `internal`.sendBufferConsumed
-        }
+        _internal.withLock { $0.send.pendingSendBytes }
     }
 
-    /// Whether there's data to send
+    /// Whether there's data to send.
     public var hasDataToSend: Bool {
-        _internal.withLock { `internal` in
-            let pending = `internal`.sendBuffer.count - `internal`.sendBufferConsumed
-            return pending > 0 || (`internal`.finQueued && !`internal`.state.finSent)
-        }
+        _internal.withLock { $0.send.hasDataToSend }
     }
 
-    /// Whether there is data available to read
+    /// Whether there is data available to read.
     public var hasDataToRead: Bool {
-        _internal.withLock { $0.recvBuffer.contiguousBytesAvailable > 0 }
+        _internal.withLock { $0.recv.hasDataToRead }
     }
 
-    /// Bytes buffered for reading
+    /// Bytes buffered for reading.
     public var bufferedReadBytes: Int {
-        _internal.withLock { $0.recvBuffer.bufferedBytes }
+        _internal.withLock { $0.recv.bufferedReadBytes }
     }
 
-    /// Whether this stream needs to generate a RESET_STREAM (due to STOP_SENDING received)
+    /// Whether this stream needs to generate a RESET_STREAM (due to STOP_SENDING received).
     public var needsResetStream: Bool {
-        _internal.withLock { `internal` in
-            `internal`.stopSendingReceived && !`internal`.resetStreamSent
-        }
+        _internal.withLock { $0.send.needsResetStream }
     }
 
-    /// The error code received in STOP_SENDING (if any)
+    /// The error code received in STOP_SENDING (if any).
     public var stopSendingErrorCode: UInt64? {
-        _internal.withLock { `internal` in
-            `internal`.stopSendingReceived ? `internal`.stopSendingErrorCode : nil
-        }
+        _internal.withLock { $0.send.stopSendingErrorCode }
     }
 
     // MARK: - Receive Side
 
-    /// Process incoming STREAM frame
-    /// - Parameter frame: The received STREAM frame
-    /// - Throws: StreamError on validation failures
+    /// Process incoming STREAM frame.
+    /// - Parameter frame: The received STREAM frame.
+    /// - Throws: `StreamError` on validation failures.
     public func receive(_ frame: StreamFrame) throws {
         try _internal.withLock { `internal` in
-            guard frame.streamID == id else {
-                throw StreamError.streamIDMismatch(expected: id, received: frame.streamID)
-            }
-
-            // Check if we can receive on this stream
-            if StreamID.isUnidirectional(id) && isLocallyInitiated {
-                throw StreamError.cannotReceiveOnSendOnlyStream
-            }
-
-            // RFC 9000 §4.5: the final size of a stream is invariant once established,
-            // whether it was learned from a FIN-bearing STREAM frame or from RESET_STREAM.
-            // Reconcile a FIN-bearing frame against any already-known final size BEFORE the
-            // receive-state gate, so a FIN that contradicts a previously received
-            // RESET_STREAM (or earlier FIN) is reported as FINAL_SIZE_ERROR rather than a
-            // generic stream-state error. Use overflow-reporting arithmetic because the
-            // offset and length are attacker-controlled wire values.
-            let (computedEndOffset, endOffsetOverflow) =
-                frame.offset.addingReportingOverflow(UInt64(frame.data.count))
-            guard !endOffsetOverflow, computedEndOffset <= DataStream.maxFinalOffset else {
-                throw StreamError.bufferError(
-                    .finalOffsetOutOfRange(offset: frame.offset, length: UInt64(frame.data.count))
-                )
-            }
-            let endOffset = computedEndOffset
-
-            if frame.fin, let knownFinalSize = `internal`.state.finalSize {
-                guard endOffset == knownFinalSize else {
-                    throw StreamError.finalSizeMismatch(
-                        expected: knownFinalSize,
-                        received: endOffset
-                    )
-                }
-            }
-
-            guard `internal`.state.canReceive else {
-                throw StreamError.invalidState(
-                    current: String(describing: `internal`.state.recvState),
-                    operation: "receive"
-                )
-            }
-
-            // Check receive flow control
-            if endOffset > `internal`.state.recvMaxData {
-                throw StreamError.flowControlViolation(
-                    limit: `internal`.state.recvMaxData,
-                    requested: endOffset
-                )
-            }
-
-            // Insert into buffer
-            do {
-                try `internal`.recvBuffer.insert(offset: frame.offset, data: Data(frame.data), fin: frame.fin)
-            } catch let error as DataBufferError {
-                throw StreamError.bufferError(error)
-            }
-
-            // Update state for FIN
-            if frame.fin {
-                `internal`.state.finReceived = true
-                `internal`.state.finalSize = endOffset
-                `internal`.state.recvState = .sizeKnown
-            }
-
-            // Update receive offset tracking (highest byte received)
-            if endOffset > `internal`.state.recvOffset {
-                `internal`.state.recvOffset = endOffset
-            }
+            try `internal`.recv.receive(frame)
         }
     }
 
-    /// Read available contiguous data
-    /// - Returns: Data if available, nil otherwise
+    /// Read available contiguous data.
+    /// - Returns: Data if available, nil otherwise.
     public func read() -> Data? {
         _internal.withLock { `internal` in
-            let canRecv = StreamID.isBidirectional(id)
-                ? `internal`.state.canReceive
-                : (!isLocallyInitiated && `internal`.state.canReceive)
-
-            guard canRecv || `internal`.state.recvState == .sizeKnown || `internal`.state.recvState == .dataRecvd else {
-                return nil
-            }
-
-            let data = `internal`.recvBuffer.readAllContiguous()
-
-            // Update state if all data has been read
-            if `internal`.recvBuffer.isComplete && `internal`.state.finReceived {
-                `internal`.state.recvState = .dataRead
-            } else if data != nil && `internal`.state.recvState == .sizeKnown && `internal`.recvBuffer.isEmpty {
-                `internal`.state.recvState = .dataRecvd
-            }
-
-            return data
+            `internal`.recv.read().map { Data($0) }
         }
     }
 
-    /// Peek at available contiguous data without consuming
-    /// - Returns: Data if available, nil otherwise
+    /// Peek at available contiguous data without consuming.
+    /// - Returns: Data if available, nil otherwise.
     public func peek() -> Data? {
-        _internal.withLock { $0.recvBuffer.peekContiguous() }
+        _internal.withLock { `internal` in
+            `internal`.recv.peek().map { Data($0) }
+        }
     }
 
     // MARK: - Send Side
 
-    /// Queue data for sending
-    /// - Parameter data: Data to send
-    /// - Throws: StreamError if stream cannot send
+    /// Queue data for sending.
+    /// - Parameter data: Data to send.
+    /// - Throws: `StreamError` if stream cannot send.
     public func write(_ data: Data) throws {
         try _internal.withLock { `internal` in
-            // Check if we can send on this stream
-            if StreamID.isUnidirectional(id) && !isLocallyInitiated {
-                throw StreamError.cannotSendOnReceiveOnlyStream
-            }
-
-            guard `internal`.state.canSend else {
-                throw StreamError.invalidState(
-                    current: String(describing: `internal`.state.sendState),
-                    operation: "write"
-                )
-            }
-
-            if `internal`.stopSendingReceived {
-                throw StreamError.streamReset(errorCode: `internal`.stopSendingErrorCode ?? 0)
-            }
-
-            `internal`.sendBuffer.append(data)
-
-            // Transition to send state
-            if `internal`.state.sendState == .ready {
-                `internal`.state.sendState = .send
-            }
+            try `internal`.send.write([UInt8](data))
         }
     }
 
-    /// Mark stream as finished (queue FIN)
-    /// - Throws: StreamError if stream cannot send
+    /// Mark stream as finished (queue FIN).
+    /// - Throws: `StreamError` if stream cannot send.
     public func finish() throws {
         try _internal.withLock { `internal` in
-            if StreamID.isUnidirectional(id) && !isLocallyInitiated {
-                throw StreamError.cannotSendOnReceiveOnlyStream
-            }
-
-            guard `internal`.state.canSend else {
-                throw StreamError.invalidState(
-                    current: String(describing: `internal`.state.sendState),
-                    operation: "finish"
-                )
-            }
-
-            `internal`.finQueued = true
+            try `internal`.send.finish()
         }
     }
 
-    /// Generate STREAM frames up to maxBytes
-    /// - Parameter maxBytes: Maximum total bytes for frames
-    /// - Returns: Array of STREAM frames to send
+    /// Generate STREAM frames up to maxBytes.
+    /// - Parameter maxBytes: Maximum total bytes for frames.
+    /// - Returns: Array of STREAM frames to send.
     public func generateFrames(maxBytes: Int) -> [StreamFrame] {
         _internal.withLock { `internal` in
-            let pending = `internal`.sendBuffer.count - `internal`.sendBufferConsumed
-            guard pending > 0 || (`internal`.finQueued && !`internal`.state.finSent) else { return [] }
-
-            var frames: [StreamFrame] = []
-            var remainingBytes = maxBytes
-
-            // Minimum overhead: streamID (1-8) + offset (0-8) + length (1-2) = ~11 bytes typical
-            let minOverhead = 11
-
-            while remainingBytes > minOverhead {
-                let currentPending = `internal`.sendBuffer.count - `internal`.sendBufferConsumed
-
-                guard currentPending > 0 || (`internal`.finQueued && !`internal`.state.finSent) else { break }
-
-                // Calculate how much data we can send
-                let sendMaxData = `internal`.state.sendMaxData
-                let sendOffset = `internal`.state.sendOffset
-                let availableWindow = sendMaxData > sendOffset ? sendMaxData - sendOffset : 0
-                let dataInBuffer = UInt64(currentPending)
-                // Use saturating subtraction to prevent underflow if remainingBytes < minOverhead
-                let adjustedRemaining = SafeConversions.saturatingSubtract(remainingBytes, minOverhead)
-                let maxDataToSend = min(availableWindow, dataInBuffer, UInt64(adjustedRemaining))
-
-                let dataToSend: Data
-                let sendFin: Bool
-
-                if maxDataToSend > 0 {
-                    // Extract data using consume offset (O(1) slice operation)
-                    let startIndex = `internal`.sendBuffer.startIndex.advanced(by: `internal`.sendBufferConsumed)
-                    let endIndex = startIndex.advanced(by: Int(maxDataToSend))
-                    dataToSend = `internal`.sendBuffer[startIndex..<endIndex]
-                    `internal`.sendBufferConsumed += Int(maxDataToSend)
-                    let newPending = `internal`.sendBuffer.count - `internal`.sendBufferConsumed
-                    sendFin = `internal`.finQueued && newPending == 0
-                } else if `internal`.finQueued && !`internal`.state.finSent && currentPending == 0 {
-                    // Send FIN-only frame
-                    dataToSend = Data()
-                    sendFin = true
-                } else {
-                    break  // No window or data
-                }
-
-                let currentOffset = `internal`.sendBufferOffset
-                `internal`.sendBufferOffset += UInt64(dataToSend.count)
-
-                let frame = StreamFrame(
-                    streamID: id,
-                    offset: currentOffset,
-                    data: dataToSend,
-                    fin: sendFin,
-                    hasLength: true
-                )
-                frames.append(frame)
-
-                // Update state
-                `internal`.state.sendOffset = `internal`.sendBufferOffset
-                if sendFin {
-                    `internal`.state.finSent = true
-                    `internal`.state.sendState = .dataSent
-                }
-
-                // Safely subtract to track remaining bytes (saturate at 0)
-                remainingBytes = SafeConversions.saturatingSubtract(
-                    remainingBytes,
-                    minOverhead + dataToSend.count
-                )
-            }
-
-            // Compact buffer when consumed portion exceeds half the total size
-            // This amortizes the O(n) compaction cost
-            if `internal`.sendBufferConsumed > `internal`.sendBuffer.count / 2 && `internal`.sendBufferConsumed > 4096 {
-                `internal`.sendBuffer.removeFirst(`internal`.sendBufferConsumed)
-                `internal`.sendBufferConsumed = 0
-            }
-
-            return frames
+            `internal`.send.generateFrames(maxBytes: maxBytes)
         }
     }
 
     // MARK: - Flow Control Updates
 
-    /// Update send flow control limit (from MAX_STREAM_DATA)
-    /// - Parameter maxData: New maximum data limit
+    /// Update send flow control limit (from MAX_STREAM_DATA).
+    /// - Parameter maxData: New maximum data limit.
     public func updateSendMaxData(_ maxData: UInt64) {
         _internal.withLock { `internal` in
-            if maxData > `internal`.state.sendMaxData {
-                `internal`.state.sendMaxData = maxData
-            }
+            `internal`.send.updateSendMaxData(maxData)
         }
     }
 
-    /// Update receive flow control limit
-    /// - Parameter maxData: New maximum data limit
+    /// Update receive flow control limit.
+    /// - Parameter maxData: New maximum data limit.
     public func updateRecvMaxData(_ maxData: UInt64) {
         _internal.withLock { `internal` in
-            if maxData > `internal`.state.recvMaxData {
-                `internal`.state.recvMaxData = maxData
-            }
+            `internal`.recv.updateRecvMaxData(maxData)
         }
     }
 
     // MARK: - Stream Control Frames
 
-    /// Handle STOP_SENDING from peer
-    /// - Parameter errorCode: Application error code
+    /// Handle STOP_SENDING from peer.
+    /// - Parameter errorCode: Application error code.
     ///
-    /// RFC 9000 Section 3.5: An endpoint that receives a STOP_SENDING frame MUST send a RESET_STREAM frame.
-    /// This method sets the flag; RESET_STREAM is generated via generateResetStream().
+    /// RFC 9000 §3.5: an endpoint that receives STOP_SENDING MUST send RESET_STREAM.
+    /// This sets the flag; RESET_STREAM is generated via `generateResetStream`.
     public func handleStopSending(errorCode: UInt64) {
         _internal.withLock { `internal` in
-            `internal`.stopSendingReceived = true
-            `internal`.stopSendingErrorCode = errorCode
-
-            // Clear send buffer (we won't be sending this data)
-            `internal`.sendBuffer.removeAll()
-            `internal`.sendBufferConsumed = 0
-
-            // NOTE: Do NOT transition sendState here!
-            // The state transition happens when RESET_STREAM is actually generated via generateResetStream().
-            // This ensures the RESET_STREAM can be generated (canSend check passes).
+            `internal`.send.handleStopSending(errorCode: errorCode)
         }
     }
 
-    /// Handle RESET_STREAM from peer
+    /// Handle RESET_STREAM from peer.
     /// - Parameters:
-    ///   - errorCode: Application error code
-    ///   - finalSize: Final size of the stream
-    /// - Throws: StreamError if final size exceeds flow control limit or mismatches
+    ///   - errorCode: Application error code.
+    ///   - finalSize: Final size of the stream.
+    /// - Throws: `StreamError` if final size exceeds flow control limit or mismatches.
     public func handleResetStream(errorCode: UInt64, finalSize: UInt64) throws {
         try _internal.withLock { `internal` in
-            // RFC 9000 Section 4.5: Validate final size against flow control limit
-            if finalSize > `internal`.state.recvMaxData {
-                throw StreamError.flowControlViolation(
-                    limit: `internal`.state.recvMaxData,
-                    requested: finalSize
-                )
-            }
-
-            // Validate final size if already known
-            if let knownFinalSize = `internal`.state.finalSize {
-                guard finalSize == knownFinalSize else {
-                    throw StreamError.finalSizeMismatch(
-                        expected: knownFinalSize,
-                        received: finalSize
-                    )
-                }
-            }
-
-            `internal`.resetStreamReceived = true
-            `internal`.peerResetErrorCode = errorCode
-            `internal`.state.finalSize = finalSize
-
-            // Clear receive buffer
-            `internal`.recvBuffer.reset()
-
-            // Transition receive state
-            `internal`.state.recvState = .resetRecvd
+            try `internal`.recv.handleResetStream(errorCode: errorCode, finalSize: finalSize)
         }
     }
 
-    /// Generate RESET_STREAM frame if needed
-    /// - Parameter errorCode: Application error code
-    /// - Returns: RESET_STREAM frame to send
-    ///
-    /// RFC 9000 Section 3.5: RESET_STREAM can be generated when:
-    /// - Stream is in a send-capable state (canSend)
-    /// - Stream has sent all data (dataSent)
-    /// - Peer sent STOP_SENDING (stopSendingReceived) - MUST respond with RESET_STREAM
+    /// Generate RESET_STREAM frame if needed.
+    /// - Parameter errorCode: Application error code.
+    /// - Returns: RESET_STREAM frame to send, or nil.
     public func generateResetStream(errorCode: UInt64) -> ResetStreamFrame? {
         _internal.withLock { `internal` in
-            guard !`internal`.resetStreamSent else { return nil }
-
-            // Can generate RESET_STREAM if:
-            // - Stream can still send (canSend)
-            // - Stream has finished sending data (dataSent)
-            // - Peer requested we stop sending (stopSendingReceived)
-            let canGenerate = `internal`.state.canSend
-                || `internal`.state.sendState == .dataSent
-                || `internal`.stopSendingReceived
-            guard canGenerate else { return nil }
-
-            `internal`.resetStreamSent = true
-            `internal`.resetStreamErrorCode = errorCode
-
-            // Clear send buffer (may have been cleared by handleStopSending, but safe to repeat)
-            `internal`.sendBuffer.removeAll()
-            `internal`.sendBufferConsumed = 0
-
-            // Transition to resetSent state
-            `internal`.state.sendState = .resetSent
-
-            return ResetStreamFrame(
-                streamID: id,
-                applicationErrorCode: errorCode,
-                finalSize: `internal`.state.sendOffset
-            )
+            `internal`.send.generateResetStream(errorCode: errorCode)
         }
     }
 
-    /// Generate STOP_SENDING frame
-    /// - Parameter errorCode: Application error code
-    /// - Returns: STOP_SENDING frame to send
+    /// Generate STOP_SENDING frame.
+    /// - Parameter errorCode: Application error code.
+    /// - Returns: STOP_SENDING frame to send, or nil.
     public func generateStopSending(errorCode: UInt64) -> StopSendingFrame? {
         _internal.withLock { `internal` in
-            let canRecv = StreamID.isBidirectional(id)
-                ? `internal`.state.canReceive
-                : (!isLocallyInitiated && `internal`.state.canReceive)
-
-            guard canRecv else { return nil }
-
-            return StopSendingFrame(
-                streamID: id,
-                applicationErrorCode: errorCode
-            )
+            `internal`.recv.generateStopSending(errorCode: errorCode)
         }
     }
 
-    /// Acknowledge that peer received our data up to this offset
-    /// - Parameter offset: Acknowledged offset
+    /// Acknowledge that peer received our data up to this offset.
+    /// - Parameter offset: Acknowledged offset.
     public func acknowledgeData(upTo offset: UInt64) {
         _internal.withLock { `internal` in
-            // If all sent data is acknowledged and FIN was sent
-            if offset >= `internal`.state.sendOffset && `internal`.state.finSent {
-                `internal`.state.sendState = .dataRecvd
-            }
+            `internal`.send.acknowledgeData(upTo: offset)
         }
     }
 
-    /// Acknowledge that peer received our RESET_STREAM
+    /// Acknowledge that peer received our RESET_STREAM.
     public func acknowledgeReset() {
         _internal.withLock { `internal` in
-            if `internal`.resetStreamSent {
-                `internal`.state.sendState = .resetRecvd
-            }
+            `internal`.send.acknowledgeReset()
         }
     }
 }
