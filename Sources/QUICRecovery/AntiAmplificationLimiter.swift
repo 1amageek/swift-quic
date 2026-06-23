@@ -29,43 +29,21 @@
 
 import Foundation
 import Synchronization
+import QUICRecoveryCore
 
 /// Manages the anti-amplification limit for QUIC connections
 ///
 /// RFC 9000 Section 8.1: Address Validation during Connection Establishment
+///
+/// ## Caller-locked core
+///
+/// The RFC 9000 §8.1 byte accounting lives in the Embedded-clean value type
+/// `QUICRecoveryCore.AntiAmplificationCore`. This class is the host adapter: it keeps
+/// the `Mutex` and delegates every query/mutation to the core under the lock. Public
+/// API and observable behavior (including overflow saturation) are unchanged.
 public final class AntiAmplificationLimiter: Sendable {
 
-    private let state: Mutex<LimiterState>
-
-    private struct LimiterState: Sendable {
-        /// Total bytes received from peer
-        var bytesReceived: UInt64 = 0
-
-        /// Total bytes sent to peer
-        var bytesSent: UInt64 = 0
-
-        /// Amplification factor (RFC 9000 specifies 3)
-        let amplificationFactor: UInt64 = 3
-
-        /// Whether address validation is complete
-        var addressValidated: Bool = false
-
-        /// Whether this endpoint is a server (only servers are limited)
-        let isServer: Bool
-
-        /// Maximum bytes allowed to send based on received bytes
-        /// Uses saturating multiplication to prevent overflow (RFC 9000 Section 8.1 compliance)
-        var sendLimit: UInt64 {
-            let (result, overflow) = bytesReceived.multipliedReportingOverflow(by: amplificationFactor)
-            return overflow ? UInt64.max : result
-        }
-
-        /// Remaining bytes that can be sent
-        var remainingAllowance: UInt64 {
-            guard sendLimit > bytesSent else { return 0 }
-            return sendLimit - bytesSent
-        }
-    }
+    private let core: Mutex<AntiAmplificationCore>
 
     // MARK: - Initialization
 
@@ -74,7 +52,7 @@ public final class AntiAmplificationLimiter: Sendable {
     /// - Parameter isServer: Whether this endpoint is a server.
     ///   Only servers are subject to the amplification limit.
     public init(isServer: Bool) {
-        self.state = Mutex(LimiterState(isServer: isServer))
+        self.core = Mutex(AntiAmplificationCore(isServer: isServer))
     }
 
     // MARK: - Byte Tracking
@@ -85,22 +63,14 @@ public final class AntiAmplificationLimiter: Sendable {
     ///
     /// - Parameter bytes: Number of bytes received
     public func recordBytesReceived(_ bytes: UInt64) {
-        state.withLock { s in
-            // Saturating addition to prevent overflow
-            let (result, overflow) = s.bytesReceived.addingReportingOverflow(bytes)
-            s.bytesReceived = overflow ? UInt64.max : result
-        }
+        core.withLock { $0.recordBytesReceived(bytes) }
     }
 
     /// Records bytes sent to the peer
     ///
     /// - Parameter bytes: Number of bytes sent
     public func recordBytesSent(_ bytes: UInt64) {
-        state.withLock { s in
-            // Saturating addition to prevent overflow
-            let (result, overflow) = s.bytesSent.addingReportingOverflow(bytes)
-            s.bytesSent = overflow ? UInt64.max : result
-        }
+        core.withLock { $0.recordBytesSent(bytes) }
     }
 
     // MARK: - Limit Checking
@@ -110,33 +80,14 @@ public final class AntiAmplificationLimiter: Sendable {
     /// - Parameter bytes: Number of bytes to send
     /// - Returns: `true` if sending is allowed
     public func canSend(bytes: UInt64) -> Bool {
-        state.withLock { s in
-            // Clients are not subject to amplification limit
-            guard s.isServer else { return true }
-
-            // Once address is validated, no limit applies
-            guard !s.addressValidated else { return true }
-
-            // Check if within the amplification limit (with overflow protection)
-            let (total, overflow) = s.bytesSent.addingReportingOverflow(bytes)
-            if overflow { return false }
-            return total <= s.sendLimit
-        }
+        core.withLock { $0.canSend(bytes: bytes) }
     }
 
     /// Gets the maximum bytes that can be sent right now
     ///
     /// - Returns: Maximum bytes allowed, or `UInt64.max` if unlimited
     public func availableSendWindow() -> UInt64 {
-        state.withLock { s in
-            // Clients are not limited
-            guard s.isServer else { return UInt64.max }
-
-            // Once validated, no limit
-            guard !s.addressValidated else { return UInt64.max }
-
-            return s.remainingAllowance
-        }
+        core.withLock { $0.availableSendWindow() }
     }
 
     /// Whether the endpoint is currently blocked by the amplification limit
@@ -148,10 +99,7 @@ public final class AntiAmplificationLimiter: Sendable {
     /// When blocked, the server must wait for more data from the client
     /// to be able to send more.
     public var isBlocked: Bool {
-        state.withLock { s in
-            guard s.isServer && !s.addressValidated else { return false }
-            return s.remainingAllowance == 0
-        }
+        core.withLock { $0.isBlocked }
     }
 
     // MARK: - Address Validation
@@ -162,9 +110,7 @@ public final class AntiAmplificationLimiter: Sendable {
     /// - Server receives Handshake packet (client address validated)
     /// - Or when handshake is confirmed
     public func validateAddress() {
-        state.withLock { s in
-            s.addressValidated = true
-        }
+        core.withLock { $0.validateAddress() }
     }
 
     /// Marks the handshake as confirmed, lifting the amplification limit
@@ -176,25 +122,25 @@ public final class AntiAmplificationLimiter: Sendable {
 
     /// Whether the address has been validated
     public var isAddressValidated: Bool {
-        state.withLock { $0.addressValidated }
+        core.withLock { $0.addressValidated }
     }
 
     // MARK: - Statistics
 
     /// Total bytes received from peer
     public var bytesReceived: UInt64 {
-        state.withLock { $0.bytesReceived }
+        core.withLock { $0.bytesReceived }
     }
 
     /// Total bytes sent to peer
     public var bytesSent: UInt64 {
-        state.withLock { $0.bytesSent }
+        core.withLock { $0.bytesSent }
     }
 
     /// Current send limit (3x received bytes)
     public var sendLimit: UInt64 {
-        state.withLock { s in
-            s.addressValidated ? UInt64.max : s.sendLimit
+        core.withLock { c in
+            c.addressValidated ? UInt64.max : c.sendLimit
         }
     }
 }
@@ -203,14 +149,14 @@ public final class AntiAmplificationLimiter: Sendable {
 
 extension AntiAmplificationLimiter: CustomStringConvertible {
     public var description: String {
-        state.withLock { s in
-            if !s.isServer {
+        core.withLock { c in
+            if !c.isServer {
                 return "AntiAmplificationLimiter(client, unlimited)"
             }
-            if s.addressValidated {
+            if c.addressValidated {
                 return "AntiAmplificationLimiter(server, validated, unlimited)"
             }
-            return "AntiAmplificationLimiter(server, received=\(s.bytesReceived), sent=\(s.bytesSent), limit=\(s.sendLimit))"
+            return "AntiAmplificationLimiter(server, received=\(c.bytesReceived), sent=\(c.bytesSent), limit=\(c.sendLimit))"
         }
     }
 }
