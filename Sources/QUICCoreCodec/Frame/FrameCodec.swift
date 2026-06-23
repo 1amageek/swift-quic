@@ -333,8 +333,21 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         switch frameType {
         case 0x00:
             // PADDING - count consecutive padding bytes.
+            // PADDING frames coalesce to the end of the packet (RFC 9000 §19.1),
+            // so stop the run on end-of-input (peek fails) without swallowing it.
             var count = 1
-            while (try? reader.peekUInt8()) == 0x00 {
+            paddingRun: while true {
+                let next: UInt8
+                do {
+                    next = try reader.peekUInt8()
+                } catch {
+                    // End of input: the PADDING run reaches the packet end.
+                    break paddingRun
+                }
+                guard next == 0x00 else {
+                    // A non-PADDING byte begins the next frame.
+                    break paddingRun
+                }
                 do { _ = try reader.readUInt8() } catch { throw FrameCodecError.insufficientData }
                 count += 1
             }

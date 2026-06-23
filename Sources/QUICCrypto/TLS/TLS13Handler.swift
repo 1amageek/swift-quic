@@ -224,8 +224,15 @@ public final class TLS13Handler: TLS13Provider, Sendable {
         }
     }
 
+    /// Requests a QUIC 1-RTT key update (RFC 9001 §6.1).
+    ///
+    /// The next application traffic secrets are derived with the QUIC "quic ku"
+    /// label via ``KeySchedule/nextApplicationTrafficSecret(from:)`` — the single
+    /// source of truth shared with the live key-phase rotation
+    /// (`KeySchedule.updateKeys()`). This deliberately does NOT use the
+    /// TLS-over-TCP "traffic upd" label of RFC 8446 §7.2, which would be wrong for
+    /// QUIC and would diverge from the live rotation path.
     public func requestKeyUpdate() async throws -> [TLSOutput] {
-        // Key update implementation (RFC 9001 Section 6 for QUIC)
         return try state.withLock { state in
             guard state.handshakeComplete else {
                 throw TLSError.unexpectedMessage("Cannot request key update before handshake complete")
@@ -236,11 +243,11 @@ public final class TLS13Handler: TLS13Provider, Sendable {
                 throw TLSError.internalError("Application secrets not available for key update")
             }
 
-            // Derive next application traffic secrets
-            let nextClientSecret = state.keySchedule.nextApplicationSecret(
+            // Derive next application traffic secrets (RFC 9001 §6.1, "quic ku").
+            let nextClientSecret = try KeySchedule.nextApplicationTrafficSecret(
                 from: currentClientSecret
             )
-            let nextServerSecret = state.keySchedule.nextApplicationSecret(
+            let nextServerSecret = try KeySchedule.nextApplicationTrafficSecret(
                 from: currentServerSecret
             )
 

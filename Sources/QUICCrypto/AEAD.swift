@@ -68,7 +68,11 @@ extension PacketProtectionError {
             switch cryptoError {
             case .invalidLength(let expected, let actual):
                 return .invalidIVLength(expected: expected, actual: actual)
-            case .authenticationFailure, .providerFailure, .unsupportedParameter,
+            case .authenticationFailure:
+                // AEAD authentication tag verification failed: this is an
+                // AEAD-open failure, not a header-protection failure.
+                return .aeadFailed
+            case .providerFailure, .unsupportedParameter,
                  .keyAgreementFailure, .invalidSignature:
                 return .headerProtectionFailed
             }

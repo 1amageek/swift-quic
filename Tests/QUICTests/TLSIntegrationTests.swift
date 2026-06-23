@@ -6,6 +6,7 @@
 import Testing
 import Foundation
 import Synchronization
+import Crypto
 @testable import QUIC
 @testable import QUICCore
 @testable import QUICCrypto
@@ -472,6 +473,80 @@ struct TLSIntegrationTests {
 
         // Verify key phase toggled back
         #expect(clientTLS.keyPhase == 0)
+    }
+
+    // MARK: - QUIC Key-Update Label Regression (RFC 9001 §6.1)
+
+    /// Raw bytes of a `SymmetricKey` (test-only helper).
+    private static func keyBytes(_ key: SymmetricKey) -> [UInt8] {
+        key.withUnsafeBytes { [UInt8]($0) }
+    }
+
+    /// Computes `HKDF-Expand-Label(secret, "quic ku", "", 32)` independently of
+    /// production code, building the TLS 1.3 HkdfLabel structure (RFC 8446 §7.1)
+    /// with the QUIC "quic ku" label (RFC 9001 §6.1). This is the known-answer
+    /// reference the production derivation must match.
+    private static func referenceQuicKeyUpdate(secret: SymmetricKey) -> [UInt8] {
+        let length = 32
+        let fullLabel = Array("tls13 quic ku".utf8)
+        var info: [UInt8] = []
+        info.append(UInt8(length >> 8))
+        info.append(UInt8(length & 0xFF))
+        info.append(UInt8(fullLabel.count))
+        info.append(contentsOf: fullLabel)
+        info.append(0) // empty context
+        let output = HKDF<SHA256>.expand(
+            pseudoRandomKey: secret,
+            info: info,
+            outputByteCount: length
+        )
+        return output.withUnsafeBytes { [UInt8]($0) }
+    }
+
+    /// Pins the QUIC key-update secret derivation to RFC 9001 §6.1 ("quic ku"),
+    /// NOT the TLS-over-TCP "traffic upd" label of RFC 8446 §7.2.
+    ///
+    /// Asserts:
+    /// 1. `KeySchedule.nextApplicationTrafficSecret` equals the independent
+    ///    "quic ku" known-answer reference, AND differs from a "traffic upd"
+    ///    derivation (catching a regression to the wrong label).
+    /// 2. The live `KeySchedule.updateKeys()` rotation derives the same next
+    ///    secret as `nextApplicationTrafficSecret` (single source of truth — the
+    ///    paths cannot drift).
+    @Test("QUIC key update uses 'quic ku' label (RFC 9001 §6.1)")
+    func quicKeyUpdateUsesQuicKuLabel() throws {
+        let secret = SymmetricKey(data: Data(repeating: 0x42, count: 32))
+
+        // (1a) Canonical derivation == independent "quic ku" known-answer.
+        let next = try KeySchedule.nextApplicationTrafficSecret(from: secret)
+        let reference = Self.referenceQuicKeyUpdate(secret: secret)
+        #expect(Self.keyBytes(next) == reference,
+                "Key update must use HKDF-Expand-Label(secret, \"quic ku\", \"\", 32)")
+
+        // (1b) The wrong "traffic upd" label must NOT match — guards the fix.
+        let wrongTrafficUpd: [UInt8] = {
+            let length = 32
+            let fullLabel = Array("tls13 traffic upd".utf8)
+            var info: [UInt8] = []
+            info.append(UInt8(length >> 8))
+            info.append(UInt8(length & 0xFF))
+            info.append(UInt8(fullLabel.count))
+            info.append(contentsOf: fullLabel)
+            info.append(0)
+            let output = HKDF<SHA256>.expand(
+                pseudoRandomKey: secret, info: info, outputByteCount: length)
+            return output.withUnsafeBytes { [UInt8]($0) }
+        }()
+        #expect(Self.keyBytes(next) != wrongTrafficUpd,
+                "Key update must NOT use the TLS 'traffic upd' label")
+
+        // (2) Live key-phase rotation derives the byte-identical next secret.
+        var schedule = KeySchedule()
+        _ = try schedule.setApplicationSecrets(clientSecret: secret, serverSecret: secret)
+        _ = try schedule.updateKeys()
+        let rotatedClientSecret = try #require(schedule.clientSecret(for: .application))
+        #expect(Self.keyBytes(rotatedClientSecret) == reference,
+                "updateKeys() must derive the same next secret as nextApplicationTrafficSecret")
     }
 }
 

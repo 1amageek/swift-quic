@@ -130,6 +130,30 @@ public struct KeySchedule: Sendable {
 
     // MARK: - Key Update (RFC 9001 Section 6)
 
+    /// Derives the next-generation 1-RTT application traffic secret (RFC 9001 §6.1).
+    ///
+    /// `secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length)`
+    ///
+    /// This is the single source of truth for QUIC key-update secret derivation:
+    /// both ``updateKeys()`` (the live key-phase rotation) and
+    /// `TLS13Handler.requestKeyUpdate()` route through it so the two paths cannot
+    /// drift. Note the QUIC "quic ku" label, NOT the TLS-over-TCP "traffic upd"
+    /// label of RFC 8446 §7.2.
+    ///
+    /// - Parameter currentSecret: The current application traffic secret.
+    /// - Returns: The next-generation application traffic secret (32 bytes).
+    public static func nextApplicationTrafficSecret(
+        from currentSecret: SymmetricKey
+    ) throws -> SymmetricKey {
+        let data = try hkdfExpandLabel(
+            secret: currentSecret,
+            label: "quic ku",
+            context: Data(),
+            length: 32
+        )
+        return SymmetricKey(data: data)
+    }
+
     /// Performs a key update for 1-RTT keys
     ///
     /// Key update derives new secrets using "quic ku" label:
@@ -144,22 +168,10 @@ public struct KeySchedule: Sendable {
             throw KeyScheduleError.applicationSecretsNotSet
         }
 
-        // Derive new secrets using "quic ku" label
-        let newClientSecretData = try hkdfExpandLabel(
-            secret: clientAppSecret,
-            label: "quic ku",
-            context: Data(),
-            length: 32
-        )
-        let newServerSecretData = try hkdfExpandLabel(
-            secret: serverAppSecret,
-            label: "quic ku",
-            context: Data(),
-            length: 32
-        )
-
-        let newClientSecret = SymmetricKey(data: newClientSecretData)
-        let newServerSecret = SymmetricKey(data: newServerSecretData)
+        // Derive new secrets using the canonical "quic ku" derivation
+        // (single source of truth shared with TLS13Handler.requestKeyUpdate()).
+        let newClientSecret = try Self.nextApplicationTrafficSecret(from: clientAppSecret)
+        let newServerSecret = try Self.nextApplicationTrafficSecret(from: serverAppSecret)
 
         // Update stored secrets
         clientSecrets[.application] = newClientSecret
