@@ -70,6 +70,17 @@ public struct TLSKeySchedule: Sendable {
         self.core = TLSKeyScheduleCore(cipherSuite: cipherSuite.coreCipherSuite)
     }
 
+    /// The underlying Embedded-clean key-schedule core.
+    ///
+    /// Exposed so the QUICCrypto adapter can hand the running key-schedule state
+    /// (already at the handshake-secret stage) to the Embedded-clean handshake FSM
+    /// (`QUICClientAuthMachine`) and read it back after the FSM derives the
+    /// application/exporter/resumption secrets. The core is a value type.
+    var coreValue: TLSKeyScheduleCore<QUICFoundationProvider> {
+        get { core }
+        set { core = newValue }
+    }
+
     // MARK: - Early Secret
 
     /// Derive early secret from PSK (or use 0 for non-PSK mode)

@@ -224,6 +224,17 @@ public enum VerificationKey: Sendable {
         }
     }
 
+    /// The raw public-key bytes (x963 uncompressed point for the NIST curves, raw
+    /// for Ed25519). This is the exact encoding the ``TLSSignatureVerifier`` crypto
+    /// seam consumes via `verifyingKey(rawRepresentation:)`.
+    public var publicKeyBytes: Data {
+        switch self {
+        case .p256(let key): return Data(key.x963Representation)
+        case .p384(let key): return Data(key.x963Representation)
+        case .ed25519(let key): return Data(key.rawRepresentation)
+        }
+    }
+
     /// Verify a signature
     public func verify(signature: Data, for data: Data) throws -> Bool {
         switch self {

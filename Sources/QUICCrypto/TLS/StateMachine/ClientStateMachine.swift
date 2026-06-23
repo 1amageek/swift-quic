@@ -19,6 +19,13 @@ public final class ClientStateMachine: Sendable {
         var handshakeState: ClientHandshakeState = .start
         var context: HandshakeContext = HandshakeContext()
         var configuration: TLSConfiguration = TLSConfiguration()
+
+        /// The Embedded-clean post-ServerHello auth FSM, constructed once ServerHello
+        /// has been processed. It owns the running transcript + key schedule by value
+        /// and encodes the CertificateVerify / Finished auth invariants. The adapter
+        /// parses wire bytes, performs X.509, and converts the FSM's returned secrets
+        /// into per-encryption-level `TLSOutput`s.
+        var authMachine: QUICClientAuthMachine<QUICFoundationProvider>?
     }
 
     // MARK: - Initialization
@@ -345,6 +352,19 @@ public final class ClientStateMachine: Sendable {
             state.context.clientHandshakeSecret = clientSecret
             state.context.serverHandshakeSecret = serverSecret
 
+            // Hand the running transcript (CH..SH folded) + key schedule (at the
+            // handshake-secret stage) to the Embedded-clean post-ServerHello auth FSM,
+            // which now owns transcript folding, CertificateVerify/Finished
+            // verification, and the application/exporter/resumption derivations.
+            state.authMachine = QUICClientAuthMachine<QUICFoundationProvider>(
+                transcript: state.context.transcriptHash.coreValue,
+                keySchedule: state.context.keySchedule.coreValue,
+                cipherSuite: serverHello.cipherSuite.coreCipherSuite,
+                clientHandshakeSecret: clientSecret.bytes,
+                serverHandshakeSecret: serverSecret.bytes,
+                pskUsed: pskAccepted
+            )
+
             // Transition state
             state.handshakeState = .waitEncryptedExtensions
 
@@ -523,17 +543,21 @@ public final class ClientStateMachine: Sendable {
                 // and retransmit in 1-RTT (handled at QUIC layer)
             }
 
-            // Update transcript
-            let message = HandshakeCodec.encode(type: .encryptedExtensions, content: data)
-            state.context.transcriptHash.update(with: message)
-
-            // Transition state - skip Certificate/CertificateVerify if PSK was used
-            if state.context.pskUsed {
-                state.handshakeState = .waitFinished
-            } else {
-                // Server may send CertificateRequest before Certificate (for mTLS)
-                state.handshakeState = .waitCertificateOrCertificateRequest
+            // Fold EncryptedExtensions + transition via the Embedded-clean auth FSM,
+            // which now owns the transcript past ServerHello.
+            guard var authMachine = state.authMachine else {
+                throw TLSHandshakeError.internalError("Auth FSM not initialized")
             }
+            let message = HandshakeCodec.encode(type: .encryptedExtensions, content: data)
+            do {
+                try authMachine.ingestEncryptedExtensions(rawMessageBytes: [UInt8](message))
+            } catch let authError as TLSClientAuthError {
+                throw TLSHandshakeError.from(authError)
+            }
+            state.authMachine = authMachine
+
+            // Mirror the FSM's transition onto the adapter's observable state.
+            state.handshakeState = authMachine.state.clientHandshakeState
 
             return []
         }
@@ -560,12 +584,20 @@ public final class ClientStateMachine: Sendable {
             state.context.certificateRequestContext = certRequest.certificateRequestContextData
             state.context.clientCertificateRequested = true
 
-            // Update transcript
+            // Fold CertificateRequest + transition via the auth FSM.
+            guard var authMachine = state.authMachine else {
+                throw TLSHandshakeError.internalError("Auth FSM not initialized")
+            }
             let message = HandshakeCodec.encode(type: .certificateRequest, content: data)
-            state.context.transcriptHash.update(with: message)
+            do {
+                try authMachine.ingestCertificateRequest(rawMessageBytes: [UInt8](message))
+            } catch let authError as TLSClientAuthError {
+                throw TLSHandshakeError.from(authError)
+            }
+            state.authMachine = authMachine
 
             // Continue to wait for server's Certificate
-            state.handshakeState = .waitCertificate
+            state.handshakeState = authMachine.state.clientHandshakeState
 
             return []
         }
@@ -646,12 +678,25 @@ public final class ClientStateMachine: Sendable {
                 }
             }
 
-            // Update transcript
+            // Fold Certificate + transition via the auth FSM. The FSM records
+            // whether a (non-empty) certificate was presented to drive the
+            // fail-closed CertificateVerify branch.
+            guard var authMachine = state.authMachine else {
+                throw TLSHandshakeError.internalError("Auth FSM not initialized")
+            }
             let message = HandshakeCodec.encode(type: .certificate, content: data)
-            state.context.transcriptHash.update(with: message)
+            do {
+                try authMachine.ingestServerCertificate(
+                    certificatePresented: !certificate.isEmpty,
+                    rawMessageBytes: [UInt8](message)
+                )
+            } catch let authError as TLSClientAuthError {
+                throw TLSHandshakeError.from(authError)
+            }
+            state.authMachine = authMachine
 
             // Transition state
-            state.handshakeState = .waitCertificateVerify
+            state.handshakeState = authMachine.state.clientHandshakeState
 
             return []
         }
@@ -670,58 +715,50 @@ public final class ClientStateMachine: Sendable {
 
             let certificateVerify = try CertificateVerify.decode(from: data)
 
-            // Get the transcript hash up to (but not including) CertificateVerify
-            let transcriptHash = state.context.transcriptHash.currentHash()
-
-            // Construct the content that was signed
-            let signedContent = TLSSignature.certificateVerifyContent(
-                transcriptHash: transcriptHash,
-                isServer: true
-            )
-
-            // Determine which verification key to use
-            let verificationKey: VerificationKey?
-
+            // Resolve the peer public-key bytes (X.509 stays adapter-side): either the
+            // explicitly configured key, or the one extracted from the certificate.
+            // The CertificateVerify proof-of-possession signature is then verified
+            // inside the Embedded-clean auth FSM, fail-closed and independent of
+            // `verifyPeer`.
+            let peerPublicKey: QUICClientAuthMachine<QUICFoundationProvider>.PeerPublicKey?
             if let expectedPublicKey = state.configuration.expectedPeerPublicKey {
-                // Use explicitly configured public key
-                verificationKey = try VerificationKey(
+                // The configured raw public key must be importable under the
+                // CertificateVerify algorithm; surface a scheme mismatch loudly.
+                let verificationKey = try VerificationKey(
                     publicKeyBytes: expectedPublicKey,
                     scheme: certificateVerify.algorithm
                 )
-            } else if let extractedKey = state.context.peerVerificationKey {
-                // Use public key extracted from certificate
-                verificationKey = extractedKey
-            } else {
-                verificationKey = nil
-            }
-
-            // Verify signature if we have a verification key
-            if let key = verificationKey {
-                // Verify the signature scheme matches the key type
-                guard key.scheme == certificateVerify.algorithm else {
-                    throw TLSHandshakeError.signatureVerificationFailed
-                }
-
-                // Verify the signature
-                let isValid = try key.verify(
-                    signature: certificateVerify.signatureData,
-                    for: signedContent
+                peerPublicKey = .init(
+                    bytes: [UInt8](verificationKey.publicKeyBytes),
+                    scheme: verificationKey.scheme
                 )
-
-                guard isValid else {
-                    throw TLSHandshakeError.signatureVerificationFailed
-                }
-            } else if (state.context.peerCertificates?.isEmpty == false)
-                        || state.configuration.verifyPeer {
-                // A certificate (or CertificateVerify) was presented but no key is
-                // available to verify possession. Fail closed — proof of possession is
-                // mandatory whenever the peer authenticates, independent of `verifyPeer`.
-                throw TLSHandshakeError.certificateVerificationFailed("No public key available to verify CertificateVerify")
+            } else if let extractedKey = state.context.peerVerificationKey {
+                peerPublicKey = .init(
+                    bytes: [UInt8](extractedKey.publicKeyBytes),
+                    scheme: extractedKey.scheme
+                )
+            } else {
+                peerPublicKey = nil
             }
 
-            // Update transcript
+            // Verify (fail-closed) + fold via the auth FSM. The FSM holds the live
+            // transcript (CH..Certificate), so the signed content is byte-identical.
+            guard var authMachine = state.authMachine else {
+                throw TLSHandshakeError.internalError("Auth FSM not initialized")
+            }
             let message = HandshakeCodec.encode(type: .certificateVerify, content: data)
-            state.context.transcriptHash.update(with: message)
+            do {
+                try authMachine.ingestServerCertificateVerify(
+                    algorithm: certificateVerify.algorithm,
+                    signature: certificateVerify.signature,
+                    peerPublicKey: peerPublicKey,
+                    verifyPeer: state.configuration.verifyPeer,
+                    rawMessageBytes: [UInt8](message)
+                )
+            } catch let authError as TLSClientAuthError {
+                throw TLSHandshakeError.from(authError)
+            }
+            state.authMachine = authMachine
 
             // Call custom certificate validator if configured
             // This is where libp2p validates the libp2p extension and extracts PeerID
@@ -732,7 +769,7 @@ public final class ClientStateMachine: Sendable {
             }
 
             // Transition state
-            state.handshakeState = .waitFinished
+            state.handshakeState = authMachine.state.clientHandshakeState
 
             return []
         }
@@ -757,44 +794,31 @@ public final class ClientStateMachine: Sendable {
 
             let serverFinished = try Finished.decode(from: data)
 
-            // Verify server Finished
-            guard let serverHandshakeSecret = state.context.serverHandshakeSecret else {
-                throw TLSHandshakeError.internalError("Missing server handshake secret")
+            guard var authMachine = state.authMachine else {
+                throw TLSHandshakeError.internalError("Auth FSM not initialized")
             }
 
-            let serverFinishedKey = state.context.keySchedule.finishedKey(from: serverHandshakeSecret)
-            let transcriptHash = state.context.transcriptHash.currentHash()
-            let expectedVerifyData = state.context.keySchedule.finishedVerifyData(
-                forKey: serverFinishedKey,
-                transcriptHash: transcriptHash
-            )
-
-            guard serverFinished.verify(expected: expectedVerifyData) else {
-                throw TLSHandshakeError.finishedVerificationFailed
+            // Verify the server Finished MAC (constant-time), fold it, and derive the
+            // application + exporter secrets — all inside the Embedded-clean auth FSM.
+            let postFinished: QUICClientAuthMachine<QUICFoundationProvider>.PostFinishedSecrets
+            do {
+                postFinished = try authMachine.ingestServerFinished(
+                    verifyData: serverFinished.verifyData)
+            } catch let authError as TLSClientAuthError {
+                throw TLSHandshakeError.from(authError)
             }
 
-            // Update transcript with server Finished
-            let serverFinishedMessage = HandshakeCodec.encode(type: .finished, content: data)
-            state.context.transcriptHash.update(with: serverFinishedMessage)
-
-            // Derive application secrets
-            let appTranscriptHash = state.context.transcriptHash.currentHash()
-            let (clientAppSecret, serverAppSecret) = try state.context.keySchedule.deriveApplicationSecrets(
-                transcriptHash: appTranscriptHash
-            )
-
+            let clientAppSecret = SymmetricKey(data: postFinished.clientApplicationSecret)
+            let serverAppSecret = SymmetricKey(data: postFinished.serverApplicationSecret)
             state.context.clientApplicationSecret = clientAppSecret
             state.context.serverApplicationSecret = serverAppSecret
-
-            // Derive exporter master secret
-            let exporterMasterSecret = try state.context.keySchedule.deriveExporterMasterSecret(
-                transcriptHash: appTranscriptHash
-            )
-            state.context.exporterMasterSecret = exporterMasterSecret
+            state.context.exporterMasterSecret = SymmetricKey(data: postFinished.exporterMasterSecret)
 
             // === Client Certificate and CertificateVerify (for mutual TLS) ===
             // RFC 8446 Section 4.4: If server sent CertificateRequest, client responds
-            // with Certificate and CertificateVerify BEFORE Finished.
+            // with Certificate and CertificateVerify BEFORE Finished. The adapter
+            // builds + signs these (X.509 / signing-key stays adapter-side); the FSM
+            // folds the bytes so the transcript stays correct.
             var clientCertMessages: [Data] = []
 
             if state.context.clientCertificateRequested {
@@ -809,14 +833,17 @@ public final class ClientStateMachine: Sendable {
                         certificates: certChain
                     )
                     let certMessage = certificate.encodeAsHandshake()
-                    state.context.transcriptHash.update(with: certMessage)
+                    do {
+                        try authMachine.foldClientCertificate(rawMessageBytes: [UInt8](certMessage))
+                    } catch let authError as TLSClientAuthError {
+                        throw TLSHandshakeError.from(authError)
+                    }
                     clientCertMessages.append(certMessage)
 
-                    // Send CertificateVerify
-                    // Sign transcript up to (not including) CertificateVerify
-                    let transcriptForCV = state.context.transcriptHash.currentHash()
+                    // Send CertificateVerify — sign the transcript (CH..client-Cert)
+                    // the FSM exposes (signing-key path is adapter-side).
                     let signatureContent = TLSSignature.certificateVerifyContent(
-                        transcriptHash: transcriptForCV,
+                        transcriptHash: Data(authMachine.clientCertificateVerifyTranscript),
                         isServer: false  // This is CLIENT's CertificateVerify
                     )
 
@@ -826,7 +853,11 @@ public final class ClientStateMachine: Sendable {
                         signature: signature
                     )
                     let cvMessage = certificateVerify.encodeAsHandshake()
-                    state.context.transcriptHash.update(with: cvMessage)
+                    do {
+                        try authMachine.foldClientCertificateVerify(rawMessageBytes: [UInt8](cvMessage))
+                    } catch let authError as TLSClientAuthError {
+                        throw TLSHandshakeError.from(authError)
+                    }
                     clientCertMessages.append(cvMessage)
                 } else {
                     // Client has no certificate material - send empty Certificate
@@ -836,43 +867,41 @@ public final class ClientStateMachine: Sendable {
                         certificates: []
                     )
                     let certMessage = emptyCertificate.encodeAsHandshake()
-                    state.context.transcriptHash.update(with: certMessage)
+                    do {
+                        try authMachine.foldClientCertificate(rawMessageBytes: [UInt8](certMessage))
+                    } catch let authError as TLSClientAuthError {
+                        throw TLSHandshakeError.from(authError)
+                    }
                     clientCertMessages.append(certMessage)
                     // No CertificateVerify for empty certificate
                 }
             }
 
-            // Generate client Finished
-            guard let clientHandshakeSecret = state.context.clientHandshakeSecret else {
-                throw TLSHandshakeError.internalError("Missing client handshake secret")
+            // Generate client Finished + derive the resumption master secret inside
+            // the FSM, which transitions to `.connected`.
+            let clientFinishedMessage: Data
+            do {
+                clientFinishedMessage = Data(try authMachine.produceClientFinished())
+            } catch let authError as TLSClientAuthError {
+                throw TLSHandshakeError.from(authError)
             }
-
-            let clientFinishedKey = state.context.keySchedule.finishedKey(from: clientHandshakeSecret)
-            let clientFinishedTranscript = state.context.transcriptHash.currentHash()
-            let clientVerifyData = state.context.keySchedule.finishedVerifyData(
-                forKey: clientFinishedKey,
-                transcriptHash: clientFinishedTranscript
-            )
-
-            let clientFinished = Finished(verifyData: clientVerifyData)
-            let clientFinishedMessage = clientFinished.encodeAsHandshake()
+            if let resumption = authMachine.resumptionMasterSecret {
+                state.context.resumptionMasterSecret = SymmetricKey(data: resumption)
+            }
 
             // Combine all client messages: [Certificate, CertificateVerify], Finished
             let allClientMessages = clientCertMessages + [clientFinishedMessage]
             let combinedClientMessage = allClientMessages.reduce(Data()) { $0 + $1 }
 
-            // Update transcript with client Finished
-            state.context.transcriptHash.update(with: clientFinishedMessage)
-
-            // Derive resumption master secret (for session tickets)
-            let resumptionTranscriptHash = state.context.transcriptHash.currentHash()
-            let resumptionMasterSecret = try state.context.keySchedule.deriveResumptionMasterSecret(
-                transcriptHash: resumptionTranscriptHash
-            )
-            state.context.resumptionMasterSecret = resumptionMasterSecret
+            // Sync the FSM's transcript + key schedule back onto the context so the
+            // post-handshake paths (NewSessionTicket / key update) observe the
+            // completed state.
+            state.context.transcriptHash.coreValue = authMachine.currentTranscript
+            state.context.keySchedule.coreValue = authMachine.currentKeySchedule
+            state.authMachine = authMachine
 
             // Transition state
-            state.handshakeState = .connected
+            state.handshakeState = authMachine.state.clientHandshakeState
 
             var outputs: [TLSOutput] = []
 
@@ -1006,5 +1035,65 @@ public final class ClientStateMachine: Sendable {
     /// after successful certificate validation (e.g., PeerID for libp2p).
     public var validatedPeerInfo: (any Sendable)? {
         state.withLock { $0.context.validatedPeerInfo }
+    }
+}
+
+// MARK: - SymmetricKey bytes helper
+
+extension SymmetricKey {
+    /// The raw key bytes (host-only bridge for the `[UInt8]`-based auth FSM core).
+    fileprivate var bytes: [UInt8] {
+        withUnsafeBytes { [UInt8]($0) }
+    }
+}
+
+// MARK: - Auth FSM state ↔ adapter state bridge
+
+extension QUICClientAuthMachine<QUICFoundationProvider>.AuthState {
+    /// The adapter's observable `ClientHandshakeState` mirroring this FSM state, so
+    /// existing accessors and tests see identical states.
+    var clientHandshakeState: ClientHandshakeState {
+        switch self {
+        case .waitEncryptedExtensions: return .waitEncryptedExtensions
+        case .waitCertificateOrCertificateRequest: return .waitCertificateOrCertificateRequest
+        case .waitCertificate: return .waitCertificate
+        case .waitCertificateVerify: return .waitCertificateVerify
+        case .waitFinished: return .waitFinished
+        case .connected: return .connected
+        }
+    }
+}
+
+// MARK: - TLSClientAuthError → TLSHandshakeError bridge
+
+extension TLSHandshakeError {
+    /// Maps an Embedded-clean ``TLSClientAuthError`` from the auth FSM core onto the
+    /// adapter's `TLSHandshakeError` so existing error-handling / alert mapping and
+    /// the auth tests observe identical behaviour.
+    static func from(_ error: TLSClientAuthError) -> TLSHandshakeError {
+        switch error {
+        case .unexpectedMessage(let tag):
+            return .unexpectedMessage("Unexpected message in state \(tag)")
+        case .noALPNMatch:
+            return .noALPNMatch
+        case .missingExtension:
+            return .missingExtension("quic_transport_parameters")
+        case .invalidExtension:
+            return .invalidExtension("invalid handshake extension")
+        case .signatureVerificationFailed:
+            return .signatureVerificationFailed
+        case .certificateVerificationFailed:
+            return .certificateVerificationFailed("No public key available to verify CertificateVerify")
+        case .finishedVerificationFailed:
+            return .finishedVerificationFailed
+        case .missingSecret:
+            return .internalError("Missing handshake secret")
+        case .wire(let wireError):
+            return .decodeError("\(wireError)")
+        case .keySchedule(let scheduleError):
+            return .internalError("Key schedule error: \(scheduleError)")
+        case .signature:
+            return .signatureVerificationFailed
+        }
     }
 }

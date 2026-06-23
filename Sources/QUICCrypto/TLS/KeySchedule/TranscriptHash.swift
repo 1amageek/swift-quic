@@ -42,6 +42,17 @@ public struct TranscriptHash: Sendable {
         self.core = core
     }
 
+    /// The underlying Embedded-clean transcript-hash core.
+    ///
+    /// Exposed so the QUICCrypto adapter can hand the running transcript state to
+    /// the Embedded-clean handshake FSM (`QUICClientAuthMachine`) at the
+    /// ServerHello → EncryptedExtensions boundary, then read it back afterwards.
+    /// The core is a value type; reading/assigning it copies the running state.
+    var coreValue: TLSTranscriptHashCore<QUICFoundationProvider> {
+        get { core }
+        set { core = newValue }
+    }
+
     // MARK: - Update
 
     /// Update the transcript with a handshake message
