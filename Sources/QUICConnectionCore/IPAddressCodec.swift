@@ -27,7 +27,10 @@ public enum IPAddressCodec {
     /// network-order bytes.
     ///
     /// Accepts exactly four decimal octets in `0...255` with no leading-zero
-    /// ambiguity beyond a single "0", matching `inet_pton`'s strict form.
+    /// ambiguity beyond a single "0". This is intentionally STRICTER than
+    /// `inet_pton`, which accepts leading zeros (e.g. "01.2.3.4"): this parser
+    /// follows the RFC-preferred unambiguous form and fails closed on any
+    /// leading-zero octet.
     ///
     /// - Returns: The 4 address bytes, or `nil` if not a valid IPv4 literal.
     public static func parseIPv4(_ address: String) -> [UInt8]? {
@@ -44,7 +47,9 @@ public enum IPAddressCodec {
             var digits = 0
             var value = 0
             while i < count, let d = decimalValue(utf8[i]) {
-                // Reject leading zeros (e.g. "01") to match inet_pton strictness.
+                // Reject leading zeros (e.g. "01"): intentionally stricter than
+                // inet_pton (which accepts them), following the RFC-preferred
+                // unambiguous form and failing closed.
                 if digits == 1 && value == 0 {
                     return nil
                 }
@@ -215,7 +220,17 @@ public enum IPAddressCodec {
     /// - Replace the longest run of consecutive zero groups (min length 2) with
     ///   "::"; on ties use the first occurrence.
     /// - Suppress leading zeros in each group; lowercase hex.
+    /// - Render IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible
+    ///   (`::a.b.c.d`) addresses with a dotted-quad tail, matching
+    ///   `inet_ntop`'s `inet_ntop6`.
     static func compressIPv6(_ groups: [UInt16]) -> String {
+        // Render an embedded-IPv4 dotted-quad tail when the address is
+        // IPv4-mapped or IPv4-compatible, matching inet_ntop's inet_ntop6.
+        // The last two groups carry the 32-bit IPv4 address.
+        if let v4Tail = embeddedIPv4Tail(groups) {
+            return v4Tail
+        }
+
         // Find the longest run of consecutive zero groups.
         var bestStart = -1
         var bestLen = 0
@@ -257,6 +272,50 @@ public enum IPAddressCodec {
         }
 
         return joined(parts, separator: ":")
+    }
+
+    /// Renders the textual form of an IPv4-mapped or IPv4-compatible IPv6
+    /// address with a dotted-quad tail, matching `inet_ntop`'s `inet_ntop6`.
+    ///
+    /// - IPv4-mapped: `groups[0..<5] == 0 && groups[5] == 0xffff` →
+    ///   `::ffff:a.b.c.d` (the last 32 bits as a dotted quad).
+    /// - IPv4-compatible: `groups[0..<6] == 0 && (groups[6] | groups[7]) != 0`
+    ///   → `::a.b.c.d`, EXCLUDING `::` (all-zero) and `::1` (loopback), which
+    ///   render in plain hextet form per `inet_ntop`.
+    ///
+    /// - Returns: The dotted-quad textual form, or `nil` if `groups` is not an
+    ///   embedded-IPv4 address.
+    @inline(__always)
+    static func embeddedIPv4Tail(_ groups: [UInt16]) -> String? {
+        // Common prefix: groups[0...4] must all be zero for either form.
+        for index in 0..<5 where groups[index] != 0 {
+            return nil
+        }
+
+        let isMapped = groups[5] == 0xffff
+        let isCompatible: Bool = {
+            // IPv4-compatible requires groups[5] == 0 as well, and a non-zero
+            // 32-bit tail. Exclude the loopback "::1" (groups[6] == 0 &&
+            // groups[7] == 1) and the all-zero "::" (handled by the non-zero
+            // tail requirement), which inet_ntop renders as plain hextets.
+            guard groups[5] == 0 else { return false }
+            let tailIsZero = groups[6] == 0 && groups[7] == 0
+            let isLoopback = groups[6] == 0 && groups[7] == 1
+            return !tailIsZero && !isLoopback
+        }()
+
+        guard isMapped || isCompatible else { return nil }
+
+        let a = groups[6] >> 8
+        let b = groups[6] & 0xFF
+        let c = groups[7] >> 8
+        let d = groups[7] & 0xFF
+        let dottedQuad = "\(a).\(b).\(c).\(d)"
+
+        if isMapped {
+            return "::ffff:" + dottedQuad
+        }
+        return "::" + dottedQuad
     }
 
     // MARK: - Foundation-free text helpers

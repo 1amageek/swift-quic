@@ -168,6 +168,27 @@ struct PreferredAddressRFCTests {
         #expect(TransportParameterCodec.parseIPv6("12345::xyz") == nil)
     }
 
+    @Test("formatIPv6 renders embedded-IPv4 dotted-quad tail like inet_ntop")
+    func ipv6EmbeddedIPv4Formatting() throws {
+        // IPv4-mapped: must format as ::ffff:192.168.0.1, NOT ::ffff:c0a8:1.
+        let mapped = try #require(TransportParameterCodec.parseIPv6("::ffff:192.168.0.1"))
+        #expect(TransportParameterCodec.formatIPv6(mapped) == "::ffff:192.168.0.1")
+
+        // IPv4-compatible: must format as ::1.2.3.4, NOT ::1:203.
+        let compatible = try #require(TransportParameterCodec.parseIPv6("::1.2.3.4"))
+        #expect(TransportParameterCodec.formatIPv6(compatible) == "::1.2.3.4")
+
+        // Loopback, all-zero, and normal IPv6 are unchanged (plain hextets).
+        let loopback = try #require(TransportParameterCodec.parseIPv6("::1"))
+        #expect(TransportParameterCodec.formatIPv6(loopback) == "::1")
+
+        let unspecified = try #require(TransportParameterCodec.parseIPv6("::"))
+        #expect(TransportParameterCodec.formatIPv6(unspecified) == "::")
+
+        let normal = try #require(TransportParameterCodec.parseIPv6("2001:db8::1"))
+        #expect(TransportParameterCodec.formatIPv6(normal) == "2001:db8::1")
+    }
+
     // MARK: - Client-Only Requirement
 
     @Test("Client MUST NOT send preferred_address")
