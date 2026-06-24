@@ -580,7 +580,7 @@ public struct PacketDecoder: Sendable {
         for i in 0..<actualPNLength {
             truncatedPN = (truncatedPN << 8) | UInt64(unprotectedPNBytes[unprotectedPNBytes.startIndex + i])
         }
-        let packetNumber = PacketNumberEncoding.decode(
+        let packetNumber = try PacketNumberEncoding.decode(
             truncated: truncatedPN,
             length: actualPNLength,
             largestPN: largestPN
@@ -709,7 +709,7 @@ public struct PacketDecoder: Sendable {
         for i in 0..<actualPNLength {
             truncatedPN = (truncatedPN << 8) | UInt64(unprotectedPNBytes[unprotectedPNBytes.startIndex + i])
         }
-        let packetNumber = PacketNumberEncoding.decode(
+        let packetNumber = try PacketNumberEncoding.decode(
             truncated: truncatedPN,
             length: actualPNLength,
             largestPN: largestPN

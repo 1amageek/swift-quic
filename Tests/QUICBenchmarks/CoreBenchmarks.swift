@@ -303,7 +303,7 @@ struct CoreBenchmarks {
         let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             for tc in testCases {
-                _ = PacketNumberEncoding.decode(
+                _ = try PacketNumberEncoding.decode(
                     truncated: tc.truncated,
                     length: tc.length,
                     largestPN: tc.largestPN

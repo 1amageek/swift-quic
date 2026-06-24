@@ -685,12 +685,43 @@ public enum PacketNumberEncoding {
         return (bytes, length)
     }
 
+    /// Errors that can occur while reconstructing a packet number.
+    public enum DecodeError: Error, Sendable, Equatable {
+        /// `largestPN` is outside the valid QUIC packet-number range
+        /// (`0 ..< 2^62`, RFC 9000 §12.3 / §17.1).
+        case largestPacketNumberOutOfRange(UInt64)
+        /// `length` is outside the valid encoded packet-number length (1...4 bytes).
+        case invalidLength(Int)
+    }
+
+    /// Largest valid QUIC packet number plus one: packet numbers occupy the
+    /// range `0 ..< 2^62` (RFC 9000 §12.3 / §17.1).
+    static let packetNumberLimit: UInt64 = 1 << 62
+
     /// Decodes a truncated packet number to its full value (RFC 9000 §A.3).
+    ///
+    /// `largestPN` is the highest packet number successfully processed in the
+    /// same packet-number space. It MUST be a valid QUIC packet number
+    /// (`< 2^62`); the reconstruction in RFC 9000 §A.3 is only well defined
+    /// inside that range, and feeding an out-of-range value would otherwise
+    /// overflow the unsigned arithmetic below. An out-of-range value is a
+    /// programming error / protocol violation and is rejected with a typed
+    /// error rather than trapping or silently wrapping.
     public static func decode(
         truncated: UInt64,
         length: Int,
         largestPN: UInt64
-    ) -> UInt64 {
+    ) throws(DecodeError) -> UInt64 {
+        guard length >= 1 && length <= 4 else {
+            throw .invalidLength(length)
+        }
+        guard largestPN < packetNumberLimit else {
+            throw .largestPacketNumberOutOfRange(largestPN)
+        }
+
+        // largestPN < 2^62 guarantees expectedPN <= 2^62, and length <= 4
+        // guarantees pnWin <= 2^32, so every intermediate sum below stays well
+        // within UInt64 and cannot overflow.
         let expectedPN = largestPN + 1
         let pnWin = UInt64(1) << (length * 8)
         let pnHwin = pnWin / 2

@@ -375,4 +375,60 @@ struct RetryPacketHeaderRFCTests {
             )
         }
     }
+
+    // MARK: - Packet Number Reconstruction (RFC 9000 §A.3)
+
+    @Test("decode reconstructs the RFC 9000 §A.3 worked example")
+    func decodeMatchesRFCAppendixA3Example() throws {
+        // RFC 9000 §A.3: largest received = 0xa82f30ea, truncated 2-byte value
+        // 0x9b32 reconstructs to 0xa82f9b32.
+        let result = try PacketNumberEncoding.decode(
+            truncated: 0x9b32, length: 2, largestPN: 0xa82f30ea)
+        #expect(result == 0xa82f9b32)
+    }
+
+    @Test("decode handles the maximum valid QUIC packet number without trapping")
+    func decodeAtMaximumValidPacketNumber() throws {
+        // RFC 9000 §12.3 / §17.1: packet numbers occupy 0 ..< 2^62. The largest
+        // legal largestPN is 2^62 - 1. The previous unchecked arithmetic in
+        // `decode` overflowed only well beyond this (largestPN within ~2^31 of
+        // UInt64.max), so this confirms every legal input still reconstructs.
+        let maxValid: UInt64 = (1 << 62) - 1
+        let result = try PacketNumberEncoding.decode(
+            truncated: 0, length: 1, largestPN: maxValid)
+        // expectedPN = 2^62, candidate = (expectedPN & ~0xFF) | 0 = 2^62, which is
+        // the well-defined §A.3 result for this input.
+        #expect(result == (1 << 62))
+    }
+
+    @Test("decode throws instead of trapping on an out-of-range largestPN")
+    func decodeRejectsOutOfRangeLargestPN() {
+        // Regression: largestPN == UInt64.max previously trapped with an
+        // arithmetic overflow ("largestPN + 1") instead of failing cleanly.
+        #expect(throws: PacketNumberEncoding.DecodeError.self) {
+            _ = try PacketNumberEncoding.decode(
+                truncated: 0, length: 1, largestPN: .max)
+        }
+        // A largestPN at the 2^62 boundary (one past the largest legal PN) is
+        // also rejected, as are values near UInt64.max that previously overflowed
+        // the §A.3 window arithmetic for 4-byte encodings.
+        #expect(throws: PacketNumberEncoding.DecodeError.self) {
+            _ = try PacketNumberEncoding.decode(
+                truncated: 0, length: 1, largestPN: 1 << 62)
+        }
+        #expect(throws: PacketNumberEncoding.DecodeError.self) {
+            _ = try PacketNumberEncoding.decode(
+                truncated: 0xFFFFFFFF, length: 4, largestPN: UInt64.max - 10)
+        }
+    }
+
+    @Test("decode throws on an invalid encoded length")
+    func decodeRejectsInvalidLength() {
+        #expect(throws: PacketNumberEncoding.DecodeError.self) {
+            _ = try PacketNumberEncoding.decode(truncated: 0, length: 0, largestPN: 0)
+        }
+        #expect(throws: PacketNumberEncoding.DecodeError.self) {
+            _ = try PacketNumberEncoding.decode(truncated: 0, length: 5, largestPN: 0)
+        }
+    }
 }

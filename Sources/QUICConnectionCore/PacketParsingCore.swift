@@ -321,7 +321,7 @@ public enum PacketParsingCore {
 
         // Step 4: Decode packet number.
         let actualPNLength = Int((unprotectedFirstByte & 0x03) + 1)
-        let packetNumber = decodeTruncatedPN(
+        let packetNumber = try decodeTruncatedPN(
             unprotectedPNBytes, length: actualPNLength, largestPN: largestPN)
 
         // Step 5: Validate header after HP removal.
@@ -455,7 +455,7 @@ public enum PacketParsingCore {
 
         // Step 4b: Decode packet number.
         let actualPNLength = Int((unprotectedFirstByte & 0x03) + 1)
-        let packetNumber = decodeTruncatedPN(
+        let packetNumber = try decodeTruncatedPN(
             unprotectedPNBytes, length: actualPNLength, largestPN: largestPN)
 
         // Step 5: Validate header.
@@ -512,13 +512,17 @@ public enum PacketParsingCore {
         _ pnBytes: [UInt8],
         length: Int,
         largestPN: UInt64
-    ) -> UInt64 {
+    ) throws(PacketParsingError) -> UInt64 {
         var truncatedPN: UInt64 = 0
         for i in 0..<length {
             truncatedPN = (truncatedPN << 8) | UInt64(pnBytes[i])
         }
-        return PacketNumberEncoding.decode(
-            truncated: truncatedPN, length: length, largestPN: largestPN)
+        do {
+            return try PacketNumberEncoding.decode(
+                truncated: truncatedPN, length: length, largestPN: largestPN)
+        } catch {
+            throw .invalidPacketFormat("packet number decode: \(error)")
+        }
     }
 
     /// Big-endian packet-number bytes of the given length.
