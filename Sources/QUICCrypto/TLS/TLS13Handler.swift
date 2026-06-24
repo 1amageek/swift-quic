@@ -8,6 +8,7 @@ import QUICTLSCore
 import Crypto
 import Synchronization
 import QUICCore
+import P2PCrypto
 
 // MARK: - TLS 1.3 Handler
 
@@ -539,9 +540,9 @@ public final class ServerStateMachine: Sendable {
         /// The adapter keeps the Mutex, the TLSConfiguration-dependent negotiation +
         /// wire-message assembly, the swift-crypto (EC)DHE + signing, X.509, and the
         /// PSK-binder validation; it specialises the core at
-        /// `C = QUICFoundationProvider` and drives it under its lock so transcripts /
+        /// `C = QUICCryptoProvider` and drives it under its lock so transcripts /
         /// secrets and behaviour stay byte-identical.
-        var serverHandshake: QUICServerHandshake<QUICFoundationProvider> = .init()
+        var serverHandshake: QUICServerHandshake<QUICCryptoProvider> = .init()
     }
 
     public init(configuration: TLSConfiguration, sessionTicketStore: SessionTicketStore? = nil) {
@@ -706,7 +707,7 @@ public final class ServerStateMachine: Sendable {
             // accepted PSK material is passed to the core, which installs the early
             // secret and derives the 0-RTT secret.
             let clientHelloMessage = HandshakeCodec.encode(type: .clientHello, content: data)
-            var acceptedPSK: QUICServerHandshake<QUICFoundationProvider>.AcceptedPSK?
+            var acceptedPSK: QUICServerHandshake<QUICCryptoProvider>.AcceptedPSK?
             var earlyDataAccepted = false
 
             if selectedPskIndex != nil,
@@ -806,7 +807,7 @@ public final class ServerStateMachine: Sendable {
             // Drive the server FSM: fold CH → install early secret → derive 0-RTT →
             // fold SH → derive handshake secrets → fold EE/CR/Cert → (non-PSK) request
             // a CertificateVerify signature.
-            let flightParameters = QUICServerHandshake<QUICFoundationProvider>.FlightParameters(
+            let flightParameters = QUICServerHandshake<QUICCryptoProvider>.FlightParameters(
                 cipherSuite: negotiatedCipherSuite.coreCipherSuite,
                 acceptedPSK: acceptedPSK,
                 sharedSecret: sharedSecret.withUnsafeBytes { [UInt8]($0) },
@@ -1204,7 +1205,7 @@ public final class ServerStateMachine: Sendable {
 
     /// Applies the HelloRetryRequest `message_hash` transform on the FSM.
     private static func applyHelloRetryRequest(
-        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICServerHandshake<QUICCryptoProvider>,
         cipherSuite: TLSCipherSuiteCore,
         clientHello1Bytes: [UInt8],
         helloRetryRequestBytes: [UInt8]
@@ -1222,9 +1223,9 @@ public final class ServerStateMachine: Sendable {
 
     /// Begins the server flight through the FSM.
     private static func beginServerFlight(
-        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICServerHandshake<QUICCryptoProvider>,
         clientHelloBytes: [UInt8],
-        parameters: QUICServerHandshake<QUICFoundationProvider>.FlightParameters,
+        parameters: QUICServerHandshake<QUICCryptoProvider>.FlightParameters,
         serverHelloBytes: [UInt8],
         encryptedExtensionsBytes: [UInt8],
         certificateRequestBytes: [UInt8]?,
@@ -1232,7 +1233,7 @@ public final class ServerStateMachine: Sendable {
     ) throws -> (
         handshakeSecrets: (client: [UInt8], server: [UInt8]),
         clientEarlyTrafficSecret: [UInt8]?,
-        certificateVerifyRequest: QUICServerHandshake<QUICFoundationProvider>.ServerCertificateVerifyRequest?
+        certificateVerifyRequest: QUICServerHandshake<QUICCryptoProvider>.ServerCertificateVerifyRequest?
     ) {
         do {
             return try handshake.beginServerFlight(
@@ -1250,7 +1251,7 @@ public final class ServerStateMachine: Sendable {
 
     /// Folds the adapter-signed server CertificateVerify through the FSM.
     private static func foldServerCertificateVerify(
-        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICServerHandshake<QUICCryptoProvider>,
         messageBytes: [UInt8]
     ) throws {
         do {
@@ -1262,7 +1263,7 @@ public final class ServerStateMachine: Sendable {
 
     /// Finishes the server flight (Finished + application/exporter secrets).
     private static func finishServerFlight(
-        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>
+        _ handshake: inout QUICServerHandshake<QUICCryptoProvider>
     ) throws -> (
         serverFinished: [UInt8],
         applicationSecrets: (client: [UInt8], server: [UInt8]),
@@ -1277,7 +1278,7 @@ public final class ServerStateMachine: Sendable {
 
     /// Ingests the client Certificate through the FSM.
     private static func ingestClientCertificate(
-        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICServerHandshake<QUICCryptoProvider>,
         certificatePresented: Bool,
         rawMessageBytes: [UInt8]
     ) throws -> Bool {
@@ -1293,10 +1294,10 @@ public final class ServerStateMachine: Sendable {
 
     /// Ingests + verifies the client CertificateVerify through the FSM.
     private static func ingestClientCertificateVerify(
-        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICServerHandshake<QUICCryptoProvider>,
         algorithm: SignatureScheme,
         signature: [UInt8],
-        clientPublicKey: QUICServerHandshake<QUICFoundationProvider>.ClientPublicKey,
+        clientPublicKey: QUICServerHandshake<QUICCryptoProvider>.ClientPublicKey,
         rawMessageBytes: [UInt8]
     ) throws {
         do {
@@ -1313,7 +1314,7 @@ public final class ServerStateMachine: Sendable {
 
     /// Ingests + verifies the client Finished through the FSM.
     private static func ingestClientFinished(
-        _ handshake: inout QUICServerHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICServerHandshake<QUICCryptoProvider>,
         verifyData: [UInt8]
     ) throws {
         do {

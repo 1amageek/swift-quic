@@ -2,7 +2,7 @@
 ///
 /// The pure RFC 8446 §7.1 derivation logic lives in `QUICTLSCore`
 /// (`TLSKeyScheduleCore<C>`), Embedded-clean and generic over the `CryptoProvider`
-/// seam. This adapter specialises the core at `C = QUICFoundationProvider`
+/// seam. This adapter specialises the core at `C = QUICCryptoProvider`
 /// (swift-crypto / CryptoKit) and bridges the public `Data` / `SymmetricKey` /
 /// `SharedSecret` surface so existing call sites and tests are unchanged. The
 /// derivation is byte-identical to the pre-seam swift-crypto implementation.
@@ -28,6 +28,7 @@
 import Foundation
 import Crypto
 import QUICTLSCore
+import P2PCrypto
 
 // MARK: - CipherSuite <-> Core bridge
 
@@ -52,7 +53,7 @@ extension CipherSuite {
 public struct TLSKeySchedule: Sendable {
 
     /// The Embedded-clean key schedule, specialised at the host provider.
-    private var core: TLSKeyScheduleCore<QUICFoundationProvider>
+    private var core: TLSKeyScheduleCore<QUICCryptoProvider>
 
     /// The negotiated cipher suite.
     public let cipherSuite: CipherSuite
@@ -76,7 +77,7 @@ public struct TLSKeySchedule: Sendable {
     /// (already at the handshake-secret stage) to the Embedded-clean handshake FSM
     /// (`QUICClientAuthMachine`) and read it back after the FSM derives the
     /// application/exporter/resumption secrets. The core is a value type.
-    var coreValue: TLSKeyScheduleCore<QUICFoundationProvider> {
+    var coreValue: TLSKeyScheduleCore<QUICCryptoProvider> {
         get { core }
         set { core = newValue }
     }
@@ -288,7 +289,7 @@ public struct TrafficKeys: Sendable {
         )
         let secretBytes = secret.withUnsafeBytes { [UInt8]($0) }
         do {
-            let (keyBytes, ivBytes) = try TLSKeyScheduleCore<QUICFoundationProvider>.trafficKeys(
+            let (keyBytes, ivBytes) = try TLSKeyScheduleCore<QUICCryptoProvider>.trafficKeys(
                 secret: secretBytes,
                 cipherSuite: suite
             )

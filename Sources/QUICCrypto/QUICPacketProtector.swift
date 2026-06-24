@@ -3,7 +3,7 @@
 /// `QUICPacketProtector` is the single concrete type that the connection and
 /// codec layers hold in place of the former `any PacketOpener` / `any PacketSealer`
 /// existentials. It wraps one ``SuiteProtector`` specialised at
-/// `C = QUICFoundationProvider` and conforms to both ``PacketOpener`` and
+/// `C = QUICCryptoProvider` and conforms to both ``PacketOpener`` and
 /// ``PacketSealer`` (i.e. ``PacketOpenerProtocol`` and ``PacketSealerProtocol``),
 /// so a single value can both open and seal packets for one derived key.
 ///
@@ -16,24 +16,25 @@
 ///
 /// This is the host (non-Embedded) adapter: its public API is `Data`-based so the
 /// existing call sites and tests compile unchanged, but all crypto routes through
-/// the `SuiteProtector<QUICFoundationProvider>` value (which itself goes through
+/// the `SuiteProtector<QUICCryptoProvider>` value (which itself goes through
 /// the `CryptoProvider` / `HeaderProtectionProvider` seam).
 
 import Foundation
 import QUICCore
 import QUICPacketProtectionCore
+import P2PCrypto
 
 /// A concrete QUIC packet protector that both opens and seals packets for one
-/// derived key, wrapping a ``SuiteProtector`` at `C = QUICFoundationProvider`.
+/// derived key, wrapping a ``SuiteProtector`` at `C = QUICCryptoProvider`.
 public struct QUICPacketProtector: PacketOpener, PacketSealer, Sendable {
     /// The underlying generic, Embedded-clean suite protector.
-    public let protector: SuiteProtector<QUICFoundationProvider>
+    public let protector: SuiteProtector<QUICCryptoProvider>
 
     /// AEAD requires a 12-byte IV for QUIC (RFC 9001 §5.3).
     public static let ivLength = 12
 
     /// Wraps an existing suite protector.
-    public init(protector: SuiteProtector<QUICFoundationProvider>) {
+    public init(protector: SuiteProtector<QUICCryptoProvider>) {
         self.protector = protector
     }
 

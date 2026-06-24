@@ -3,7 +3,7 @@
 ///
 /// Asserts that the Embedded-clean `QUICTLSCore.TLSKeyExchange<C>` and
 /// `QUICTLSCore.TLSSignature{Signer,Verifier}<C>` specialised at
-/// `C = QUICFoundationProvider` produce results byte-for-byte / behaviour-identical
+/// `C = QUICCryptoProvider` produce results byte-for-byte / behaviour-identical
 /// to the legacy direct-swift-crypto paths (`KeyExchange`, `TLSSignature` /
 /// `SigningKey` / `VerificationKey`):
 ///
@@ -25,11 +25,12 @@ import Crypto
 import P2PCoreBytes
 @testable import QUICCrypto
 import QUICTLSCore
+import P2PCrypto
 
 @Suite("TLS Key Exchange + Signature Seam Differential")
 struct KeyExchangeSignatureSeamDifferentialTests {
 
-    private typealias Provider = QUICFoundationProvider
+    private typealias Provider = QUICCryptoProvider
 
     // MARK: - (EC)DHE shared-secret equality (legacy path == seam path)
 

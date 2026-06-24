@@ -53,7 +53,7 @@ public protocol PacketSealer: PacketSealerProtocol {}
 /// Cryptographic context for a single encryption level.
 ///
 /// Holds the concrete ``QUICPacketProtector`` (a closed ``SuiteProtector`` over
-/// `QUICFoundationProvider`) for each direction rather than the former
+/// `DefaultCryptoProvider`) for each direction rather than the former
 /// `any PacketOpener` / `any PacketSealer` existentials, so the generic crypto
 /// seam flows through the connection layer without `any`.
 public struct CryptoContext: Sendable {

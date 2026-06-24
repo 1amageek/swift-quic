@@ -4,6 +4,7 @@ import Crypto
 @testable import QUICCore
 @testable import QUICCrypto
 import QUICPacketProtectionCore
+import P2PCrypto
 import P2PCoreBytes
 
 /// Byte-for-byte differential tests for the Embedded-clean packet-protection core
@@ -37,8 +38,8 @@ struct PacketProtectionDifferentialTests {
     // RFC 9001 A.2: the header-protection mask = AES-ECB(hp, sample)[0..<5].
     static let expectedMask: [UInt8] = [0x43, 0x7b, 0x9a, 0xec, 0x36]
 
-    private func makeClientProtector() throws -> SuiteProtector<QUICFoundationProvider> {
-        try SuiteProtector<QUICFoundationProvider>.make(
+    private func makeClientProtector() throws -> SuiteProtector<QUICCryptoProvider> {
+        try SuiteProtector<QUICCryptoProvider>.make(
             suite: .aes128GCM,
             key: Self.clientKey,
             iv: Self.clientIV,
@@ -171,9 +172,9 @@ struct PacketProtectionDifferentialTests {
             0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
             0xcc, 0xbb, 0x7f, 0x0a,
         ]
-        let (clientSecret, _) = try QUICKeyDerivation<QUICFoundationProvider>.initialSecrets(
+        let (clientSecret, _) = try QUICKeyDerivation<QUICCryptoProvider>.initialSecrets(
             connectionID: dcid, salt: salt)
-        let (key, iv, hpKey) = try QUICKeyDerivation<QUICFoundationProvider>.packetKeys(
+        let (key, iv, hpKey) = try QUICKeyDerivation<QUICCryptoProvider>.packetKeys(
             secret: clientSecret, suite: .aes128GCM)
         #expect(key == Self.clientKey)
         #expect(iv == Self.clientIV)
@@ -188,9 +189,9 @@ struct PacketProtectionDifferentialTests {
             0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
             0xcc, 0xbb, 0x7f, 0x0a,
         ]
-        let (clientSecret, _) = try QUICKeyDerivation<QUICFoundationProvider>.initialSecrets(
+        let (clientSecret, _) = try QUICKeyDerivation<QUICCryptoProvider>.initialSecrets(
             connectionID: dcid, salt: salt)
-        let protector = try QUICKeyDerivation<QUICFoundationProvider>.protector(
+        let protector = try QUICKeyDerivation<QUICCryptoProvider>.protector(
             secret: clientSecret, suite: .aes128GCM)
         let mask = try protector.headerProtectionMask(sample: Self.clientSample)
         #expect(mask == Self.expectedMask)
@@ -212,7 +213,7 @@ struct PacketProtectionDifferentialTests {
             0x57, 0x5d, 0x79, 0x99, 0xc2, 0x5a, 0x5b, 0xfb,
         ]
         // 12-byte placeholder IV/key for ChaCha (only HP is asserted here).
-        let protector = try SuiteProtector<QUICFoundationProvider>.make(
+        let protector = try SuiteProtector<QUICCryptoProvider>.make(
             suite: .chaCha20Poly1305,
             key: [UInt8](repeating: 0, count: 32),
             iv: [UInt8](repeating: 0, count: 12),

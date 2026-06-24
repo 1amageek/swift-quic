@@ -7,6 +7,7 @@ import QUICTLSCore
 import Crypto
 import Synchronization
 import QUICCore
+import P2PCrypto
 
 // MARK: - Client State Machine
 
@@ -29,14 +30,14 @@ public final class ClientStateMachine: Sendable {
         /// shared secret; the core derives the secrets and hands its transcript +
         /// key schedule to the auth FSM at the ServerHello → EncryptedExtensions
         /// boundary.
-        var clientHandshake: QUICClientHandshake<QUICFoundationProvider>?
+        var clientHandshake: QUICClientHandshake<QUICCryptoProvider>?
 
         /// The Embedded-clean post-ServerHello auth FSM, constructed once ServerHello
         /// has been processed. It owns the running transcript + key schedule by value
         /// and encodes the CertificateVerify / Finished auth invariants. The adapter
         /// parses wire bytes, performs X.509, and converts the FSM's returned secrets
         /// into per-encryption-level `TLSOutput`s.
-        var authMachine: QUICClientAuthMachine<QUICFoundationProvider>?
+        var authMachine: QUICClientAuthMachine<QUICCryptoProvider>?
     }
 
     // MARK: - Initialization
@@ -128,13 +129,13 @@ public final class ClientStateMachine: Sendable {
             // transcript, computes the PSK two-pass binder, and derives the 0-RTT
             // early-traffic-secret. The main transcript suite is the client default
             // (SHA-256), matching the legacy `HandshakeContext.transcriptHash`.
-            var handshake = QUICClientHandshake<QUICFoundationProvider>(
+            var handshake = QUICClientHandshake<QUICCryptoProvider>(
                 cipherSuite: CipherSuite.tls_aes_128_gcm_sha256.coreCipherSuite
             )
 
             // PSK-related extensions (if we have a session ticket)
             var offeredPsks: OfferedPsks?
-            var pskBinder: QUICClientHandshake<QUICFoundationProvider>.PSKBinderInput?
+            var pskBinder: QUICClientHandshake<QUICCryptoProvider>.PSKBinderInput?
             var attemptEarlyDataResolved = false
 
             if let ticket = sessionTicket, ticket.isValid() {
@@ -493,7 +494,7 @@ public final class ClientStateMachine: Sendable {
 
     /// Applies the HelloRetryRequest `message_hash` transform on the FSM.
     private static func applyHelloRetryRequest(
-        _ handshake: inout QUICClientHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICClientHandshake<QUICCryptoProvider>,
         cipherSuite: TLSCipherSuiteCore,
         rawMessageBytes: [UInt8]
     ) throws {
@@ -513,13 +514,13 @@ public final class ClientStateMachine: Sendable {
     /// Produces the ClientHello (handles the PSK two-pass binder + 0-RTT) through
     /// the FSM.
     private static func produceClientHello(
-        _ handshake: inout QUICClientHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICClientHandshake<QUICCryptoProvider>,
         random: [UInt8],
         legacySessionID: [UInt8],
         cipherSuites: [CipherSuite],
         extensions: [TLSExtension],
         offeredPsks: OfferedPsks?,
-        pskBinder: QUICClientHandshake<QUICFoundationProvider>.PSKBinderInput?,
+        pskBinder: QUICClientHandshake<QUICCryptoProvider>.PSKBinderInput?,
         attemptEarlyData: Bool
     ) throws -> (clientHello: [UInt8], earlyTrafficSecret: [UInt8]?) {
         do {
@@ -541,7 +542,7 @@ public final class ClientStateMachine: Sendable {
     /// FSM. The legacy QUIC adapter performs no downgrade-sentinel check, so the FSM
     /// is driven with `checkDowngrade: false` to stay byte-identical.
     private static func ingestServerHello(
-        _ handshake: inout QUICClientHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICClientHandshake<QUICCryptoProvider>,
         serverRandom: [UInt8],
         cipherSuite: TLSCipherSuiteCore,
         pskAccepted: Bool,
@@ -564,8 +565,8 @@ public final class ClientStateMachine: Sendable {
 
     /// Hands the FSM's transcript + key schedule off to the post-ServerHello auth FSM.
     private static func makeAuthMachine(
-        consuming handshake: consuming QUICClientHandshake<QUICFoundationProvider>
-    ) throws -> QUICClientAuthMachine<QUICFoundationProvider> {
+        consuming handshake: consuming QUICClientHandshake<QUICCryptoProvider>
+    ) throws -> QUICClientAuthMachine<QUICCryptoProvider> {
         do {
             return try handshake.makeAuthMachine()
         } catch {
@@ -575,7 +576,7 @@ public final class ClientStateMachine: Sendable {
 
     /// Produces ClientHello2 (no PSK re-offer) through the FSM.
     private static func produceClientHello2(
-        _ handshake: inout QUICClientHandshake<QUICFoundationProvider>,
+        _ handshake: inout QUICClientHandshake<QUICCryptoProvider>,
         random: [UInt8],
         legacySessionID: [UInt8],
         extensions: [TLSExtension]
@@ -813,7 +814,7 @@ public final class ClientStateMachine: Sendable {
             // The CertificateVerify proof-of-possession signature is then verified
             // inside the Embedded-clean auth FSM, fail-closed and independent of
             // `verifyPeer`.
-            let peerPublicKey: QUICClientAuthMachine<QUICFoundationProvider>.PeerPublicKey?
+            let peerPublicKey: QUICClientAuthMachine<QUICCryptoProvider>.PeerPublicKey?
             if let expectedPublicKey = state.configuration.expectedPeerPublicKey {
                 // The configured raw public key must be importable under the
                 // CertificateVerify algorithm; surface a scheme mismatch loudly.
@@ -893,7 +894,7 @@ public final class ClientStateMachine: Sendable {
 
             // Verify the server Finished MAC (constant-time), fold it, and derive the
             // application + exporter secrets — all inside the Embedded-clean auth FSM.
-            let postFinished: QUICClientAuthMachine<QUICFoundationProvider>.PostFinishedSecrets
+            let postFinished: QUICClientAuthMachine<QUICCryptoProvider>.PostFinishedSecrets
             do {
                 postFinished = try authMachine.ingestServerFinished(
                     verifyData: serverFinished.verifyData)
@@ -1133,7 +1134,7 @@ public final class ClientStateMachine: Sendable {
 
 // MARK: - Auth FSM state ↔ adapter state bridge
 
-extension QUICClientAuthMachine<QUICFoundationProvider>.AuthState {
+extension QUICClientAuthMachine<QUICCryptoProvider>.AuthState {
     /// The adapter's observable `ClientHandshakeState` mirroring this FSM state, so
     /// existing accessors and tests see identical states.
     var clientHandshakeState: ClientHandshakeState {

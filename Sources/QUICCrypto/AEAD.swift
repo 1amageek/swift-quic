@@ -11,7 +11,7 @@
 /// `C = FoundationCryptoProvider`. The generic `PacketProtector<C, A>` /
 /// `SuiteProtector<C>` value types live in `QUICPacketProtectionCore`; the
 /// connection/codec layers now hold the concrete ``QUICPacketProtector`` (a
-/// `SuiteProtector<QUICFoundationProvider>` wrapper) directly, so no
+/// `SuiteProtector<QUICCryptoProvider>` wrapper) directly, so no
 /// `any PacketOpener` / `any PacketSealer` existential remains on the crypto path.
 /// These concrete `AES128GCMOpener`/`Sealer` and `ChaCha20…Opener`/`Sealer` types
 /// remain for the existing unit tests and direct callers.
@@ -21,6 +21,7 @@ import QUICTLSCore
 import Crypto
 import QUICCore
 import QUICPacketProtectionCore
+import P2PCrypto
 import P2PCoreCrypto
 import P2PCoreBytes
 
@@ -36,11 +37,11 @@ extension QUICCipherSuite {
     }
 }
 
-/// Builds a `SuiteProtector<QUICFoundationProvider>` from `KeyMaterial`, routing
+/// Builds a `SuiteProtector<QUICCryptoProvider>` from `KeyMaterial`, routing
 /// AEAD construction + header-protection through the seam. Surfaces a typed
 /// ``CryptoError`` instead of the core's ``PacketProtectionError`` so the adapter
 /// API is unchanged — no silent fallback.
-func makeSuiteProtector(from keyMaterial: KeyMaterial) throws -> SuiteProtector<QUICFoundationProvider> {
+func makeSuiteProtector(from keyMaterial: KeyMaterial) throws -> SuiteProtector<QUICCryptoProvider> {
     let suite = keyMaterial.cipherSuite.protectionSuite
     guard keyMaterial.iv.count == 12 else {
         throw CryptoError.invalidIVLength(expected: 12, actual: keyMaterial.iv.count)
@@ -49,7 +50,7 @@ func makeSuiteProtector(from keyMaterial: KeyMaterial) throws -> SuiteProtector<
     let iv = [UInt8](keyMaterial.iv)
     let hpKey = [UInt8](keyMaterial.hp.withUnsafeBytes { Data($0) })
     do {
-        return try SuiteProtector<QUICFoundationProvider>.make(
+        return try SuiteProtector<QUICCryptoProvider>.make(
             suite: suite, key: key, iv: iv, hpKey: hpKey)
     } catch {
         throw error.asCryptoError
@@ -88,7 +89,7 @@ extension PacketProtectionError {
 /// AES based header protection (RFC 9001 Section 5.4.3).
 ///
 /// Computes the 5-byte mask via the `HeaderProtectionProvider` seam
-/// (`QUICFoundationHeaderProtection.aesECBBlockMask`).
+/// (`QUICCryptoProvider.HeaderProtection.aesECBBlockMask`).
 public struct AES128HeaderProtection: HeaderProtection, Sendable {
     private let key: [UInt8]
 
@@ -104,7 +105,7 @@ public struct AES128HeaderProtection: HeaderProtection, Sendable {
         }
         let sampleBytes = [UInt8](sample.prefix(16))
         do {
-            let mask = try QUICFoundationHeaderProtection.aesECBBlockMask(
+            let mask = try QUICCryptoProvider.HeaderProtection.aesECBBlockMask(
                 key: key.span, sample: sampleBytes.span)
             return Data(mask)
         } catch {
@@ -116,9 +117,9 @@ public struct AES128HeaderProtection: HeaderProtection, Sendable {
 // MARK: - AES-128-GCM Opener
 
 /// AES-128-GCM packet opener (decryption). Thin adapter over
-/// `SuiteProtector<QUICFoundationProvider>` (AES-128-GCM case).
+/// `SuiteProtector<QUICCryptoProvider>` (AES-128-GCM case).
 public struct AES128GCMOpener: PacketOpener, Sendable {
-    private let protector: SuiteProtector<QUICFoundationProvider>
+    private let protector: SuiteProtector<QUICCryptoProvider>
 
     /// AES-128-GCM requires 12-byte IV
     public static let ivLength = 12
@@ -132,7 +133,7 @@ public struct AES128GCMOpener: PacketOpener, Sendable {
         let keyBytes = [UInt8](key.withUnsafeBytes { Data($0) })
         let hpBytes = [UInt8](hp.withUnsafeBytes { Data($0) })
         do {
-            self.protector = try SuiteProtector<QUICFoundationProvider>.make(
+            self.protector = try SuiteProtector<QUICCryptoProvider>.make(
                 suite: .aes128GCM, key: keyBytes, iv: [UInt8](iv), hpKey: hpBytes)
         } catch {
             throw error.asCryptoError
@@ -175,9 +176,9 @@ public struct AES128GCMOpener: PacketOpener, Sendable {
 // MARK: - AES-128-GCM Sealer
 
 /// AES-128-GCM packet sealer (encryption). Thin adapter over
-/// `SuiteProtector<QUICFoundationProvider>` (AES-128-GCM case).
+/// `SuiteProtector<QUICCryptoProvider>` (AES-128-GCM case).
 public struct AES128GCMSealer: PacketSealer, Sendable {
-    private let protector: SuiteProtector<QUICFoundationProvider>
+    private let protector: SuiteProtector<QUICCryptoProvider>
 
     /// AES-128-GCM requires 12-byte IV
     public static let ivLength = 12
@@ -191,7 +192,7 @@ public struct AES128GCMSealer: PacketSealer, Sendable {
         let keyBytes = [UInt8](key.withUnsafeBytes { Data($0) })
         let hpBytes = [UInt8](hp.withUnsafeBytes { Data($0) })
         do {
-            self.protector = try SuiteProtector<QUICFoundationProvider>.make(
+            self.protector = try SuiteProtector<QUICCryptoProvider>.make(
                 suite: .aes128GCM, key: keyBytes, iv: [UInt8](iv), hpKey: hpBytes)
         } catch {
             throw error.asCryptoError
@@ -234,7 +235,7 @@ public struct AES128GCMSealer: PacketSealer, Sendable {
 /// ChaCha20-based header protection (RFC 9001 Section 5.4.4).
 ///
 /// Computes the 5-byte mask via the `HeaderProtectionProvider` seam
-/// (`QUICFoundationHeaderProtection.chaCha20BlockMask`).
+/// (`QUICCryptoProvider.HeaderProtection.chaCha20BlockMask`).
 public struct ChaCha20HeaderProtection: HeaderProtection, Sendable {
     private let key: [UInt8]
 
@@ -251,7 +252,7 @@ public struct ChaCha20HeaderProtection: HeaderProtection, Sendable {
         }
         let sampleBytes = [UInt8](sample.prefix(16))
         do {
-            let mask = try QUICFoundationHeaderProtection.chaCha20BlockMask(
+            let mask = try QUICCryptoProvider.HeaderProtection.chaCha20BlockMask(
                 key: key.span, sample: sampleBytes.span)
             return Data(mask)
         } catch {
@@ -263,9 +264,9 @@ public struct ChaCha20HeaderProtection: HeaderProtection, Sendable {
 // MARK: - ChaCha20-Poly1305 Opener
 
 /// ChaCha20-Poly1305 packet opener (decryption). Thin adapter over
-/// `SuiteProtector<QUICFoundationProvider>` (ChaCha20-Poly1305 case).
+/// `SuiteProtector<QUICCryptoProvider>` (ChaCha20-Poly1305 case).
 public struct ChaCha20Poly1305Opener: PacketOpener, Sendable {
-    private let protector: SuiteProtector<QUICFoundationProvider>
+    private let protector: SuiteProtector<QUICCryptoProvider>
 
     /// ChaCha20-Poly1305 requires 12-byte IV
     public static let ivLength = 12
@@ -282,7 +283,7 @@ public struct ChaCha20Poly1305Opener: PacketOpener, Sendable {
         let keyBytes = [UInt8](key.withUnsafeBytes { Data($0) })
         let hpBytes = [UInt8](hp.withUnsafeBytes { Data($0) })
         do {
-            self.protector = try SuiteProtector<QUICFoundationProvider>.make(
+            self.protector = try SuiteProtector<QUICCryptoProvider>.make(
                 suite: .chaCha20Poly1305, key: keyBytes, iv: [UInt8](iv), hpKey: hpBytes)
         } catch {
             throw error.asCryptoError
@@ -323,9 +324,9 @@ public struct ChaCha20Poly1305Opener: PacketOpener, Sendable {
 // MARK: - ChaCha20-Poly1305 Sealer
 
 /// ChaCha20-Poly1305 packet sealer (encryption). Thin adapter over
-/// `SuiteProtector<QUICFoundationProvider>` (ChaCha20-Poly1305 case).
+/// `SuiteProtector<QUICCryptoProvider>` (ChaCha20-Poly1305 case).
 public struct ChaCha20Poly1305Sealer: PacketSealer, Sendable {
-    private let protector: SuiteProtector<QUICFoundationProvider>
+    private let protector: SuiteProtector<QUICCryptoProvider>
 
     /// ChaCha20-Poly1305 requires 12-byte IV
     public static let ivLength = 12
@@ -342,7 +343,7 @@ public struct ChaCha20Poly1305Sealer: PacketSealer, Sendable {
         let keyBytes = [UInt8](key.withUnsafeBytes { Data($0) })
         let hpBytes = [UInt8](hp.withUnsafeBytes { Data($0) })
         do {
-            self.protector = try SuiteProtector<QUICFoundationProvider>.make(
+            self.protector = try SuiteProtector<QUICCryptoProvider>.make(
                 suite: .chaCha20Poly1305, key: keyBytes, iv: [UInt8](iv), hpKey: hpBytes)
         } catch {
             throw error.asCryptoError

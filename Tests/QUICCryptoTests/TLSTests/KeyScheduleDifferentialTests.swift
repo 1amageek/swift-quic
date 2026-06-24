@@ -3,19 +3,20 @@ import Foundation
 import Crypto
 @testable import QUICCrypto
 import QUICTLSCore
+import P2PCrypto
 
 /// Byte-for-byte differential tests for the Embedded-clean TLS 1.3 key schedule
 /// (`TLSKeyScheduleCore<C>` / `TLSExpandLabel<C>` / `TLSTranscriptHashCore<C>`)
 /// against a direct swift-crypto reference implementation.
 ///
 /// This is the correctness oracle for the crypto-seam extraction: it proves the new
-/// generic `<C: CryptoProvider>` path, specialised at `C = QUICFoundationProvider`,
+/// generic `<C: CryptoProvider>` path, specialised at `C = QUICCryptoProvider`,
 /// produces bit-identical secrets/labels/transcripts to the historical
 /// swift-crypto (`HKDF`/`SHA256`/`SHA384`/`HMAC`) computation it replaced.
 @Suite("TLS Key Schedule Differential")
 struct KeyScheduleDifferentialTests {
 
-    private typealias P = QUICFoundationProvider
+    private typealias P = QUICCryptoProvider
 
     // MARK: - Reference helpers (direct swift-crypto, the pre-seam path)
 

@@ -76,8 +76,13 @@ let package = Package(
         // to an error in future SwiftPM). Original: .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.2")
         .package(path: "../swift-nio-udp"),
 
-        // Cryptography
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
+        // Cryptography.
+        // Range (not `from: 4.2.0`) so the apple/swift-crypto identity resolves to a
+        // single version compatible with swift-p2p-crypto (which floors at 3.x) and
+        // swift-certificates (3.12.3..<5.0.0). Adding the swift-p2p-crypto dependency
+        // for the unified DefaultCryptoProvider requires the ranges to overlap;
+        // 3.12.3..<5.0.0 mirrors swift-certificates' own range. (embedded-first-api.md §2.2)
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.12.3"..<"5.0.0"),
 
         // X.509 Certificates and ASN.1
         .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.0"),
@@ -91,6 +96,13 @@ let package = Package(
 
         // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter) + crypto seam
         .package(path: "../swift-p2p-core"),
+
+        // Unified crypto provider: surfaces `DefaultCryptoProvider` (host
+        // swift-crypto / Embedded BoringSSL). Replaces the deleted per-lib
+        // QUICFoundationProvider (embedded-first-api.md §2.2). Its vendored
+        // BoringSSL has a distinct `p2p-boringssl` identity + renamed C symbols, so
+        // it coexists with apple/swift-crypto + swift-certificates with no conflict.
+        .package(path: "../swift-p2p-crypto"),
     ],
     targets: [
         // MARK: - Embedded-clean wire codec (dual-build: host + Embedded)
@@ -159,7 +171,7 @@ let package = Package(
         // secrets, finished key/verify-data, and the incremental transcript hash, all
         // over `[UInt8]` secrets via the CryptoProvider / KeyDerivation / HashFunction
         // / MessageAuthenticationCode seam. No Foundation/any/Mutex/ContinuousClock/
-        // direct-Crypto. The QUICCrypto adapter specialises at C = QUICFoundationProvider
+        // direct-Crypto. The QUICCrypto adapter specialises at C = DefaultCryptoProvider
         // and bridges Data / SymmetricKey / SharedSecret so existing tests are unchanged.
         .target(
             name: "QUICTLSCore",
@@ -215,6 +227,10 @@ let package = Package(
                 "QUICConnectionCore",
                 "QUICPacketProtectionCore",
                 "QUICTLSCore",
+                // Unified provider: the host adapter specialises every generic
+                // engine at C = DefaultCryptoProvider (= FoundationCryptoProvider),
+                // replacing the deleted QUICFoundationProvider.
+                .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "X509", package: "swift-certificates"),
                 .product(name: "SwiftASN1", package: "swift-asn1"),
@@ -306,6 +322,7 @@ let package = Package(
                 "QUICCrypto",
                 "QUICPacketProtectionCore",
                 "QUICTLSCore",
+                .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
             ],
             path: "Tests/QUICCryptoTests"

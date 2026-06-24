@@ -2,7 +2,7 @@
 ///
 /// The running-hash logic lives in `QUICTLSCore` (`TLSTranscriptHashCore<C>`),
 /// Embedded-clean and generic over the `CryptoProvider` seam. This adapter
-/// specialises it at `C = QUICFoundationProvider` and bridges the public `Data`
+/// specialises it at `C = QUICCryptoProvider` and bridges the public `Data`
 /// surface so existing call sites and tests are unchanged.
 ///
 /// For TLS 1.3, the transcript hash is:
@@ -13,6 +13,7 @@
 import Foundation
 import Crypto
 import QUICTLSCore
+import P2PCrypto
 
 // MARK: - Transcript Hash
 
@@ -20,7 +21,7 @@ import QUICTLSCore
 /// Supports both SHA-256 and SHA-384 based on cipher suite
 public struct TranscriptHash: Sendable {
     /// The Embedded-clean transcript hash, specialised at the host provider.
-    private var core: TLSTranscriptHashCore<QUICFoundationProvider>
+    private var core: TLSTranscriptHashCore<QUICCryptoProvider>
 
     /// Hash output length in bytes
     public var hashLength: Int { core.hashLength }
@@ -38,7 +39,7 @@ public struct TranscriptHash: Sendable {
     }
 
     /// Internal init wrapping an existing core (for copy / message-hash operations)
-    private init(core: TLSTranscriptHashCore<QUICFoundationProvider>) {
+    private init(core: TLSTranscriptHashCore<QUICCryptoProvider>) {
         self.core = core
     }
 
@@ -48,7 +49,7 @@ public struct TranscriptHash: Sendable {
     /// the Embedded-clean handshake FSM (`QUICClientAuthMachine`) at the
     /// ServerHello → EncryptedExtensions boundary, then read it back afterwards.
     /// The core is a value type; reading/assigning it copies the running state.
-    var coreValue: TLSTranscriptHashCore<QUICFoundationProvider> {
+    var coreValue: TLSTranscriptHashCore<QUICCryptoProvider> {
         get { core }
         set { core = newValue }
     }
@@ -93,7 +94,7 @@ public struct TranscriptHash: Sendable {
         clientHello1Hash: Data,
         cipherSuite: CipherSuite = .tls_aes_128_gcm_sha256
     ) -> TranscriptHash {
-        let core = TLSTranscriptHashCore<QUICFoundationProvider>.fromMessageHash(
+        let core = TLSTranscriptHashCore<QUICCryptoProvider>.fromMessageHash(
             clientHello1Hash: [UInt8](clientHello1Hash),
             hash: cipherSuite.coreCipherSuite.hash
         )
@@ -112,7 +113,7 @@ public struct TranscriptHash: Sendable {
 
 /// Transcript hash using SHA-384 (for TLS_AES_256_GCM_SHA384)
 public struct TranscriptHashSHA384: Sendable {
-    private var core: TLSTranscriptHashCore<QUICFoundationProvider>
+    private var core: TLSTranscriptHashCore<QUICCryptoProvider>
     private var messageCount: Int
 
     public init() {
@@ -120,7 +121,7 @@ public struct TranscriptHashSHA384: Sendable {
         self.messageCount = 0
     }
 
-    private init(core: TLSTranscriptHashCore<QUICFoundationProvider>, messageCount: Int) {
+    private init(core: TLSTranscriptHashCore<QUICCryptoProvider>, messageCount: Int) {
         self.core = core
         self.messageCount = messageCount
     }
