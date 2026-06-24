@@ -20,7 +20,7 @@
 
 import Foundation
 import P2PCoreBytes
-import QUICCoreCodec
+import QUICWire
 
 // MARK: - Frame struct Data conveniences
 

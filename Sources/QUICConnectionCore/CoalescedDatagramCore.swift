@@ -18,7 +18,7 @@
 /// (``CoalescedDatagramError``); no silent fallback.
 
 import P2PCoreBytes
-import QUICCoreCodec
+import QUICWire
 
 /// Error thrown while splitting a coalesced datagram.
 public enum CoalescedDatagramError: Error, Sendable, Equatable {

@@ -6,7 +6,7 @@
 //     write/finish/generateFrames/handleStopSending/generateResetStream/
 //     acknowledgeData/acknowledgeReset methods and stored sendOffset / sendMaxData /
 //     finSent / send-buffer state. STREAM / RESET_STREAM frames are the `[UInt8]`-based
-//     codec types from `QUICCoreCodec`.
+//     codec types from `QUICWire`.
 //   - Receive-stream FSM as a value type: `ReceiveStreamCore` (Recv → SizeKnown →
 //     DataRecvd → DataRead, plus ResetRecvd) with an in-order reassembly buffer,
 //     `mutating` receive/read/updateRecvMaxData/handleResetStream and a pure

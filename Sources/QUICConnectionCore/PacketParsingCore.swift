@@ -24,7 +24,7 @@
 
 import P2PCoreBytes
 import P2PCoreCrypto
-import QUICCoreCodec
+import QUICWire
 import QUICPacketProtectionCore
 
 /// Error thrown by ``PacketParsingCore``.

@@ -15,7 +15,7 @@
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`.
 
-import QUICCoreCodec
+import QUICWire
 
 public struct ReceiveStreamCore: Sendable {
     /// Maximum permitted stream final offset (RFC 9000 §4.5).

@@ -8,7 +8,7 @@
 /// protection codec and the test suite compile unchanged.
 
 import Foundation
-import QUICCoreCodec
+import QUICWire
 
 // MARK: - LongHeader Data conveniences
 

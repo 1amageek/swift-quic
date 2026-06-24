@@ -7,7 +7,7 @@
 /// so existing callers and tests compile unchanged.
 
 import Foundation
-import QUICCoreCodec
+import QUICWire
 
 extension Varint {
     /// Encodes the varint to `Data`.

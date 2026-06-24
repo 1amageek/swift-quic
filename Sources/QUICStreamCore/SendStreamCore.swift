@@ -9,11 +9,11 @@
 ///
 /// The host `DataStream` holds this under a `Mutex` and bridges `Data` to/from
 /// `[UInt8]`, so observable behavior is unchanged. STREAM / RESET_STREAM frames are
-/// the `[UInt8]`-based types from `QUICCoreCodec`.
+/// the `[UInt8]`-based types from `QUICWire`.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`.
 
-import QUICCoreCodec
+import QUICWire
 
 public struct SendStreamCore: Sendable {
     /// Maximum permitted stream final offset (RFC 9000 §4.5): the stream final offset

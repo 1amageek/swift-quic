@@ -7,7 +7,7 @@
 /// call sites compile unchanged.
 
 import Foundation
-import QUICCoreCodec
+import QUICWire
 
 extension QUICVersion {
     /// Returns the initial salt for key derivation (RFC 9001 Section 5.2) as `Data`.

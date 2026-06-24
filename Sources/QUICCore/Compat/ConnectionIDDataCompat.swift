@@ -6,7 +6,7 @@
 /// legacy `DataReader` decode so existing callers and tests compile unchanged.
 
 import Foundation
-import QUICCoreCodec
+import QUICWire
 
 extension ConnectionID {
     /// Creates a connection ID from `Data` with validation.

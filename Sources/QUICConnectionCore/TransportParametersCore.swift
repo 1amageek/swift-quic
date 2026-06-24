@@ -10,7 +10,7 @@
 /// Embedded-clean: no Foundation, no `any`. The wire codec lives in
 /// ``TransportParameterCodecCore``.
 
-import QUICCoreCodec
+import QUICWire
 
 /// Preferred address for connection migration (RFC 9000 §18.2), wire-byte form.
 public struct PreferredAddressCore: Sendable, Hashable {

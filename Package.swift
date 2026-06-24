@@ -30,10 +30,10 @@ let package = Package(
             name: "QUIC",
             targets: ["QUIC"]
         ),
-        // Embedded-clean wire codec (varint + frame + packet-header codec)
+        // Tier-3 Embedded-clean wire codec (varint + frame + packet-header codec)
         .library(
-            name: "QUICCoreCodec",
-            targets: ["QUICCoreCodec"]
+            name: "QUICWire",
+            targets: ["QUICWire"]
         ),
         // Embedded-clean packet protection (PacketProtector<C,A> / SuiteProtector<C>)
         .library(
@@ -60,7 +60,7 @@ let package = Package(
             name: "QUICConnectionCore",
             targets: ["QUICConnectionCore"]
         ),
-        // Core types (no I/O dependencies) — Foundation adapter over QUICCoreCodec
+        // Core types (no I/O dependencies) — Foundation adapter over QUICWire
         .library(
             name: "QUICCore",
             targets: ["QUICCore"]
@@ -96,11 +96,11 @@ let package = Package(
         // MARK: - Embedded-clean wire codec (dual-build: host + Embedded)
 
         .target(
-            name: "QUICCoreCodec",
+            name: "QUICWire",
             dependencies: [
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
             ],
-            path: "Sources/QUICCoreCodec",
+            path: "Sources/QUICWire",
             swiftSettings: coreSettings
         ),
 
@@ -113,7 +113,7 @@ let package = Package(
         .target(
             name: "QUICPacketProtectionCore",
             dependencies: [
-                "QUICCoreCodec",
+                "QUICWire",
                 .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
                 .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
             ],
@@ -129,7 +129,7 @@ let package = Package(
         .target(
             name: "QUICRecoveryCore",
             dependencies: [
-                "QUICCoreCodec",
+                "QUICWire",
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
             ],
             path: "Sources/QUICRecoveryCore",
@@ -145,7 +145,7 @@ let package = Package(
         .target(
             name: "QUICStreamCore",
             dependencies: [
-                "QUICCoreCodec",
+                "QUICWire",
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
             ],
             path: "Sources/QUICStreamCore",
@@ -164,7 +164,7 @@ let package = Package(
         .target(
             name: "QUICTLSCore",
             dependencies: [
-                "QUICCoreCodec",
+                "QUICWire",
                 .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
                 .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
             ],
@@ -185,7 +185,7 @@ let package = Package(
         .target(
             name: "QUICConnectionCore",
             dependencies: [
-                "QUICCoreCodec",
+                "QUICWire",
                 "QUICPacketProtectionCore",
                 .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
                 .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
@@ -194,12 +194,12 @@ let package = Package(
             swiftSettings: coreSettings
         ),
 
-        // MARK: - Core Types (Foundation adapter over QUICCoreCodec)
+        // MARK: - Core Types (Foundation adapter over QUICWire)
 
         .target(
             name: "QUICCore",
             dependencies: [
-                "QUICCoreCodec",
+                "QUICWire",
                 "QUICConnectionCore",
                 .product(name: "P2PCoreFoundation", package: "swift-p2p-core"),
             ],

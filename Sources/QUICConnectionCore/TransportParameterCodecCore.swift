@@ -1,7 +1,7 @@
 /// QUIC Transport Parameter codec — Embedded-clean core (RFC 9000 §18).
 ///
 /// Encodes/decodes ``TransportParametersCore`` over `[UInt8]` via the
-/// ``QUICCoreCodec`` `ByteReader`/`ByteWriter` and varint primitives. The wire
+/// ``QUICWire`` `ByteReader`/`ByteWriter` and varint primitives. The wire
 /// format is byte-for-byte identical to the historical `Data`-based
 /// `TransportParameterCodec`; the `preferred_address` IPv4/IPv6 fields are
 /// parsed/formatted by the host adapter via ``IPAddressCodec`` (this core only
@@ -12,7 +12,7 @@
 /// input throws a distinct case.
 
 import P2PCoreBytes
-import QUICCoreCodec
+import QUICWire
 
 /// Error thrown by ``TransportParameterCodecCore``.
 public enum TransportParameterCodecError: Error, Sendable, Equatable {

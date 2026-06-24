@@ -10,11 +10,11 @@
 /// QUIC uses credit-based flow control similar to HTTP/2: the receiver advertises the
 /// maximum amount of data the sender can send. The frame types returned here
 /// (MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS / DATA_BLOCKED / STREAMS_BLOCKED) are the
-/// Embedded-clean codec types from `QUICCoreCodec`.
+/// Embedded-clean codec types from `QUICWire`.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`.
 
-import QUICCoreCodec
+import QUICWire
 
 public struct FlowControllerCore: Sendable {
     // MARK: - Role

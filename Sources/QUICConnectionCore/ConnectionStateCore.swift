@@ -20,7 +20,7 @@
 ///
 /// Embedded-clean: no Foundation, no `ContinuousClock`, no `any`, no `Mutex`.
 
-import QUICCoreCodec
+import QUICWire
 
 // MARK: - Connection Status
 
