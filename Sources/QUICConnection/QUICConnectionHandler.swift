@@ -643,24 +643,26 @@ public final class QUICConnectionHandler: Sendable {
             contexts[info.level] = CryptoContext(opener: opener, sealer: sealer)
         }
 
-        // Update key schedule
-        var updatedSchedule = keySchedule.withLock { $0 }
-        switch info.level {
-        case .handshake:
-            _ = try updatedSchedule.setHandshakeSecrets(
-                clientSecret: clientSecret,
-                serverSecret: serverSecret
-            )
-        case .application:
-            _ = try updatedSchedule.setApplicationSecrets(
-                clientSecret: clientSecret,
-                serverSecret: serverSecret,
-                cipherSuite: cipherSuite
-            )
-        default:
-            break
+        // Update key schedule under a single lock so concurrent installs (or an
+        // install racing the shared key-update path) cannot lose an update via a
+        // copy-out / mutate / write-back sequence. Mutate the schedule in place.
+        try keySchedule.withLock { schedule in
+            switch info.level {
+            case .handshake:
+                _ = try schedule.setHandshakeSecrets(
+                    clientSecret: clientSecret,
+                    serverSecret: serverSecret
+                )
+            case .application:
+                _ = try schedule.setApplicationSecrets(
+                    clientSecret: clientSecret,
+                    serverSecret: serverSecret,
+                    cipherSuite: cipherSuite
+                )
+            default:
+                break
+            }
         }
-        keySchedule.withLock { $0 = updatedSchedule }
     }
 
     /// Gets the crypto context for an encryption level

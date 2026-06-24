@@ -56,8 +56,21 @@ public actor QUICEndpoint {
     /// Whether this endpoint is a server
     private let isServer: Bool
 
-    /// Incoming connections (server mode)
+    /// Incoming connections stream (server mode), created lazily and cached so
+    /// every access returns the same stream. Recreating it on each read would
+    /// orphan previously-yielded connections and leak a never-finished stream.
+    private var incomingConnectionStream: AsyncStream<any QUICConnectionProtocol>?
+
+    /// Continuation paired with `incomingConnectionStream`.
     private var incomingConnectionContinuation: AsyncStream<any QUICConnectionProtocol>.Continuation?
+
+    /// Whether the incoming-connections stream has been finished (after shutdown).
+    private var incomingConnectionStreamFinished: Bool = false
+
+    /// Connections accepted before `incomingConnections` was first accessed.
+    /// Buffered so they are delivered to the first consumer instead of being
+    /// silently dropped (no silent fallback).
+    private var pendingIncomingConnections: [any QUICConnectionProtocol] = []
 
     /// Send callback (for testing without real socket)
     private var sendCallback: (@Sendable (Data, SocketAddress) async throws -> Void)?
@@ -97,6 +110,15 @@ public actor QUICEndpoint {
         self.router = ConnectionRouter(isServer: isServer, dcidLength: 8)
         self.timerManager = TimerManager(idleTimeout: configuration.maxIdleTimeout)
         self.isServer = isServer
+    }
+
+    /// Cancels the I/O task if the endpoint is dropped without `shutdown()`.
+    ///
+    /// Backstop for the leak case where a caller releases the endpoint without
+    /// calling `shutdown()`: cancelling `ioTask` lets the packet/timer loops exit
+    /// (the cancellation handler shuts the socket, finishing its incoming stream).
+    deinit {
+        ioTask?.cancel()
     }
 
     // MARK: - TLS Provider Creation
@@ -223,8 +245,12 @@ public actor QUICEndpoint {
     ) async throws -> (endpoint: QUICEndpoint, runTask: Task<Void, Error>) {
         let endpoint = QUICEndpoint(configuration: configuration, isServer: true)
 
-        // Start the I/O loop in a separate task
-        let runTask = Task {
+        // Start the I/O loop in a separate task. Capture the endpoint weakly so the
+        // stored `ioTask` does not form a self <-> ioTask reference cycle; the
+        // returned task is owned by the caller, which keeps the endpoint alive for
+        // as long as it holds the task.
+        let runTask = Task { [weak endpoint] in
+            guard let endpoint else { return }
             try await endpoint.run(socket: socket)
         }
         await endpoint.setIOTask(runTask)
@@ -254,10 +280,50 @@ public actor QUICEndpoint {
         _localAddress
     }
 
-    /// Stream of incoming connections (server mode)
+    /// Stream of incoming connections (server mode).
+    ///
+    /// The stream and its continuation are created once and cached, so repeated
+    /// accesses return the same stream. This mirrors `ManagedConnection.incomingStreams`
+    /// and avoids orphaning yielded connections (which would otherwise go nowhere
+    /// and leave a never-finished stream that hangs `for await`).
     public var incomingConnections: AsyncStream<any QUICConnectionProtocol> {
-        AsyncStream { continuation in
-            self.incomingConnectionContinuation = continuation
+        // After shutdown, return the (finished) cached stream, or an already-finished
+        // one, so new iterators exit immediately instead of hanging.
+        if incomingConnectionStreamFinished {
+            if let existing = incomingConnectionStream { return existing }
+            let (stream, continuation) = AsyncStream<any QUICConnectionProtocol>.makeStream()
+            continuation.finish()
+            incomingConnectionStream = stream
+            return stream
+        }
+
+        // Return the cached stream if already created (lazy initialization).
+        if let existing = incomingConnectionStream { return existing }
+
+        let (stream, continuation) = AsyncStream<any QUICConnectionProtocol>.makeStream()
+        incomingConnectionStream = stream
+        incomingConnectionContinuation = continuation
+
+        // Drain any connections that arrived before this was first accessed.
+        for pending in pendingIncomingConnections {
+            continuation.yield(pending)
+        }
+        pendingIncomingConnections.removeAll()
+
+        return stream
+    }
+
+    /// Delivers a newly accepted connection to the incoming-connections stream.
+    ///
+    /// If a consumer has not yet accessed `incomingConnections` (so no continuation
+    /// exists), the connection is buffered and delivered when the stream is first
+    /// accessed. After shutdown the connection is dropped.
+    private func deliverIncomingConnection(_ connection: any QUICConnectionProtocol) {
+        guard !incomingConnectionStreamFinished else { return }
+        if let continuation = incomingConnectionContinuation {
+            continuation.yield(connection)
+        } else {
+            pendingIncomingConnections.append(connection)
         }
     }
 
@@ -298,9 +364,13 @@ public actor QUICEndpoint {
         self.socket = socket
         self.isRunning = true
 
-        // Start I/O loop in background task
-        let runTask = Task { [self] in
-            try await runPacketLoop(socket: socket)
+        // Start I/O loop in background task. Capture `self` weakly so dropping the
+        // endpoint without calling `shutdown()` does not keep it (and its packet
+        // loop) alive via a self <-> ioTask reference cycle. `deinit` cancels the
+        // task as a backstop.
+        let runTask = Task { [weak self] in
+            guard let self else { return }
+            try await self.runPacketLoop(socket: socket)
         }
         self.ioTask = runTask
 
@@ -731,7 +801,7 @@ public actor QUICEndpoint {
         _ = try await connection.start()
 
         // Notify about new connection
-        incomingConnectionContinuation?.yield(connection)
+        deliverIncomingConnection(connection)
 
         return connection
     }
@@ -996,9 +1066,11 @@ public actor QUICEndpoint {
         let task = ioTask
         ioTask = nil
 
-        // Finish the incoming connections stream
+        // Finish the incoming connections stream so any `for await` exits.
+        incomingConnectionStreamFinished = true
         incomingConnectionContinuation?.finish()
         incomingConnectionContinuation = nil
+        pendingIncomingConnections.removeAll()
 
         // Stop the socket to finish its AsyncStream
         // This will cause the packetReceiveLoop's for-await to exit

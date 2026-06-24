@@ -112,59 +112,84 @@ public final class TimerManager: Sendable {
     /// Gets the next timer deadline across all connections
     /// - Returns: The earliest deadline, or nil if no timers pending
     public func nextDeadline() -> ContinuousClock.Instant? {
-        return connections.withLock { conns in
-            var earliest: ContinuousClock.Instant? = nil
+        // Snapshot under the lock, then query each connection (which takes the
+        // connection's own locks) OUTSIDE this lock. This keeps the critical
+        // section short and avoids nesting connection locks under `connections`,
+        // which would couple the two lock orders.
+        let active: [(connection: ManagedConnection, lastActivity: ContinuousClock.Instant)] =
+            connections.withLock { conns in
+                conns.values
+                    .filter { !$0.isClosed }
+                    .map { ($0.connection, $0.lastActivity) }
+            }
 
-            for (_, info) in conns {
-                guard !info.isClosed else { continue }
+        var earliest: ContinuousClock.Instant? = nil
 
-                // Get connection's next timer deadline
-                if let connectionDeadline = info.connection.nextTimerDeadline() {
-                    if earliest == nil || connectionDeadline < earliest! {
-                        earliest = connectionDeadline
-                    }
-                }
-
-                // Check idle timeout
-                let idleDeadline = info.lastActivity + idleTimeout
-                if earliest == nil || idleDeadline < earliest! {
-                    earliest = idleDeadline
+        for entry in active {
+            // Get connection's next timer deadline
+            if let connectionDeadline = entry.connection.nextTimerDeadline() {
+                if earliest == nil || connectionDeadline < earliest! {
+                    earliest = connectionDeadline
                 }
             }
 
-            return earliest
+            // Check idle timeout
+            let idleDeadline = entry.lastActivity + idleTimeout
+            if earliest == nil || idleDeadline < earliest! {
+                earliest = idleDeadline
+            }
         }
+
+        return earliest
     }
 
     /// Processes expired timers and returns events
     /// - Parameter now: Current time
     /// - Returns: Array of timer events
     public func processTimers(now: ContinuousClock.Instant = .now) -> [TimerEvent] {
-        var events: [TimerEvent] = []
-
-        connections.withLock { conns in
-            for (cid, info) in conns {
-                guard !info.isClosed else { continue }
-
-                // Check idle timeout
-                let idleDeadline = info.lastActivity + idleTimeout
-                if idleDeadline <= now {
-                    events.append(.idleTimeout(info.connection))
-                    // Mark as closed
-                    var updatedInfo = info
-                    updatedInfo.isClosed = true
-                    conns[cid] = updatedInfo
-                    continue
+        // Snapshot under the lock, then query each connection (`nextTimerDeadline()`
+        // / `isEstablished`, which take the connection's own locks) OUTSIDE this
+        // lock. This avoids nesting connection locks under `connections` and keeps
+        // the critical section short. Connections that idle out are written back as
+        // closed in a second short locked pass.
+        let active: [(cid: ConnectionID, connection: ManagedConnection, lastActivity: ContinuousClock.Instant)] =
+            connections.withLock { conns in
+                conns.compactMap { cid, info in
+                    info.isClosed ? nil : (cid, info.connection, info.lastActivity)
                 }
+            }
 
-                // Check connection's timer
-                if let connectionDeadline = info.connection.nextTimerDeadline(),
-                   connectionDeadline <= now {
-                    // Determine event type based on connection state
-                    if info.connection.isEstablished {
-                        events.append(.lossDetection(info.connection))
-                    } else {
-                        events.append(.probe(info.connection))
+        var events: [TimerEvent] = []
+        var idledOut: [ConnectionID] = []
+
+        for entry in active {
+            // Check idle timeout
+            let idleDeadline = entry.lastActivity + idleTimeout
+            if idleDeadline <= now {
+                events.append(.idleTimeout(entry.connection))
+                idledOut.append(entry.cid)
+                continue
+            }
+
+            // Check connection's timer
+            if let connectionDeadline = entry.connection.nextTimerDeadline(),
+               connectionDeadline <= now {
+                // Determine event type based on connection state
+                if entry.connection.isEstablished {
+                    events.append(.lossDetection(entry.connection))
+                } else {
+                    events.append(.probe(entry.connection))
+                }
+            }
+        }
+
+        // Write back the closed flags for connections that idled out.
+        if !idledOut.isEmpty {
+            connections.withLock { conns in
+                for cid in idledOut {
+                    if var info = conns[cid] {
+                        info.isClosed = true
+                        conns[cid] = info
                     }
                 }
             }

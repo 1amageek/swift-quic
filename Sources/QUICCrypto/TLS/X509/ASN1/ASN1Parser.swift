@@ -28,8 +28,28 @@ public struct ASN1Parser: Sendable {
 
     // MARK: - Public API
 
+    /// Maximum nesting depth for constructed TLVs.
+    ///
+    /// Bounds recursion so adversarial input such as a long run of constructed
+    /// SEQUENCE headers (`30 80 30 80 ...`) cannot exhaust the stack. Real X.509 /
+    /// PKIX structures nest far shallower than this.
+    private static let maxDepth = 64
+
     /// Parses the next TLV (Tag-Length-Value) from the data
     public mutating func parse() throws -> ASN1Value {
+        try parse(depth: 0)
+    }
+
+    /// Parses the next TLV, tracking the current nesting depth.
+    ///
+    /// - Parameter depth: Current recursion depth. The top-level call uses `0`;
+    ///   each constructed child increments it. Throws `depthLimitExceeded` once it
+    ///   would exceed `maxDepth`.
+    private mutating func parse(depth: Int) throws -> ASN1Value {
+        guard depth < ASN1Parser.maxDepth else {
+            throw ASN1Error.depthLimitExceeded(ASN1Parser.maxDepth)
+        }
+
         let startPos = position
 
         // Read tag
@@ -38,11 +58,14 @@ public struct ASN1Parser: Sendable {
         // Read length
         let length = try readLength()
 
-        // Calculate end position
-        let endPos = position + length
-        guard endPos <= data.endIndex else {
+        // Calculate end position without an addition that could overflow-trap.
+        // `readLength` only bounds each accumulation step, so `length` can be close
+        // to `Int.max`; `position + length` would trap before the bounds guard
+        // below could reject it. Validate against the remaining byte count instead.
+        guard length <= data.endIndex - position else {
             throw ASN1Error.unexpectedEndOfData
         }
+        let endPos = position + length
 
         // Get raw bytes for this TLV
         let rawBytes = data[startPos..<endPos]
@@ -50,11 +73,11 @@ public struct ASN1Parser: Sendable {
         // Read content
         if tag.isConstructed {
             // Parse children
-            let contentEnd = position + length
+            let contentEnd = endPos
             var children: [ASN1Value] = []
 
             while position < contentEnd {
-                let child = try parse()
+                let child = try parse(depth: depth + 1)
                 children.append(child)
             }
 

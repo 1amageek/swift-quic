@@ -470,4 +470,6 @@ public enum ASN1Error: Error, Sendable {
     case indexOutOfBounds(index: Int, count: Int)
     /// Unsupported feature
     case unsupported(String)
+    /// Constructed-value nesting exceeded the maximum allowed depth
+    case depthLimitExceeded(Int)
 }
