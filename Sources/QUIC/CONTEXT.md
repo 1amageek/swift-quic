@@ -4,12 +4,23 @@ QUIC Endpoint と Packet Processing の統合層。
 
 ## Cored Seam / 状態（重要）
 
-このモジュールは **host orchestrator** であり、まだ cored engine に移植されて
-**いない**（"M11" 待ち）。`QUICEndpoint`（~1280L, I/O ループ）、
-`ManagedConnection`（~2257L, 高レベル接続）、`TimerManager`（~329L, loss/PTO
-タイマ）は host 専用のまま。Embedded コンパイルは下位の core
-（`QUICWire` / `QUICPacketProtectionCore` / ...）を対象とし、この接続ファサード
-全体はまだ対象外。
+このモジュールは **host orchestrator** であり、その per-connection 同期オーケスト
+レーションは cored engine `QUICConnectionEngine<C, T>`（target
+`QUICConnectionEngineCore`）へ移植済み（"M11" engine slice 完了）。engine は
+値型・caller-locked・sans-IO・clock-free（DTLS テンプレート踏襲）で、3 PN spaces /
+key phase+key update / loss・RTT・CC・pacing / ACK 生成 / stream multiplex /
+flow control / idle / path validation を既存 core 駆動で内包する。時刻は
+`nowNanos: UInt64` 注入のみ、`handleTimeout(nowNanos:)` が caller-driven で
+probe/retx/owed-ACK/idle を返す。`--target QUICConnectionEngineCore -c release`
+で Embedded compile 緑。
+
+ただし `QUICEndpoint`（~1280L, I/O ループ）、`ManagedConnection`（~2257L, 高レベル
+接続）、`TimerManager`（~329L, loss/PTO タイマ）は **まだ engine を driving せず**
+host 専用のまま（facade rewire = `FacadeLock<Engine>`+`AsyncTimer`+
+`DatagramTransport` driver、`--target QUIC -c release` Embedded compile は後続スライス
+= tls Slice B 相当）。Embedded コンパイルは下位の core
+（`QUICWire` / `QUICPacketProtectionCore` / ... / `QUICConnectionEngineCore`）を
+対象とし、この接続ファサード全体（`QUIC` target）はまだ対象外。
 
 ただし `PacketProcessor` の暗号化/復号は cored seam を使う: cipher-suite dispatch
 は `any PacketOpener`/`Sealer` ではなく `SuiteProtector<C>`（閉じた enum, C =

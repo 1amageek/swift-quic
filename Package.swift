@@ -60,6 +60,13 @@ let package = Package(
             name: "QUICConnectionCore",
             targets: ["QUICConnectionCore"]
         ),
+        // Embedded-clean connection engine (value-type, caller-locked, sans-IO,
+        // clock-free) — the cored orchestrator (M11). Drives the cores; the host
+        // facade owns the DatagramTransport + AsyncTimer.
+        .library(
+            name: "QUICConnectionEngineCore",
+            targets: ["QUICConnectionEngineCore"]
+        ),
         // Core types (no I/O dependencies) — Foundation adapter over QUICWire
         .library(
             name: "QUICCore",
@@ -206,6 +213,35 @@ let package = Package(
             swiftSettings: coreSettings
         ),
 
+        // MARK: - Embedded-clean connection engine (dual-build: host + Embedded)
+
+        // The value-type, caller-locked, sans-IO connection orchestration engine
+        // `QUICConnectionEngine<C, T>` (M11). It owns the per-connection orchestration
+        // ManagedConnection currently does under Mutex — packet-number spaces, key
+        // phases, loss recovery + CC + pacing, ACK generation, stream multiplexing,
+        // flow control, connection state, idle timeout, path validation — driving the
+        // existing cores (NOT reimplementing them). Timers are clock-free: time is
+        // injected as `nowNanos: UInt64`, and `handleTimeout(nowNanos:)` returns what
+        // to send + the next deadline (mirroring DTLS's `DTLSFlightController`). I/O
+        // is inverted: `receive(datagram:from:nowNanos:) -> QUICEngineOutput` and the
+        // facade owns the `DatagramTransport` + `AsyncTimer`. Crypto/cert are injected
+        // via typed-throws closures; X.509 stays out of the engine. No Foundation,
+        // no `any`, no `Mutex`/`ContinuousClock`, no direct-Crypto.
+        .target(
+            name: "QUICConnectionEngineCore",
+            dependencies: [
+                "QUICWire",
+                "QUICPacketProtectionCore",
+                "QUICConnectionCore",
+                "QUICRecoveryCore",
+                "QUICStreamCore",
+                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+            ],
+            path: "Sources/QUICConnectionEngineCore",
+            swiftSettings: coreSettings
+        ),
+
         // MARK: - Core Types (Foundation adapter over QUICWire)
 
         .target(
@@ -332,6 +368,20 @@ let package = Package(
             name: "QUICRecoveryTests",
             dependencies: ["QUICRecovery", "QUICCore"],
             path: "Tests/QUICRecoveryTests"
+        ),
+
+        .testTarget(
+            name: "QUICConnectionEngineCoreTests",
+            dependencies: [
+                "QUICConnectionEngineCore",
+                "QUICWire",
+                "QUICPacketProtectionCore",
+                "QUICConnectionCore",
+                .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
+                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+            ],
+            path: "Tests/QUICConnectionEngineCoreTests"
         ),
 
         .testTarget(
