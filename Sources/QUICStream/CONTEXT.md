@@ -10,6 +10,21 @@ This module implements QUIC stream multiplexing and flow control. It handles:
 - Connection and stream-level flow control
 - Out-of-order data reassembly
 
+## Cored Seam
+
+QUICStream is a **host (Foundation) adapter**. The stream state-machine logic
+lives in the Embedded-clean **QUICStreamCore** target as value types over
+`[UInt8]`:
+
+- `SendStreamCore` / `ReceiveStreamCore` — send/receive FSMs
+- `StreamReassemblyBuffer` — out-of-order reassembly
+- `FlowControllerCore` — connection + stream-level flow control
+
+The adapter types here (`DataStream`, `FlowController`, `DataBuffer`) hold those
+cores under a `Mutex` and bridge `Data`. `StreamManager` and the priority
+scheduler (`StreamScheduler`) remain host-only orchestration. No Foundation /
+`any` / `Mutex` in the cores.
+
 ## Architecture
 
 ```

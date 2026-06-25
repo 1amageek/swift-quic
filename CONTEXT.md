@@ -4,172 +4,65 @@ QUIC プロトコル (RFC 9000, 9001, 9002) の Swift 実装。
 
 ## ディレクトリ構造
 
+swift-quic は **Embedded-first**。プロトコルロジックは Embedded-clean な *core*
+ターゲット（値型・呼び出し側ロック・sans-IO・crypto seam にジェネリック）に置き、
+host (Foundation) モジュールはその上の薄いアダプタである。`Package.swift` の
+`P2P_CORE_EMBEDDED=1` トグルで core を Embedded ビルドに切り替える（dual-build）。
+
 ```
 Sources/
-├── QUICCore/       # コア型、パケット/フレームコーデック
-├── QUICCrypto/     # 暗号化操作、TLS 1.3
-├── QUICConnection/ # 接続状態管理
-├── QUICRecovery/   # ロス検出、輻輳制御
-├── QUICStream/     # ストリーム管理
-└── QUIC/           # 高レベル API
+# --- Embedded-clean cores (dual-build: host + Embedded) ---
+├── QUICWire/                 # Tier-3 ワイヤコーデック (Varint, Frame/, Packet/,
+│                             #   Version, ProtocolLimits, SafeConversions, StandardFrameCodec)
+├── QUICPacketProtectionCore/ # PacketProtector<C,A> / SuiteProtector<C> (`any` を置換), 鍵導出
+├── QUICRecoveryCore/         # LossDetectorCore, RTTEstimatorCore, CUBIC/NewReno, Pacer
+├── QUICStreamCore/           # Send/ReceiveStreamCore FSM, ReassemblyBuffer, FlowControllerCore
+├── QUICTLSCore/              # TLS 1.3 鍵スケジュール + transcript hash + handshake FSM
+├── QUICConnectionCore/       # DPLPMTUD, transport-params codec, packet parse/serialize core
+# --- host adapters (Foundation) ---
+├── QUICCore/                 # QUICWire+QUICConnectionCore の Foundation アダプタ
+├── QUICCrypto/               # QUICTLSCore + QUICPacketProtectionCore のアダプタ (C = DefaultCryptoProvider)
+├── QUICConnection/           # 接続状態管理 (QUICConnectionCore の上)
+├── QUICRecovery/             # ロス検出、輻輳制御 (QUICRecoveryCore の上)
+├── QUICStream/               # ストリーム管理 (QUICStreamCore の上)
+├── QUICTransport/            # UDP 統合 (swift-nio-udp)
+└── QUIC/                     # 高レベル API (host orchestrator — まだ core 化されていない)
 ```
 
-各ディレクトリには個別の `CONTEXT.md` があります。
+`QUIC`, `QUICConnection`, `QUICCrypto`, `QUICCrypto/TLS`, `QUICRecovery`,
+`QUICStream` には個別の `CONTEXT.md` がある。6 つの core ターゲットには専用の
+`CONTEXT.md` はなく、対応する親アダプタの `CONTEXT.md` で説明する。
+
+> **状態 (重要)**: Embedded コンパイルは core を対象とし、接続ファサード全体は
+> まだ対象外。host orchestrator (`QUICEndpoint` ~1280L / `ManagedConnection`
+> ~2257L / `TimerManager` ~329L) は未だ cored engine に移植されていない（"M11"
+> 待ち）。リリース済み `1.3.0` は host API。core は `embedded` ブランチで未リリース
+> （"M8" 待ち）。高レベル API（`QUICEndpoint.serve/dial`,
+> `QUICConfiguration.production`, `MockTLSProvider`）は不変かつ正確。
 
 ---
 
-## コードレビュー結果
+## コードレビュー結果（履歴）
 
-**レビュー日**: 2026-01-19
-**ツール**: OpenAI Codex CLI (gpt-5.2-codex)
+> **注意**: 以下は **2026-01-19 の Codex CLI レビュー時点のスナップショット**で
+> あり、現在の `embedded` ブランチには当てはまらない。当時 "未対応" だった項目は
+> その後対応済み。最新の設計・対応状況は `PHASE_B_DESIGN.md`（#1/#7/#8 の根本対応）
+> および git 履歴を参照すること。下表は履歴として残す。
 
-### Critical (重大) - なし
+| # | 問題 | 重要度 | 当時の状態 | 現状 |
+|---|------|--------|-----------|------|
+| 1 | ACK レンジ DoS (`LossDetector`) | Warning | 未対応 | 対応済み — `PHASE_B_DESIGN.md` (bounded iteration) + その後の硬化。ロジックは `QUICRecoveryCore.LossDetectorCore` に core 化 |
+| 2 | ChaCha20 エンディアン | Warning | 対応済み | 対応済み |
+| 3 | X.509 検証不足 (EKU/SAN/NameConstraints) | Warning | 未対応 | 対応済み — `QUICCrypto/TLS/X509/X509Validator.swift` で EKU(serverAuth)/SAN/NameConstraints を検証 |
+| 4 | MAX_STREAMS ゼロガード | Warning | 対応済み | 対応済み |
+| 5 | MockTLSProvider デフォルト | Warning | 未対応 | 対応済み — TLS プロバイダは必須（insecure default なし）。`.production`/`.development`/`.testing` で明示注入 |
+| 6 | AES HP 非 Apple | Warning | 未対応 | 解消 — HP は `DefaultCryptoProvider` / `QUICPacketProtectionCore` の seam 経由（host swift-crypto / Embedded BoringSSL）。CommonCrypto 直叩きではない |
+| 7 | ヘッダ検証未使用 | Info | 未対応 | `PHASE_B_DESIGN.md` 参照 |
+| 8 | STREAM オーバーヘッド誤差 | Info | 未対応 | `PHASE_B_DESIGN.md` 参照 |
+| 9 | peekBytes コメント | Info | 問題なし | 問題なし |
 
-### Warning (警告) - 6件
-
-#### 1. ACK レンジによる CPU DoS
-
-**ファイル**: `Sources/QUICRecovery/LossDetector.swift:144-188`
-
-**問題**: `processAckedRanges` が ACK レンジ内の全パケット番号をイテレート。悪意ある巨大レンジで O(range) ループを強制可能。
-
-**対策案**: `sentPackets` のキーをイテレートし、レンジ内に含まれるか確認する方式に変更。
-
-```swift
-// Before: O(range_length) - 危険
-for pn in checkStart...current {
-    if let packet = state.sentPackets[pn] { ... }
-}
-
-// After: O(sentPackets.count * log(ranges)) - 安全
-for pn in state.sentPackets.keys {
-    if isInAckRanges(pn, ranges: ackFrame.ackRanges) { ... }
-}
-```
-
----
-
-#### 2. ChaCha20 カウンタロードのエンディアン問題
-
-**ファイル**: `Sources/QUICCrypto/AEAD.swift:427-433`
-
-**問題**: `load(as: UInt32.self)` がネイティブエンディアンを仮定。ビッグエンディアン環境で誤動作の可能性。
-
-**対策案**: リトルエンディアンで明示的にデコード。
-
-```swift
-// Before: エンディアン依存
-let counter = sample.withUnsafeBytes { $0.load(as: UInt32.self) }
-
-// After: 明示的リトルエンディアン
-let counter = sample.withUnsafeBytes {
-    UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self))
-}
-```
-
----
-
-#### 3. X.509 検証の不足
-
-**ファイル**: `Sources/QUICCrypto/TLS/X509/X509Validator.swift:172-223`
-
-**問題**: EKU (serverAuth)、SAN 要件、名前制約の検証なし。不正な証明書を受け入れる可能性。
-
-**対策案**:
-- ExtendedKeyUsage で serverAuth を検証
-- Subject Alternative Name (SAN) のホスト名検証
-- 名前制約の強制
-
----
-
-#### 4. MAX_STREAMS 自動拡張の問題
-
-**ファイル**: `Sources/QUICStream/FlowController.swift:423-438`
-
-**問題**: `maxLocalStreams = 0` の場合も自動拡張が発動し、ストリーム禁止設定を上書き。
-
-**対策案**: ゼロ値チェックを追加。
-
-```swift
-// Before: ゼロでも拡張される
-let threshold = maxLocalBidiStreams / 2
-if openRemoteBidiStreams >= threshold { ... }
-
-// After: ゼロなら拡張しない
-guard maxLocalBidiStreams > 0 else { return nil }
-let threshold = maxLocalBidiStreams / 2
-if openRemoteBidiStreams >= threshold { ... }
-```
-
----
-
-#### 5. MockTLSProvider のデフォルト使用
-
-**ファイル**: `Sources/QUIC/QUICEndpoint.swift:174-180`
-
-**問題**: TLS プロバイダ未指定時に `MockTLSProvider` を使用。本番環境で TLS が無効化される危険性。
-
-**対策案**:
-- 本番ビルドで MockTLSProvider の使用を禁止
-- または TLS プロバイダを必須パラメータに変更
-
----
-
-#### 6. AES ヘッダ保護の非 Apple プラットフォーム問題
-
-**ファイル**: `Sources/QUICCrypto/AEAD.swift:439-485`
-
-**問題**: Linux 等で AES-ECB ヘッダ保護が例外を投げる。
-
-**対策案**: OpenSSL/BoringSSL または ソフトウェアフォールバックを実装。
-
----
-
-### Info (情報) - 3件
-
-#### 1. ヘッダ検証の未使用
-
-**ファイル**: `Sources/QUICCore/Packet/PacketHeader.swift:560-619`
-
-**問題**: `LongHeader.validate()` / `ShortHeader.validate()` が定義されているがデコードパスで呼ばれていない。
-
-**対策案**: ヘッダ保護除去後に検証を呼び出す。
-
----
-
-#### 2. STREAM フレームオーバーヘッドの近似誤差
-
-**ファイル**: `Sources/QUICStream/StreamManager.swift:491-498`
-
-**問題**: 固定 11 バイトで計算しているが varint サイズで変動。パケットサイズ超過の可能性。
-
-**対策案**: 実際の varint サイズを計算してオーバーヘッドを算出。
-
----
-
-#### 3. `peekBytes` のコメント不一致
-
-**ファイル**: `Sources/QUICCore/DataReader.swift:71-79`
-
-**問題**: "no copy" とコメントしているが `Data(data[position..<])` でコピーが発生。
-
-**対策案**: コメントを修正、または実際にコピーを回避する実装に変更。
-
----
-
-## 対応状況
-
-| # | 問題 | 重要度 | 状態 |
-|---|------|--------|------|
-| 1 | ACK レンジ DoS | Warning | 未対応 |
-| 2 | ChaCha20 エンディアン | Warning | ✅ 対応済み (Phase 11) |
-| 3 | X.509 検証不足 | Warning | 未対応 |
-| 4 | MAX_STREAMS ガード | Warning | ✅ 対応済み (Phase 11) |
-| 5 | MockTLSProvider デフォルト | Warning | 未対応 |
-| 6 | AES HP 非 Apple | Warning | 未対応 |
-| 7 | ヘッダ検証未使用 | Info | 未対応 |
-| 8 | STREAM オーバーヘッド | Info | 未対応 |
-| 9 | peekBytes コメント | Info | ✅ 問題なし (コメントは正確) |
+crypto は `DefaultCryptoProvider`（host swift-crypto / Embedded BoringSSL）に統一
+され、削除された per-lib `QUICFoundationProvider` を置き換えた。
 
 ---
 

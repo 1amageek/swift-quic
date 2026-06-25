@@ -68,69 +68,139 @@ codex exec --skip-git-repo-check -C "Review Sources/QUICCore/Packet/ for RFC com
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Embedded-First Architecture
+
+swift-quic is **Embedded-first**: the protocol logic lives in a set of
+Embedded-clean *core* targets (value-type, caller-locked, sans-IO, generic over
+the crypto seam), and the host (Foundation) modules are thin adapters over them.
+
+- `P2P_CORE_EMBEDDED=1` (a `Context.environment` toggle in `Package.swift`)
+  switches the core targets into Embedded mode: it enables the experimental
+  `Embedded` feature + whole-module optimization (`-wmo`). The `Lifetimes`
+  feature is enabled in **both** modes (Span-returning members of the
+  `P2PCoreBytes` dependency require `@_lifetime`). The cores are **dual-build**:
+  they compile both as ordinary host libraries and under Embedded Swift.
+- Embedded rules for the cores: no Foundation, no `any` existentials, no
+  `Mutex`/`ContinuousClock`, no direct swift-crypto; all crypto goes through the
+  `CryptoProvider` seam; typed throws; closed enums instead of `any`. Cipher-suite
+  dispatch is `SuiteProtector<C>` (a closed enum over `PacketProtector<C, A>`),
+  which replaced the old `any PacketOpener`/`any PacketSealer` existentials.
+
+> **IMPORTANT — current status.** The Embedded compile covers the **cores**, not
+> yet the full connection facade. The host orchestrator
+> (`QUICEndpoint` ~1280L / `ManagedConnection` ~2257L / `TimerManager` ~329L) is
+> **not** yet ported to a cored engine — that port is pending (milestone "M11").
+> The released `1.3.0` tag is the host API. The Embedded cores are unreleased on
+> the `embedded` branch (milestone "M8" pending). The high-level usage API
+> (`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`)
+> is unchanged and accurate.
+
 ## Module Structure
 
 ```
 swift-quic/
 ├── Sources/
-│   ├── QUIC/                    # Main public API
-│   │   ├── QUICClient.swift     # Client-side connection establishment
-│   │   ├── QUICListener.swift   # Server-side listener
-│   │   ├── QUICConnection.swift # Multiplexed connection
-│   │   ├── QUICStream.swift     # Individual stream
-│   │   └── QUICConfiguration.swift
-│   │
-│   ├── QUICCore/                # Core types (no I/O dependencies)
+│   ├── QUICWire/                # Tier-3 Embedded-clean wire codec (dual-build)
+│   │   ├── Varint.swift                # QUIC variable-length integer
+│   │   ├── ProtocolLimits.swift        # RFC-compliant protocol limits
+│   │   ├── SafeConversions.swift       # Overflow-checked integer conversions
+│   │   ├── QUICWireError.swift
 │   │   ├── Packet/
 │   │   │   ├── PacketHeader.swift      # Long/Short header
-│   │   │   ├── PacketNumber.swift      # Packet number encoding
 │   │   │   ├── ConnectionID.swift
-│   │   │   └── Version.swift
-│   │   ├── Frame/
-│   │   │   ├── Frame.swift             # Frame enum
-│   │   │   ├── StreamFrame.swift
-│   │   │   ├── AckFrame.swift
-│   │   │   ├── CryptoFrame.swift
-│   │   │   └── ...
-│   │   ├── Varint.swift                # QUIC variable-length integer
-│   │   └── Error.swift
+│   │   │   └── Version.swift           # salt / retry-integrity constants
+│   │   └── Frame/
+│   │       ├── Frame.swift             # Frame enum + FrameType
+│   │       ├── FrameCodec.swift        # StandardFrameCodec
+│   │       ├── FrameTypes.swift
+│   │       └── FrameSize.swift
 │   │
-│   ├── QUICCrypto/              # TLS 1.3 integration
-│   │   ├── TLS13.swift          # TLS 1.3 state machine
-│   │   ├── KeySchedule.swift    # HKDF key derivation
-│   │   ├── AEAD.swift           # AES-GCM / ChaCha20-Poly1305
-│   │   ├── HeaderProtection.swift
-│   │   └── CryptoState.swift
+│   ├── QUICPacketProtectionCore/  # Embedded-clean packet protection (dual-build)
+│   │   ├── PacketProtector.swift       # PacketProtector<C, A> (AEAD + HP over the seam)
+│   │   ├── SuiteProtector.swift        # closed cipher-suite enum (no `any`)
+│   │   └── QUICKeyDerivation.swift     # RFC 9001 §5.1 key material
 │   │
-│   ├── QUICConnection/          # Connection management
-│   │   ├── ConnectionState.swift
-│   │   ├── ConnectionManager.swift
-│   │   ├── PathManager.swift
-│   │   └── IdleTimeout.swift
+│   ├── QUICRecoveryCore/        # Embedded-clean congestion control + pacing (dual-build)
+│   │   ├── LossDetectorCore.swift      # sorted-array packet/time threshold detection
+│   │   ├── RTTEstimatorCore.swift
+│   │   ├── CubicCore.swift             # CUBIC (RFC 9438)
+│   │   ├── NewRenoCore.swift           # NewReno (RFC 9002 §7)
+│   │   ├── PacerCore.swift             # token-bucket pacing (RFC 9002 §7.7)
+│   │   └── AntiAmplificationCore.swift
 │   │
-│   ├── QUICStream/              # Stream management (RFC 9000 Section 2-4)
-│   │   ├── DataStream.swift       # Individual stream with send/receive state machines
+│   ├── QUICStreamCore/          # Embedded-clean STREAM state machine (dual-build)
+│   │   ├── SendStreamCore.swift        # send FSM
+│   │   ├── ReceiveStreamCore.swift     # receive FSM
+│   │   ├── StreamReassemblyBuffer.swift
+│   │   └── FlowControllerCore.swift
+│   │
+│   ├── QUICTLSCore/             # Embedded-clean TLS 1.3 key schedule + handshake (dual-build)
+│   │   ├── TLSKeyScheduleCore.swift    # RFC 8446 §7.1 key schedule
+│   │   ├── TLSTranscriptHashCore.swift # incremental transcript hash
+│   │   ├── QUICClientHandshake.swift   # client handshake FSM
+│   │   ├── QUICServerHandshake.swift   # server handshake FSM
+│   │   ├── QUICClientAuthMachine.swift # post-ServerHello auth FSM
+│   │   └── ...                         # message + extension wire codecs
+│   │
+│   ├── QUICConnectionCore/      # Embedded-clean connection state machines (dual-build)
+│   │   ├── PathMTUSearchCore.swift     # DPLPMTUD (RFC 8899 / RFC 9000 §14)
+│   │   ├── TransportParameterCodecCore.swift  # RFC 9000 §18
+│   │   ├── IPAddressCodec.swift        # Foundation-free IPv4/IPv6 parser
+│   │   ├── PacketParsingCore.swift     # packet parse/serialize over SuiteProtector<C>
+│   │   ├── ConnectionStateCore.swift
+│   │   ├── IdleTimeoutCore.swift
+│   │   └── PathValidationCore.swift
+│   │
+│   ├── QUICCore/                # Foundation adapter over QUICWire + QUICConnectionCore
+│   │   ├── Packet/PacketCodec.swift    # packet encoding with encryption + padding
+│   │   ├── Compat/                     # Data-based views over the wire codec
+│   │   └── ...
+│   │
+│   ├── QUICCrypto/              # TLS 1.3 + packet-protection adapter (over QUICTLSCore + QUICPacketProtectionCore)
+│   │   ├── TLS/TLS13Handler.swift      # TLS 1.3 state machine (host adapter)
+│   │   ├── InitialSecrets.swift        # Initial key derivation, KeyMaterial, QUICCipherSuite
+│   │   ├── AEAD.swift                  # AES-GCM / ChaCha20-Poly1305 over PacketProtector<C,A>
+│   │   ├── CryptoState.swift           # CryptoContext, HeaderProtection
+│   │   └── QUICCryptoProvider.swift    # the unified C = DefaultCryptoProvider (+ DER-ECDSA)
+│   │
+│   ├── QUICConnection/          # Connection orchestration adapter (over QUICConnectionCore)
+│   │   ├── QUICConnectionHandler.swift # per-connection state machine, TLS integration
+│   │   └── ...
+│   │
+│   ├── QUICStream/              # Stream adapter (over QUICStreamCore; RFC 9000 §2-4)
+│   │   ├── DataStream.swift       # holds Send/ReceiveStreamCore under Mutex, bridges Data
 │   │   ├── StreamManager.swift    # Stream multiplexing, creation, lifecycle
-│   │   ├── FlowController.swift   # Connection & stream-level flow control
-│   │   ├── DataBuffer.swift       # Out-of-order data reassembly
-│   │   └── StreamState.swift      # Send/receive state enums
+│   │   ├── FlowController.swift   # wraps FlowControllerCore
+│   │   ├── DataBuffer.swift       # wraps StreamReassemblyBuffer
+│   │   └── StreamState.swift
 │   │
-│   ├── QUICRecovery/            # Loss detection & congestion (RFC 9002)
-│   │   ├── LossDetector.swift        # Packet loss detection with PTO support
+│   ├── QUICRecovery/            # Loss detection adapter (over QUICRecoveryCore; RFC 9002)
+│   │   ├── LossDetector.swift        # holds LossDetectorCore under Mutex
 │   │   ├── AckManager.swift          # ACK frame generation & tracking
-│   │   ├── RTTEstimator.swift        # RTT measurement & smoothing
-│   │   ├── NewRenoCongestionController.swift  # NewReno congestion control
-│   │   ├── AntiAmplificationLimiter.swift     # Server amplification attack prevention
-│   │   └── SentPacket.swift          # Sent packet metadata
+│   │   ├── RTTEstimator.swift        # wraps RTTEstimatorCore
+│   │   ├── NewRenoCongestionController.swift  # wraps NewRenoCore
+│   │   ├── CubicCongestionController.swift     # wraps CubicCore
+│   │   ├── AntiAmplificationLimiter.swift     # wraps AntiAmplificationCore
+│   │   └── SentPacket.swift
 │   │
-│   └── QUICTransport/           # UDP integration
-│       ├── UDPSocket.swift      # Uses swift-nio-udp
-│       └── PacketIO.swift
+│   ├── QUICTransport/           # UDP integration (uses swift-nio-udp)
+│   │
+│   └── QUIC/                    # Main public API (host orchestrator — NOT yet cored)
+│       ├── QUICEndpoint.swift     # Server/Client endpoint, I/O loops
+│       ├── ManagedConnection.swift# high-level connection (async streams)
+│       ├── ManagedStream.swift
+│       ├── ConnectionRouter.swift # DCID-based routing
+│       ├── PacketProcessor.swift  # packet encryption/decryption over SuiteProtector<C>
+│       ├── TimerManager.swift     # loss-detection / PTO timers
+│       └── QUICConfiguration.swift
 │
 └── Tests/
     ├── QUICCoreTests/
-    ├── QUICCryptoTests/
-    └── QUICIntegrationTests/
+    ├── QUICCryptoTests/      # also exercises QUICPacketProtectionCore + QUICTLSCore
+    ├── QUICRecoveryTests/
+    ├── QUICStreamTests/
+    ├── QUICTests/           # integration
+    └── QUICBenchmarks/
 ```
 
 ## Key Types
@@ -234,10 +304,25 @@ public enum EncryptionLevel: Sendable {
     case application
 }
 
-/// QUIC packet protection
-public protocol PacketProtector: Sendable {
-    func protect(_ packet: inout Data, packetNumber: UInt64) throws
-    func unprotect(_ packet: inout Data) throws -> UInt64
+/// QUIC packet protection (Embedded-clean, in QUICPacketProtectionCore).
+///
+/// The generic `PacketProtector<C, A>` carries one keyed AEAD `A` plus the
+/// packet-protection IV and header-protection key, performing seal/open and
+/// header protection over the `CryptoProvider` / `HeaderProtectionProvider` seam.
+public struct PacketProtector<C: CryptoProvider, A: AEAD>: Sendable {
+    public func seal(_ plaintext: [UInt8], packetNumber: UInt64, header: [UInt8]) throws(PacketProtectionError) -> [UInt8]
+    public func open(_ ciphertext: [UInt8], packetNumber: UInt64, header: [UInt8]) throws(PacketProtectionError) -> [UInt8]
+    public func applyHeaderProtection(sample: [UInt8], firstByte: UInt8, packetNumberBytes: [UInt8]) throws(PacketProtectionError) -> (firstByte: UInt8, packetNumberBytes: [UInt8])
+    public func removeHeaderProtection(sample: [UInt8], firstByte: UInt8, packetNumberBytes: [UInt8]) throws(PacketProtectionError) -> (firstByte: UInt8, packetNumberBytes: [UInt8])
+}
+
+/// Cipher-suite dispatch is a closed enum — NOT `any PacketOpener`/`any PacketSealer`.
+/// QUIC mandates AES-128-GCM and ChaCha20-Poly1305 (RFC 9001 §5.3); key updates
+/// may add AES-256-GCM. The adapter instantiates it at C = QUICCryptoProvider.
+public enum SuiteProtector<C: CryptoProvider>: Sendable {
+    case aes128GCM(PacketProtector<C, C.AESGCM128>)
+    case aes256GCM(PacketProtector<C, C.AESGCM256>)
+    case chaCha20Poly1305(PacketProtector<C, C.ChaChaPoly>)
 }
 
 /// TLS 1.3 integration
@@ -381,11 +466,11 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 ### Phase 2: Crypto (QUICCrypto) ✅
 - [x] HKDF key derivation
 - [x] Initial secrets (derived from Connection ID)
-- [x] AES-128-GCM AEAD
-- [x] AES-128 Header protection (CommonCrypto/Apple, _CryptoExtras/Linux)
+- [x] AES-128-GCM AEAD (over PacketProtector<C, A>)
+- [x] AES Header protection (routed through the HeaderProtectionProvider seam — DefaultCryptoProvider: host swift-crypto / Embedded BoringSSL; no longer CommonCrypto-direct)
 - [x] ChaCha20-Poly1305 AEAD
-- [x] ChaCha20 Header protection
-- [x] Cross-platform support (Apple/Linux)
+- [x] ChaCha20 Header protection (via the seam)
+- [x] Cross-platform support (host swift-crypto / Embedded BoringSSL)
 
 ### Phase 3: TLS 1.3 Integration ✅
 - [x] TLS13Provider protocol
@@ -400,6 +485,7 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] Session resumption (PSK)
 - [x] 0-RTT early data
 - [x] MockTLSProvider for testing (#if DEBUG guarded)
+- [x] TLS 1.3 handshake + key schedule cored into QUICTLSCore (client/server/auth FSMs)
 - [ ] libp2p extension support (OID 1.3.6.1.4.1.53594.1.1)
 
 ### Phase 4: Connection Layer ✅
@@ -423,27 +509,64 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] STOP_SENDING/RESET_STREAM handling
 - [ ] Priority scheduling
 
-### Phase 7: Integration
-- [ ] UDP transport integration (swift-nio-udp)
-- [ ] Public API (QUICClient, QUICListener)
-- [ ] libp2p Transport wrapper
-- [ ] Interoperability testing (quiche, quinn)
+### Phase 7: Integration ✅
+- [x] UDP transport integration (swift-nio-udp)
+- [x] Public API — entry point is `QUICEndpoint` (`serve` / `dial`), with
+      `ManagedConnection` / `ManagedStream` as the high-level surface.
+      (There is no `QUICClient` / `QUICListener` type.)
+- [x] libp2p Transport wrapper
+- [x] Interoperability testing (quinn, ngtcp2; Docker-based)
+
+### Phase 8: Embedded-first re-tier (cores) — in progress
+- [x] QUICWire (Tier-3 wire codec) extracted from QUICCore
+- [x] QUICPacketProtectionCore (PacketProtector<C,A> / SuiteProtector<C>)
+- [x] QUICRecoveryCore (CUBIC + NewReno + pacing)
+- [x] QUICStreamCore (Send/Receive FSMs + reassembly + flow control)
+- [x] QUICTLSCore (key schedule + transcript hash + handshake FSMs)
+- [x] QUICConnectionCore (DPLPMTUD + transport-params codec + packet parse/serialize)
+- [x] Crypto unified on DefaultCryptoProvider (QUICFoundationProvider deleted)
+- [ ] Tagged release of the cores (milestone "M8")
+- [ ] Port the host orchestrator (QUICEndpoint / ManagedConnection / TimerManager)
+      to a cored connection engine (milestone "M11"). Until then the Embedded
+      compile covers the cores, not the full connection facade.
 
 ## Dependencies
 
+Verify against `Package.swift` (Swift tools 6.2; platforms macOS/iOS/tvOS/watchOS/visionOS v26).
+
 ```swift
 dependencies: [
-    // UDP transport
+    // UDP transport — local-path on the embedded branch (a URL pin collides with
+    // swift-libp2p's local-path nio-udp via SwiftPM identity). Restore URL before release.
     .package(path: "../swift-nio-udp"),
-    // Or: .package(url: "...", from: "1.0.0"),
 
-    // Cryptography
-    .package(url: "https://github.com/apple/swift-crypto.git", from: "4.0.0"),
+    // Cryptography — range (not `from:`) so apple/swift-crypto resolves to a single
+    // version compatible with swift-p2p-crypto (3.x floor) and swift-certificates.
+    .package(url: "https://github.com/apple/swift-crypto.git", "3.12.3"..<"5.0.0"),
+
+    // X.509 + ASN.1
+    .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.0"),
+    .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.0"),
 
     // Logging
-    .package(url: "https://github.com/apple/swift-log.git", from: "1.8.0"),
+    .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
+
+    // Documentation
+    .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
+
+    // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter) + crypto seam
+    .package(path: "../swift-p2p-core"),
+
+    // Unified crypto provider: surfaces `DefaultCryptoProvider` (host swift-crypto /
+    // Embedded BoringSSL). Replaces the deleted per-lib QUICFoundationProvider.
+    .package(path: "../swift-p2p-crypto"),
 ]
 ```
+
+The unified provider: `QUICCryptoProvider` is the host adapter's concrete crypto
+provider — it mirrors `DefaultCryptoProvider` (host swift-crypto / Embedded
+BoringSSL) except ECDSA signatures are DER-encoded for the TLS path. Every generic
+core engine is specialised at `C = QUICCryptoProvider` in the host adapters.
 
 ## References
 

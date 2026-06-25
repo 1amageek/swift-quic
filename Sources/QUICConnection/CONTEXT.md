@@ -2,6 +2,22 @@
 
 QUIC Connection ハンドラと状態管理。
 
+## Cored Seam
+
+`QUICConnectionHandler` は **host (Foundation) アダプタ**。codec/crypto ではない
+純粋な接続状態機械は Embedded-clean な **QUICConnectionCore** の値型にある:
+
+- `ConnectionStateCore` / `IdleTimeoutCore` / `PathValidationCore` — 接続ライフ
+  サイクルの状態機械
+- `PathMTUSearchCore` — DPLPMTUD 探索 (RFC 8899 / RFC 9000 §14)
+- `TransportParameterCodecCore` + `IPAddressCodec` — transport-params codec
+  (RFC 9000 §18, Foundation-free な IPv4/IPv6 パーサ)
+- `PacketParsingCore` — packet parse/serialize core（cored `SuiteProtector<C>` を
+  駆動）
+
+key installation は依然として host アダプタの責務だが、cipher-suite dispatch は
+`any PacketOpener`/`Sealer` ではなく `SuiteProtector<C>`（閉じた enum）で行う。
+
 ## Architecture
 
 ```

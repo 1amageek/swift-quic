@@ -27,7 +27,7 @@ client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
 server_initial_secret = HKDF-Expand-Label(initial_secret, "server in", "", 32)
 ```
 
-**Implementation:** `Sources/QUICCore/Packet/Version.swift:47-66`
+**Implementation:** `Sources/QUICWire/Packet/Version.swift:47-66`
 ```swift
 public var initialSalt: Data? {
     switch self {
@@ -182,15 +182,28 @@ private func constructNonce(iv: Data, packetNumber: UInt64) -> Data {
 - Short header: mask lower 5 bits of first byte
 - Packet number bytes: XOR with mask[1..pn_length+1]
 
-**Implementation:** `Sources/QUICCrypto/AEAD.swift:26-32` (Mask Generation)
+**Implementation:** `Sources/QUICCrypto/AEAD.swift` (Mask Generation)
+
+The mask is computed through the `HeaderProtectionProvider` seam
+(`QUICCryptoProvider.HeaderProtection`), which routes to host swift-crypto on
+the host and BoringSSL under Embedded Swift — no CommonCrypto-direct call:
 ```swift
 public func mask(sample: Data) throws -> Data {
     guard sample.count >= 16 else {
         throw CryptoError.insufficientSample(expected: 16, actual: sample.count)
     }
-    return try aesECBEncrypt(key: key, block: sample.prefix(16))
+    // AES suites: QUICCryptoProvider.HeaderProtection.aesECBBlockMask(key:sample:)
+    // ChaCha20:   QUICCryptoProvider.HeaderProtection.chaCha20BlockMask(key:sample:)
+    let mask = try QUICCryptoProvider.HeaderProtection.aesECBBlockMask(
+        key: key.withUnsafeBytes { Array($0) }.span,
+        sample: Array(sample.prefix(16)).span)
+    return Data(mask)
 }
 ```
+
+The Embedded-clean kernel lives in
+`Sources/QUICPacketProtectionCore/PacketProtector.swift`
+(`headerProtectionMask` / `applyHeaderProtection` / `removeHeaderProtection`).
 
 **Implementation:** `Sources/QUICCrypto/AEAD.swift:89-111` (Header Protection Removal)
 ```swift
@@ -224,7 +237,7 @@ let sample = packet[sampleOffset..<(sampleOffset + 16)]
 - QUIC v1: Key = `0xbe0c690b9f66575a1d766b54e368c84e`, Nonce = `0x461599d35d632bf2239825bb`
 - QUIC v2: Key = `0x8fb4b01b56ac48e260fbcbcead7ccc92`, Nonce = `0xd86969bc2d7c6d9990efb04a`
 
-**Implementation:** `Sources/QUICCore/Packet/Version.swift:70-104`
+**Implementation:** `Sources/QUICWire/Packet/Version.swift:70-104`
 ```swift
 public var retryIntegrityKey: Data? {
     switch self {
@@ -358,7 +371,7 @@ if padToMinimum && header.packetType == .initial {
 2MSB = 11: 62-bit value (8 bytes, max 4611686018427387903)
 ```
 
-**Implementation:** `Sources/QUICCore/Varint.swift:54-88`
+**Implementation:** `Sources/QUICWire/Varint.swift:54-88`
 ```swift
 public func encode(to data: inout Data) {
     if value <= 63 {
@@ -387,7 +400,7 @@ public func encode(to data: inout Data) {
 **RFC Requirement:**
 > The sender MUST use a packet number size able to represent more than twice as large a range as the difference between the largest acknowledged packet number and the current packet number.
 
-**Implementation:** `Sources/QUICCore/Packet/PacketHeader.swift:472-539`
+**Implementation:** `Sources/QUICWire/Packet/PacketHeader.swift:472-539`
 ```swift
 public static func encode(fullPacketNumber: UInt64, largestAcked: UInt64?) -> (bytes: Data, length: Int) {
     let numUnacked: UInt64
@@ -444,7 +457,7 @@ Long Header Packet {
 }
 ```
 
-**Implementation:** `Sources/QUICCore/Packet/PacketHeader.swift:89-221`
+**Implementation:** `Sources/QUICWire/Packet/PacketHeader.swift:89-221`
 ```swift
 public struct LongHeader: Sendable, Hashable {
     public var firstByte: UInt8
@@ -495,7 +508,7 @@ public struct LongHeader: Sendable, Hashable {
 }
 ```
 
-**Implementation:** `Sources/QUICCore/Packet/PacketHeader.swift:240-287`
+**Implementation:** `Sources/QUICWire/Packet/PacketHeader.swift:240-287`
 ```swift
 public struct ShortHeader: Sendable, Hashable {
     public var firstByte: UInt8
@@ -599,7 +612,7 @@ public enum TransportParameterID: UInt64, Sendable, CaseIterable {
 | 0x1c-0x1d | CONNECTION_CLOSE |
 | 0x1e | HANDSHAKE_DONE |
 
-**Implementation:** `Sources/QUICCore/Frame/Frame.swift:11-39`
+**Implementation:** `Sources/QUICWire/Frame/Frame.swift:11-39`
 ```swift
 public enum FrameType: UInt64, Sendable {
     case padding = 0x00
@@ -651,7 +664,7 @@ STREAM Frame {
 - Bit 0x02: LEN bit (length present)
 - Bit 0x01: FIN bit
 
-**Implementation:** `Sources/QUICCore/Frame/FrameTypes.swift:67-108`
+**Implementation:** `Sources/QUICWire/Frame/FrameTypes.swift:67-108`
 ```swift
 public struct StreamFrame: Sendable, Hashable {
     public let streamID: UInt64
@@ -687,13 +700,13 @@ DATAGRAM Frame {
 - Type 0x30: No length field
 - Type 0x31: Length field present
 
-**Implementation:** `Sources/QUICCore/Frame/Frame.swift:37-38`
+**Implementation:** `Sources/QUICWire/Frame/Frame.swift:37-38`
 ```swift
 case datagram = 0x30
 case datagramWithLength = 0x31
 ```
 
-**Implementation:** `Sources/QUICCore/Frame/FrameTypes.swift:310-324`
+**Implementation:** `Sources/QUICWire/Frame/FrameTypes.swift:310-324`
 ```swift
 public struct DatagramFrame: Sendable, Hashable {
     public let data: Data
@@ -770,7 +783,7 @@ private func detectLostPacketsInternal(
 
 ### Safe Integer Conversions
 
-**Implementation:** `Sources/QUICCore/SafeConversions.swift`
+**Implementation:** `Sources/QUICWire/SafeConversions.swift`
 
 All UInt64 → Int conversions from network data use centralized validation:
 
@@ -789,7 +802,7 @@ public enum SafeConversions {
 
 ### Protocol Limits
 
-**Implementation:** `Sources/QUICCore/ProtocolLimits.swift`
+**Implementation:** `Sources/QUICWire/ProtocolLimits.swift`
 
 RFC-compliant limits enforced throughout the codebase:
 
@@ -837,7 +850,7 @@ for (index, range) in ackFrame.ackRanges.enumerated() {
 
 ### Connection ID Validation
 
-**Implementation:** `Sources/QUICCore/Packet/ConnectionID.swift`
+**Implementation:** `Sources/QUICWire/Packet/ConnectionID.swift`
 
 ```swift
 public init(bytes: Data) throws {
@@ -920,7 +933,13 @@ public init(bytes: Data) throws {
 
 2. **Cipher Suites**: Both AES-128-GCM and ChaCha20-Poly1305 are supported per RFC 9001.
 
-3. **Platform Support**: AES-ECB for header protection uses CommonCrypto on Apple platforms. Linux support would require an alternative implementation.
+3. **Platform Support**: Header protection (and all crypto) routes through the
+   `CryptoProvider` / `HeaderProtectionProvider` seam of the unified
+   `DefaultCryptoProvider` — host swift-crypto on Apple/Linux, BoringSSL under
+   Embedded Swift. The AES-ECB and ChaCha20 header-protection block masks are
+   exposed by `QUICCryptoProvider.HeaderProtection` and the kernel is in
+   `QUICPacketProtectionCore`. (The earlier CommonCrypto-direct, Apple-only path
+   has been removed.)
 
 4. **0-RTT Support**: Early data transmission is supported with replay protection. Session tickets are managed via `SessionTicketStore` (server) and `ClientSessionCache` (client).
 

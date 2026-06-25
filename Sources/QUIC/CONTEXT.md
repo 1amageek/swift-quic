@@ -2,6 +2,20 @@
 
 QUIC Endpoint と Packet Processing の統合層。
 
+## Cored Seam / 状態（重要）
+
+このモジュールは **host orchestrator** であり、まだ cored engine に移植されて
+**いない**（"M11" 待ち）。`QUICEndpoint`（~1280L, I/O ループ）、
+`ManagedConnection`（~2257L, 高レベル接続）、`TimerManager`（~329L, loss/PTO
+タイマ）は host 専用のまま。Embedded コンパイルは下位の core
+（`QUICWire` / `QUICPacketProtectionCore` / ...）を対象とし、この接続ファサード
+全体はまだ対象外。
+
+ただし `PacketProcessor` の暗号化/復号は cored seam を使う: cipher-suite dispatch
+は `any PacketOpener`/`Sealer` ではなく `SuiteProtector<C>`（閉じた enum, C =
+QUICCryptoProvider）で行う。高レベル API（`QUICEndpoint.serve/dial`,
+`QUICConfiguration.production`, `MockTLSProvider`）は不変かつ正確。
+
 ## Architecture
 
 ```
@@ -175,12 +189,13 @@ Encrypted Packet Data
 
 | ファイル | 責務 |
 |---------|------|
-| `QUICEndpoint.swift` | Server/Client Endpoint, I/O Loop |
-| `PacketProcessor.swift` | Packet 暗号化/復号, 鍵管理 |
-| `PacketEncoder.swift` | Packet → Wire Format |
-| `PacketDecoder.swift` | Wire Format → Packet |
-| `CoalescedPacketParser.swift` | UDP Datagram 内の複数パケット分離 |
-| `UDPSocket.swift` | NIO UDP Transport |
+| `QUICEndpoint.swift` | Server/Client Endpoint, I/O Loop（host-only, 未 core 化） |
+| `ManagedConnection.swift` | 高レベル接続（async stream）, shutdown lifecycle |
+| `ManagedStream.swift` | `QUICStreamProtocol` を実装する stream wrapper |
+| `PacketProcessor.swift` | Packet 暗号化/復号, 鍵管理（`SuiteProtector<C>` 経由） |
+| `ConnectionRouter.swift` | DCID ベースの packet routing |
+| `TimerManager.swift` | loss-detection / PTO タイマ |
+| `QUICConfiguration.swift` | 設定（`.production` / `.development` / `.testing`） |
 
 ## Testing
 

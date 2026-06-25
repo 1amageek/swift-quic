@@ -2,6 +2,23 @@
 
 TLS 1.3 ハンドシェイク実装 (RFC 8446) と QUIC 統合 (RFC 9001)。
 
+## Cored Seam（重要）
+
+`TLS13Handler` は **host アダプタ**。TLS 1.3 のロジック本体は Embedded-clean な
+**QUICTLSCore** にある（`C: CryptoProvider` にジェネリック）:
+
+- `TLSKeyScheduleCore` — early/handshake/master secret, HKDF-Expand-Label,
+  Derive-Secret, traffic secret, finished key / verify-data (RFC 8446 §7.1)
+- `TLSTranscriptHashCore` — incremental transcript hash
+- `QUICClientHandshake` / `QUICServerHandshake` / `QUICClientAuthMachine` —
+  handshake FSM（pre/post-ServerHello, client auth）
+- handshake message body + extension の wire codec（ClientHello, ServerHello,
+  Certificate, CertificateVerify, Finished, ... ）
+
+host の `TLS13Handler` はこれらを `C = QUICCryptoProvider` で特殊化し、`Data` /
+`SymmetricKey` を橋渡しする。signature の sign/verify は `TLSSignatureSigner` /
+`TLSSignatureVerifier`（同じく core, seam 経由）。
+
 ## Architecture
 
 ```

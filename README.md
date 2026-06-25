@@ -26,8 +26,8 @@ swift-quic provides a modern, type-safe QUIC implementation designed for the swi
 
 ## Requirements
 
-- Swift 6.0+
-- macOS 15.0+ / iOS 18.0+ / tvOS 18.0+ / watchOS 11.0+ / visionOS 2.0+
+- Swift tools 6.2+
+- macOS 26+ / iOS 26+ / tvOS 26+ / watchOS 26+ / visionOS 26+
 
 ## Installation
 
@@ -35,18 +35,35 @@ Add swift-quic to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-quic.git", from: "1.2.0")
+    .package(url: "https://github.com/1amageek/swift-quic.git", from: "1.3.0")
+]
+```
+
+The latest released tag is `1.3.0`, which ships the host API (Foundation-backed
+`QUIC` / `QUICCore` / `QUICCrypto` ...). The Embedded-clean core targets described
+under [Module Structure](#module-structure) — `QUICWire`,
+`QUICPacketProtectionCore`, `QUICRecoveryCore`, `QUICStreamCore`, `QUICTLSCore`,
+`QUICConnectionCore` — are **unreleased**: they live on the `embedded` branch and
+are not yet part of a tagged release. To use them, point at the branch:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/1amageek/swift-quic.git", branch: "embedded")
 ]
 ```
 
 ### Dependencies
 
-swift-quic uses the following Apple libraries:
+swift-quic uses the following libraries:
 
-- [swift-crypto](https://github.com/apple/swift-crypto) - Cryptographic operations
-- [swift-certificates](https://github.com/apple/swift-certificates) - X.509 certificate handling
-- [swift-asn1](https://github.com/apple/swift-asn1) - ASN.1 encoding/decoding
-- [swift-log](https://github.com/apple/swift-log) - Logging
+- [swift-crypto](https://github.com/apple/swift-crypto) (`3.12.3 ..< 5.0.0`) - Cryptographic operations
+- [swift-certificates](https://github.com/apple/swift-certificates) (`1.17.0+`) - X.509 certificate handling
+- [swift-asn1](https://github.com/apple/swift-asn1) (`1.5.0+`) - ASN.1 encoding/decoding
+- [swift-log](https://github.com/apple/swift-log) (`1.9.0+`) - Logging
+- [swift-docc-plugin](https://github.com/swiftlang/swift-docc-plugin) (`1.4.3+`) - Documentation
+- swift-p2p-core - Embedded-clean byte primitives (`Bytes`/`ByteReader`/`ByteWriter`) + crypto seam
+- swift-p2p-crypto - Unified `DefaultCryptoProvider` (host swift-crypto / Embedded BoringSSL)
+- swift-nio-udp - UDP transport (local-path dependency on the `embedded` branch)
 
 ## Architecture
 
@@ -80,19 +97,92 @@ swift-quic uses the following Apple libraries:
 
 ## Module Structure
 
+swift-quic is split into two tiers:
+
+- **Embedded-clean cores** (dual-build: host + Embedded Swift) — value-type,
+  caller-locked, sans-IO building blocks generic over the crypto seam. No
+  Foundation, no `any` existentials, no `Mutex`/`ContinuousClock`, typed throws.
+  Cipher-suite dispatch is a closed `SuiteProtector<C>` enum, not `any
+  PacketOpener`/`any PacketSealer`.
+- **Host adapters** (Foundation-backed) — hold the cores under a `Mutex`, bridge
+  `Data`/`SymmetricKey`, and add the I/O orchestration. These remain the public
+  high-level API and are unchanged for callers.
+
+### Embedded-clean Cores
+
+#### QUICWire (Tier-3 wire codec)
+
+Embedded-clean varint + frame + packet-header codec over `Bytes`/`[UInt8]`:
+
+- **Varint**: Variable-length integer encoding (RFC 9000 Section 16)
+- **ConnectionID**: Connection identification with secure random generation
+- **PacketHeader**: Long and Short header parsing with validation
+- **Version**: QUIC version constants, initial salt, retry-integrity key/nonce
+- **Frame** / **FrameCodec** (`StandardFrameCodec`): all 19 QUIC frame types
+- **ProtocolLimits**: RFC-compliant protocol limit constants
+- **SafeConversions**: Overflow-checked integer conversions
+
+#### QUICPacketProtectionCore
+
+Embedded-clean packet protection generic over the crypto provider:
+
+- **PacketProtector<C, A>**: AEAD payload protection + header protection over the `CryptoProvider` / `HeaderProtectionProvider` seam
+- **SuiteProtector<C>**: closed cipher-suite enum (AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305) that replaces the `any PacketOpener`/`any PacketSealer` existentials
+- **QUICKeyDerivation**: RFC 9001 §5.1 key material derivation
+
+#### QUICRecoveryCore
+
+Value-type loss detection + congestion control with time injected as a monotonic `UInt64` nanosecond parameter:
+
+- **LossDetectorCore**: sorted-array packet/time threshold loss detection
+- **RTTEstimatorCore**: RTT smoothing and min-RTT tracking
+- **CubicCore** (RFC 9438) / **NewRenoCore** (RFC 9002 §7): congestion controllers
+- **PacerCore**: token-bucket pacing (RFC 9002 §7.7)
+- **AntiAmplificationCore**: server 3x amplification limit
+
+#### QUICStreamCore
+
+Value-type STREAM state machines over `[UInt8]` payloads (RFC 9000 §2-4):
+
+- **SendStreamCore** / **ReceiveStreamCore**: send/receive FSMs
+- **StreamReassemblyBuffer**: out-of-order reassembly
+- **FlowControllerCore**: connection + stream-level flow control
+
+#### QUICTLSCore
+
+TLS 1.3 (RFC 8446) handshake + key schedule generic over `C: CryptoProvider`:
+
+- **TLSKeyScheduleCore**: early/handshake/master secrets, HKDF-Expand-Label, traffic secrets, finished/verify-data (RFC 8446 §7.1)
+- **TLSTranscriptHashCore**: incremental transcript hash
+- **QUICClientHandshake** / **QUICServerHandshake** / **QUICClientAuthMachine**: handshake FSMs
+- Handshake message + extension wire codecs (ClientHello, ServerHello, Certificate, ...)
+
+#### QUICConnectionCore
+
+Pure value-type connection state machines that are neither codec nor crypto:
+
+- **PathMTUSearchCore**: DPLPMTUD search (RFC 8899 / RFC 9000 §14)
+- **TransportParameterCodecCore** + **IPAddressCodec**: transport-params codec (RFC 9000 §18) with a Foundation-free IPv4/IPv6 parser
+- **PacketParsingCore**: packet parse/serialize core driving `SuiteProtector<C>` (RFC 9000 §12/§17, RFC 9001 §5)
+- **ConnectionStateCore** / **IdleTimeoutCore** / **PathValidationCore**: connection lifecycle state machines
+
+### Host Adapters
+
 ### QUIC
 
-High-level API for QUIC connections:
+High-level API for QUIC connections (host-only; not yet ported to a cored engine):
 
 - **QUICEndpoint**: Server and client endpoint management
 - **ManagedConnection**: High-level connection with async stream APIs
 - **ManagedStream**: Stream wrapper implementing QUICStreamProtocol
 - **ConnectionRouter**: DCID-based packet routing with reverse mapping
-- **PacketProcessor**: Unified packet encryption/decryption
+- **PacketProcessor**: Unified packet encryption/decryption (over `SuiteProtector<C>`)
+- **TimerManager**: Loss-detection / PTO timer scheduling
 
 ### QUICCore
 
-Core types and packet processing:
+Foundation adapter over `QUICWire` + `QUICConnectionCore`. Restores the historical
+`Data`-based views over the Embedded-clean wire codec:
 
 - **Varint**: Variable-length integer encoding (RFC 9000 Section 16)
 - **ConnectionID**: Connection identification with secure random generation
@@ -102,14 +192,20 @@ Core types and packet processing:
 - **PacketCodec**: Packet encoding/decoding with encryption and Initial packet padding
 - **CoalescedPackets**: Multiple packet handling
 
+> The wire codec primitives (`Varint`, `ConnectionID`, `PacketHeader`, `Version`,
+> `Frame`/`FrameCodec`, `ProtocolLimits`, `SafeConversions`) now live in
+> `QUICWire`; `QUICCore` re-exports Foundation-friendly adapters over them.
+
 ### QUICCrypto
 
-Cryptographic operations:
+Cryptographic operations (Foundation adapter over `QUICTLSCore` +
+`QUICPacketProtectionCore`, specialised at `C = QUICCryptoProvider`, the unified
+`DefaultCryptoProvider`):
 
 - **InitialSecrets**: Initial key derivation (RFC 9001)
 - **KeyMaterial**: Encryption key management
-- **AEAD**: AES-128-GCM and ChaCha20-Poly1305 encryption
-- **HeaderProtection**: AES-ECB header protection
+- **AEAD**: AES-128-GCM and ChaCha20-Poly1305 encryption (over `PacketProtector<C,A>`)
+- **HeaderProtection**: header protection routed through the `HeaderProtectionProvider` seam (`DefaultCryptoProvider`: host swift-crypto / Embedded BoringSSL)
 - **KeyUpdate**: AEAD limit tracking and key rotation (RFC 9001 Section 6)
 - **RetryIntegrityTag**: Retry packet integrity verification (RFC 9001 Section 5.8)
 - **TLS13Handler**: Native TLS 1.3 handshake state machine

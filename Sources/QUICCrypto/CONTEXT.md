@@ -2,6 +2,23 @@
 
 RFC 9001 準拠の QUIC パケット暗号化実装。
 
+## Cored Seam（重要）
+
+QUICCrypto は **host (Foundation) アダプタ**であり、暗号ロジック本体は 2 つの
+Embedded-clean core にある:
+
+- **QUICPacketProtectionCore** — `PacketProtector<C, A>`（AEAD seal/open + header
+  protection を `CryptoProvider` / `HeaderProtectionProvider` seam 経由で実行）と
+  `SuiteProtector<C>`（閉じた cipher-suite enum）。`SuiteProtector<C>` が旧
+  `any PacketOpener` / `any PacketSealer` 存在型を置き換えた。
+- **QUICTLSCore** — TLS 1.3 鍵スケジュール（`TLSKeyScheduleCore`, RFC 8446 §7.1）と
+  incremental transcript hash（`TLSTranscriptHashCore`）、handshake FSM。
+
+host アダプタは全ジェネリックエンジンを `C = QUICCryptoProvider`（統一
+`DefaultCryptoProvider`、ただし ECDSA は TLS 用に DER 署名）で特殊化し、
+`Data` / `SymmetricKey` / `SharedSecret` を橋渡しする。HP は CommonCrypto 直叩き
+ではなく seam 経由（host swift-crypto / Embedded BoringSSL）。
+
 ## Architecture
 
 ```
@@ -126,10 +143,22 @@ QUIC 固有のラベル:
 
 | ファイル | 責務 | RFC参照 |
 |---------|------|--------|
-| `AEAD.swift` | AES/ChaCha20 Opener/Sealer 実装 | RFC 9001 Section 5 |
-| `ChaCha20Block.swift` | ChaCha20 Block Function (Header Protection 用) | RFC 8439 Section 2.3 |
+| `AEAD.swift` | AES/ChaCha20 Opener/Sealer（`PacketProtector<C,A>` の上の Data アダプタ） | RFC 9001 Section 5 |
+| `ChaCha20Block.swift` | ChaCha20 Block Function | RFC 8439 Section 2.3 |
 | `InitialSecrets.swift` | Initial 鍵導出, KeyMaterial, QUICCipherSuite | RFC 9001 Section 5.2 |
 | `CryptoState.swift` | CryptoContext, HeaderProtection protocol | RFC 9001 Section 5 |
+| `QUICCryptoProvider.swift` | 統一 crypto provider（`C = DefaultCryptoProvider` + DER-ECDSA） | - |
+| `QUICPacketProtector.swift` | `SuiteProtector<C>` を保持する packet protector アダプタ | RFC 9001 Section 5 |
+| `PacketCodecCoreBridge.swift` | `QUICConnectionCore` の packet parse/serialize core へのブリッジ | - |
+
+### 対応する core ターゲット
+
+| core ファイル | 責務 |
+|--------------|------|
+| `QUICPacketProtectionCore/PacketProtector.swift` | AEAD seal/open + HP（seam 経由、Embedded-clean） |
+| `QUICPacketProtectionCore/SuiteProtector.swift` | 閉じた cipher-suite enum（`any` を置換） |
+| `QUICTLSCore/TLSKeyScheduleCore.swift` | TLS 1.3 鍵スケジュール (RFC 8446 §7.1) |
+| `QUICTLSCore/TLSTranscriptHashCore.swift` | incremental transcript hash |
 
 ## Testing
 

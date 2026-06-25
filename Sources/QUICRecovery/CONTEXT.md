@@ -2,6 +2,23 @@
 
 RFC 9002 準拠の Loss Detection と Congestion Control 実装。
 
+## Cored Seam
+
+QUICRecovery は **host (Foundation) アダプタ**。検出・輻輳制御のロジック本体は
+Embedded-clean な **QUICRecoveryCore** の値型にある（時刻は monotonic な
+`UInt64` ナノ秒パラメータで注入、`ContinuousClock` なし）:
+
+- `LossDetectorCore` — sorted-array による packet/time threshold 検出
+- `RTTEstimatorCore` — RTT smoothing + min-RTT
+- `CubicCore` (RFC 9438) / `NewRenoCore` (RFC 9002 §7) — 輻輳制御
+- `PacerCore` — token-bucket pacing (RFC 9002 §7.7)
+- `AntiAmplificationCore` — server 3x 制限
+
+host アダプタ（`LossDetector`, `RTTEstimator`, `NewRenoCongestionController`,
+`CubicCongestionController`, `AntiAmplificationLimiter`）はこれらを `Mutex` で保持
+する。ACK レンジ DoS への bounded-iteration 対応は core に取り込まれている
+（`PHASE_B_DESIGN.md` 参照）。`AckManager` / `SentPacket` は host 側に残る。
+
 ## Architecture
 
 ```
