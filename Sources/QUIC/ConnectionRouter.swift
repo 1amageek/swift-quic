@@ -15,7 +15,7 @@ import QUICCore
 /// - Known connection routing (by DCID)
 /// - New connection creation (for Initial packets to server)
 /// - Connection ID retirement and rotation
-public final class ConnectionRouter: Sendable {
+package final class ConnectionRouter: Sendable {
     // MARK: - Types
 
     /// Result of routing a packet

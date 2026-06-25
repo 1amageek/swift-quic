@@ -86,14 +86,23 @@ type with no lock and no I/O. The byte currency is `[UInt8]` / `Bytes`.
 - `C: CryptoProvider` for all key derivation / AEAD / header protection;
   specialised by the facade at `C = QUICCryptoProvider`.
 
-## Status: not yet driven by the facade (Slice B pending)
+## Status: driven by the seam facade (Slice B rails landed)
 
 This core compiles green Embedded (`P2P_CORE_EMBEDDED=1 swift build --target
-QUICConnectionEngineCore -c release`), but the host orchestrator (`QUICEndpoint` /
-`ManagedConnection` / `TimerManager`) is NOT yet rewired onto it. The facade
-rewire (`FacadeLock<Engine>` + `AsyncTimer` + `DatagramTransport` driver, and the
-`--target QUIC -c release` full Embedded compile) is the pending "quic Slice B"
-follow-up (ROADMAP M11).
+QUICConnectionEngineCore -c release`). It is now driven by the host facade's
+seam-based driver `QUICEngineConnection` (`Sources/QUIC/QUICEngineConnection.swift`):
+a `final class & Sendable` holding `FacadeLock<QUICConnectionEngine>` over the
+`DatagramTransport` + `AsyncTimer` seams, exercised end-to-end by
+`QUICEngineConnectionTests`. The driver is additive — the public `QUIC` facade
+keeps its proven host spine so its Foundation/NIO API + 895 tests stay intact — so
+the engine is wired but not yet the live data path. The full `--target QUIC -c
+release` Embedded compile remains blocked by the facade's Foundation `Data`/NIO
+public surface (see `Sources/QUIC/CONTEXT.md`), not by this core.
+
+Fix landed in this slice: `collectStreamFrames` no longer emits a spurious
+RESET_STREAM for an idle send stream (a stream with no pending data this tick) —
+RESET_STREAM is sent only on an outstanding STOP_SENDING (RFC 9000 §3.5/§19.4).
+Previously every flush reset healthy idle streams.
 
 ## Build
 

@@ -35,7 +35,7 @@ public enum TimerEvent: Sendable {
 /// - Tracks the next deadline for each connection
 /// - Returns the earliest deadline across all connections
 /// - Generates appropriate events when timers expire
-public final class TimerManager: Sendable {
+package final class TimerManager: Sendable {
     // MARK: - Properties
 
     /// Registered connections and their timer info
@@ -258,7 +258,7 @@ public final class TimerManager: Sendable {
 ///
 /// Uses a hierarchical wheel structure for O(1) timer insertion and
 /// O(n) worst case expiry processing where n is the number of expiring timers.
-public final class TimerWheel: Sendable {
+package final class TimerWheel: Sendable {
     // MARK: - Properties
 
     /// Wheel slots (each slot contains connections expiring in that time range)

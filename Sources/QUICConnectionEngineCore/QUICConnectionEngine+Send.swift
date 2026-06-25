@@ -228,7 +228,13 @@ extension QUICConnectionEngine {
             guard connectionBudget > 0 else { break }
             guard var send = streams.sendStreams[id] else { continue }
             guard send.hasDataToSend else {
-                if let reset = send.generateResetStream(errorCode: send.stopSendingErrorCode ?? 0) {
+                // A stream with no pending data is NOT reset merely because it is
+                // idle this tick (RFC 9000 §3.5/§19.4: RESET_STREAM is only sent
+                // when the peer sent STOP_SENDING, or the application reset it).
+                // Resetting an idle stream would tear down healthy streams on every
+                // flush. Only honour an outstanding STOP_SENDING here.
+                if let stopCode = send.stopSendingErrorCode,
+                   let reset = send.generateResetStream(errorCode: stopCode) {
                     frames.append(.resetStream(reset))
                     streams.sendStreams[id] = send
                 }

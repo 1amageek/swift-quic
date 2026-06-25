@@ -46,19 +46,50 @@ engine (see status below).
 - Encryption levels (packet-number spaces): Initial, 0-RTT (client only),
   Handshake, Application (1-RTT short header).
 
-## Status: not yet rewired onto the cored engine (Slice B pending)
+## Status: Slice B rails landed (engine-driven path is additive)
 
 The cored orchestration engine `QUICConnectionEngine<C, T>` (target
-`QUICConnectionEngineCore`) exists and compiles green Embedded, but the host
-orchestrator here — `QUICEndpoint`, `ManagedConnection` (~2257 lines),
-`TimerManager` — does NOT yet drive it. The facade rewire (`FacadeLock<Engine>` +
-`AsyncTimer` + `DatagramTransport` driver, and the `--target QUIC -c release`
-Embedded compile) is the pending "quic Slice B" follow-up (ROADMAP M11). Until
-then the Embedded compile covers the cores, not this facade. The public API
-(`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`) is
-unchanged and accurate.
+`QUICConnectionEngineCore`) is now driven by a seam-based facade alongside the
+proven host orchestrator:
+
+- `FacadeLock.swift` — host `Synchronization.Mutex` typealias / Embedded
+  `Atomic<Bool>` spinlock (verbatim from the proven swift-tls Tier-1 facade).
+- `AsyncTimerClock.swift` — the host `AsyncTimer` (`ContinuousClock`+`Task.sleep`),
+  the engine's `T` clock seam (host-gated; Embedded injects its own `AsyncTimer`).
+- `QUICEngineConnection.swift` — the `final class & Sendable` driver holding
+  `FacadeLock<QUICConnectionEngine>` over the `DatagramTransport` (UDP) +
+  `AsyncTimer` (clock+sleep) seams. It inverts I/O (`transport.incoming →
+  engine.receive → transport.send`) and drives the clock-free timer loop (read
+  `deadlines(nowNanos:)`, `sleep(untilNanos: earliest)`, on wake
+  `handleTimeout(nowNanos:)`). No `ContinuousClock`/`Task.sleep`/`Date` in the
+  driver — all time flows through the injected `AsyncTimer`.
+- `QUICEngineConfigurationStrategy.swift` — host vs Embedded crypto/cert capability
+  behind one signature: host CSPRNG + injected X.509 validator (fail-closed);
+  Embedded RPK (RFC 7250) leaf-SPKI parsing via `P2PCoreDER` (fail-closed).
+
+The driver is wired and unit-tested end-to-end (`QUICEngineConnectionTests`:
+stream round-trip + close over an in-memory loopback transport), but it is NOT yet
+the live data path: `QUICEndpoint`/`ManagedConnection` keep their proven
+`QUICConnectionHandler`/`PacketProcessor` spine so the public Foundation/NIO API
+and the 895 host tests stay intact. Now-internal orchestrators (`PacketProcessor`,
+`ConnectionRouter`, `TimerManager`/`TimerWheel`) are demoted to `package`.
+
+## Embedded gate (the milestone): `--target QUIC -c release` does NOT compile
+
+This is the irreducible blocker, identical in shape to swift-tls's Slice B: the
+public facade surface is Foundation `Data` (`QUICStreamProtocol.read()->Data` /
+`write(Data)`) and NIO-bridging (`QUIC.SocketAddress.init(_ nioAddress:)` /
+`toNIOAddress()`), and `QUIC` hard-depends on the host adapters `QUICCore`
+(→`P2PCoreFoundation`/Foundation), `QUICCrypto` (→X509/SwiftASN1/Crypto/Foundation),
+`QUICConnection`, `QUICStream`, `QUICRecovery`, `QUICTransport` (→NIO). swift-libp2p
+is pinned to those exact symbols, so they cannot be gated away. The first failure
+is `P2PCoreFoundation` importing the Embedded-built `P2PCoreBytes` under Foundation.
+A full Embedded `QUIC` compile requires a NEW Foundation-free facade product (a
+`[UInt8]`/`SocketEndpoint` surface over `QUICEngineConnection`) — a follow-up
+slice. The cores, incl. `QUICConnectionEngineCore`, still compile Embedded.
 
 ## Build
 
-- Host only: `swift build` / `swift test --filter QUICTests`. This module is not
-  yet part of the Embedded compile.
+- Host: `swift build` / `swift test --skip QUICBenchmarks`. The seam driver
+  (`QUICEngineConnection`) is dual-build-shaped (cores + seams only); the facade
+  module is host-only until the Foundation-free facade product lands.

@@ -339,6 +339,18 @@ let package = Package(
                 "QUICStream",
                 "QUICRecovery",
                 "QUICTransport",
+                // Cored sans-IO engine (M11 "Slice B"): the host facade drives
+                // `QUICConnectionEngine` behind `FacadeLock` over the
+                // `DatagramTransport` (UDP) + `AsyncTimer` (clock+sleep) seams.
+                "QUICConnectionEngineCore",
+                "QUICConnectionCore",
+                "QUICPacketProtectionCore",
+                .product(name: "P2PCoreCrypto",    package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes",     package: "swift-p2p-core"),
+                .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
+                // RFC 7250 raw-public-key SPKI parsing for the Embedded cert
+                // strategy (fail-closed); host path uses swift-certificates.
+                .product(name: "P2PCoreDER",       package: "swift-p2p-core"),
                 .product(name: "Logging", package: "swift-log"),
             ],
             path: "Sources/QUIC",
@@ -395,6 +407,24 @@ let package = Package(
             name: "QUICTests",
             dependencies: ["QUIC", "QUICRecovery", "QUICTransport"],
             path: "Tests/QUICTests"
+        ),
+
+        // Seam-driven engine driver (quic Slice B): exercises QUICEngineConnection
+        // (FacadeLock<engine> + DatagramTransport + AsyncTimer) end-to-end over an
+        // in-memory loopback transport, proving the facade-on-engine rewire.
+        .testTarget(
+            name: "QUICEngineConnectionTests",
+            dependencies: [
+                "QUIC",
+                "QUICConnectionEngineCore",
+                "QUICWire",
+                "QUICPacketProtectionCore",
+                "QUICConnectionCore",
+                .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
+            ],
+            path: "Tests/QUICEngineConnectionTests"
         ),
 
         // MARK: - Benchmarks (run separately with: swift test --filter QUICBenchmarks)

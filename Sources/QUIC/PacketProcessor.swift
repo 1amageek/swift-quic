@@ -20,7 +20,7 @@ import Synchronization
 /// - Coalesced packet handling
 ///
 /// Thread-safe via Mutex for crypto context updates.
-public final class PacketProcessor: Sendable {
+package final class PacketProcessor: Sendable {
     // MARK: - Properties
 
     /// Crypto contexts per encryption level

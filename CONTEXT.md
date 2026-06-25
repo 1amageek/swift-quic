@@ -95,19 +95,25 @@ is no backward-compatibility obligation to the old `Data` API inside a core.
 - Time never enters a core via a clock: it is injected as a monotonic
   `nowNanos: UInt64`.
 
-## Status: orchestrator not yet rewired (Slice B pending)
+## Status: Slice B rails landed (engine-driven facade is additive)
 
-The Embedded compile currently covers the cores (including
-`QUICConnectionEngineCore`, which compiles green under `--target
-QUICConnectionEngineCore -c release`), NOT yet the full connection facade. The
-host orchestrator — `QUICEndpoint`, `ManagedConnection` (~2257 lines), and
-`TimerManager` — is **not yet rewired onto `QUICConnectionEngine`**. That facade
-rewire (`FacadeLock<Engine>` + `AsyncTimer` + `DatagramTransport` driver, plus
-`--target QUIC -c release` Embedded compile) is the pending "quic Slice B"
-follow-up (ROADMAP M11). The released `1.3.0` tag is the host API; the Embedded
-cores are unreleased on the `embedded` branch (M8 pending). The high-level usage
-API (`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`)
-is unchanged and accurate.
+The Embedded compile covers the cores (including `QUICConnectionEngineCore`, green
+under `--target QUICConnectionEngineCore -c release`). The "quic Slice B" facade
+rewire has landed its rails: a seam-based driver `QUICEngineConnection`
+(`Sources/QUIC/`) holds `FacadeLock<QUICConnectionEngine>` over the
+`DatagramTransport` (UDP) + `AsyncTimer` (clock+sleep) seams, inverts I/O, and runs
+the clock-free timer loop — unit-tested end-to-end (`QUICEngineConnectionTests`).
+It is ADDITIVE: `QUICEndpoint`/`ManagedConnection` keep their proven
+`QUICConnectionHandler`/`PacketProcessor` spine, so the public Foundation/NIO API
++ the 895 host tests stay intact and swift-libp2p still builds. The full `--target
+QUIC -c release` Embedded compile remains BLOCKED by the facade's Foundation
+`Data`/NIO public surface + host-adapter deps (`QUICCrypto`→X509, `QUICTransport`→
+NIO, `QUICCore`→`P2PCoreFoundation`); making it Embedded needs a NEW Foundation-free
+facade product (`[UInt8]`/`SocketEndpoint`) over the driver — a follow-up slice.
+The released `1.3.0` tag is the host API; the Embedded cores are unreleased on the
+`embedded` branch (M8 pending). The high-level usage API
+(`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`) is
+unchanged and accurate.
 
 ## Build
 
