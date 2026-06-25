@@ -2,6 +2,12 @@
 ///
 /// High-level stream wrapper implementing QUICStreamProtocol.
 /// Provides async read/write operations for application data.
+///
+/// Host-only QUIC orchestrator spine (Foundation/`Synchronization`). Gated
+/// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
+/// only the cores + the `[UInt8]` engine facade (quic Slice C).
+
+#if !hasFeature(Embedded)
 
 import Foundation
 import Synchronization
@@ -146,3 +152,5 @@ public enum ManagedStreamError: Error, Sendable {
     /// Read failed
     case readFailed(String)
 }
+
+#endif

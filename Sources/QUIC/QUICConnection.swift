@@ -1,6 +1,14 @@
 /// QUIC Connection Public API
 ///
 /// High-level interface for QUIC connections.
+///
+/// Host-only QUIC public surface (`QUICConnectionProtocol`/`QUICStreamProtocol`
+/// over Foundation `Data` + the NIO `SocketAddress` bridge). Gated
+/// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
+/// only the cores + the `[UInt8]` engine facade (quic Slice C). Under Embedded the
+/// public surface is the `[UInt8]`/`SocketEndpoint` facade instead.
+
+#if !hasFeature(Embedded)
 
 import Foundation
 import QUICCore
@@ -157,3 +165,5 @@ extension SocketAddress {
         try NIOCore.SocketAddress(ipAddress: ipAddress, port: Int(port))
     }
 }
+
+#endif

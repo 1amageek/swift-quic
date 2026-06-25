@@ -3,6 +3,12 @@
 /// High-level integration layer for QUIC packet encoding/decoding.
 /// Combines PacketEncoder, PacketDecoder, and crypto contexts for
 /// convenient packet processing.
+///
+/// Host-only QUIC orchestrator spine (Foundation/Crypto/host adapters). Gated
+/// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
+/// only the cores + the `[UInt8]` engine facade (quic Slice C).
+
+#if !hasFeature(Embedded)
 
 import Foundation
 import Crypto
@@ -834,3 +840,5 @@ extension PacketProcessor {
         return (client: clientKeys, server: serverKeys)
     }
 }
+
+#endif

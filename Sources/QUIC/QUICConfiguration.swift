@@ -1,6 +1,12 @@
 /// QUIC Configuration
 ///
 /// Configuration options for QUIC connections.
+///
+/// Host-only QUIC orchestrator spine (Foundation/host adapters). Gated
+/// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
+/// only the cores + the `[UInt8]` engine facade (quic Slice C).
+
+#if !hasFeature(Embedded)
 
 import Foundation
 import QUICCore
@@ -358,3 +364,5 @@ extension TransportParameters {
         self.maxDatagramFrameSize = config.maxDatagramFrameSize
     }
 }
+
+#endif

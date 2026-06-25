@@ -2,6 +2,12 @@
 ///
 /// High-level connection wrapper that orchestrates handshake, packet processing,
 /// and stream management. Implements QUICConnectionProtocol for public API.
+///
+/// Host-only QUIC orchestrator spine (Foundation/NIO/host adapters). Gated
+/// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
+/// only the cores + the `[UInt8]` engine facade (quic Slice C).
+
+#if !hasFeature(Embedded)
 
 import Foundation
 import Synchronization
@@ -2255,3 +2261,5 @@ extension ManagedConnectionError {
         }
     }
 }
+
+#endif

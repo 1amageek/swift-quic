@@ -25,6 +25,7 @@
 // / `QUICEndpoint`) keeps its Foundation/NIO-typed surface (so swift-libp2p is
 // unbroken) and is the host adapter over this driver.
 
+import _Concurrency   // REQUIRED under Embedded for AsyncStream/Task/withTaskGroup
 import QUICWire
 import QUICPacketProtectionCore
 import QUICConnectionCore

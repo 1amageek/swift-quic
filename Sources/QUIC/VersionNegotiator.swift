@@ -2,6 +2,12 @@
 ///
 /// Handles Version Negotiation packet creation and processing.
 /// Used when client and server need to agree on a QUIC version.
+///
+/// Host-only QUIC orchestrator spine (Foundation/host adapters). Gated
+/// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
+/// only the cores + the `[UInt8]` engine facade (quic Slice C).
+
+#if !hasFeature(Embedded)
 
 import Foundation
 import QUICCore
@@ -257,3 +263,5 @@ public struct VersionNegotiator: Sendable {
         return version == 0
     }
 }
+
+#endif

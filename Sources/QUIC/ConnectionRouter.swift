@@ -2,6 +2,12 @@
 ///
 /// Routes incoming packets to the appropriate connection based on
 /// Destination Connection ID (DCID).
+///
+/// Host-only QUIC orchestrator spine (Foundation/`Synchronization`/host adapters).
+/// Gated `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded
+/// with only the cores + the `[UInt8]` engine facade (quic Slice C).
+
+#if !hasFeature(Embedded)
 
 import Foundation
 import Synchronization
@@ -289,3 +295,5 @@ extension ManagedConnection: Hashable {
         hasher.combine(sourceConnectionID)
     }
 }
+
+#endif

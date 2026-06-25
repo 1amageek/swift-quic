@@ -15,6 +15,49 @@ let coreSettings: [SwiftSetting] = {
     return s
 }()
 
+// The `QUIC` facade target's dependencies. The cored Embedded-clean cores + the
+// unified provider + the seam-driven `[UInt8]` engine facade (`QUICEngineClient` /
+// `QUICEngineConnection`) are present in BOTH builds. The host orchestrator spine
+// (`QUICEndpoint` / `ManagedConnection` / `QUICConnectionProtocol` / Foundation /
+// NIO) lives in the host adapter targets (`QUICCore` / `QUICCrypto` /
+// `QUICConnection` / `QUICStream` / `QUICRecovery` / `QUICTransport`); those are
+// dropped under Embedded, where the host spine source is gated
+// `#if !hasFeature(Embedded)` and the facade uses only the cores + the
+// `DefaultCryptoProvider` seam. This mirrors the proven swift-tls `facadeDependencies`
+// split (quic Slice C). The host build is byte-for-byte unchanged.
+let quicFacadeDependencies: [Target.Dependency] = {
+    var d: [Target.Dependency] = [
+        // Cored sans-IO engine + cores (dual-build): the `[UInt8]` facade path.
+        "QUICConnectionEngineCore",
+        "QUICConnectionCore",
+        "QUICPacketProtectionCore",
+        "QUICWire",
+        // Unified crypto provider for the concrete `DefaultCryptoProvider` facade,
+        // and the seams the engine facade is generic over.
+        .product(name: "P2PCrypto",        package: "swift-p2p-crypto"),
+        .product(name: "P2PCoreCrypto",    package: "swift-p2p-core"),
+        .product(name: "P2PCoreBytes",     package: "swift-p2p-core"),
+        .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
+        // RFC 7250 raw-public-key SPKI parsing for the Embedded cert strategy
+        // (fail-closed); host path uses swift-certificates via QUICCrypto.
+        .product(name: "P2PCoreDER",       package: "swift-p2p-core"),
+    ]
+    if !embeddedEnabled {
+        d += [
+            // Host orchestrator spine + Foundation/NIO adapters (gated
+            // `#if !hasFeature(Embedded)` in source; dropped from the Embedded build).
+            "QUICCore",
+            "QUICCrypto",
+            "QUICConnection",
+            "QUICStream",
+            "QUICRecovery",
+            "QUICTransport",
+            .product(name: "Logging", package: "swift-log"),
+        ]
+    }
+    return d
+}()
+
 let package = Package(
     name: "swift-quic",
     platforms: [
@@ -330,31 +373,19 @@ let package = Package(
 
         // MARK: - Main Public API
 
+        // Dual-build: on host the full Foundation/NIO orchestrator spine compiles
+        // (the `QUICEndpoint` / `ManagedConnection` API swift-libp2p uses); under
+        // Embedded the spine is gated `#if !hasFeature(Embedded)` and only the
+        // cores + the `[UInt8]` engine facade (`QUICEngineClient` /
+        // `QUICEngineConnection`) compile. Dependencies switch via
+        // `quicFacadeDependencies`; `swiftSettings: coreSettings` applies the
+        // Embedded feature when `P2P_CORE_EMBEDDED=1` (quic Slice C).
         .target(
             name: "QUIC",
-            dependencies: [
-                "QUICCore",
-                "QUICCrypto",
-                "QUICConnection",
-                "QUICStream",
-                "QUICRecovery",
-                "QUICTransport",
-                // Cored sans-IO engine (M11 "Slice B"): the host facade drives
-                // `QUICConnectionEngine` behind `FacadeLock` over the
-                // `DatagramTransport` (UDP) + `AsyncTimer` (clock+sleep) seams.
-                "QUICConnectionEngineCore",
-                "QUICConnectionCore",
-                "QUICPacketProtectionCore",
-                .product(name: "P2PCoreCrypto",    package: "swift-p2p-core"),
-                .product(name: "P2PCoreBytes",     package: "swift-p2p-core"),
-                .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
-                // RFC 7250 raw-public-key SPKI parsing for the Embedded cert
-                // strategy (fail-closed); host path uses swift-certificates.
-                .product(name: "P2PCoreDER",       package: "swift-p2p-core"),
-                .product(name: "Logging", package: "swift-log"),
-            ],
+            dependencies: quicFacadeDependencies,
             path: "Sources/QUIC",
-            exclude: ["CONTEXT.md"]
+            exclude: ["CONTEXT.md"],
+            swiftSettings: coreSettings
         ),
 
         // MARK: - Tests

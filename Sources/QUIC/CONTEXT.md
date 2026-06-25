@@ -74,22 +74,38 @@ the live data path: `QUICEndpoint`/`ManagedConnection` keep their proven
 and the 895 host tests stay intact. Now-internal orchestrators (`PacketProcessor`,
 `ConnectionRouter`, `TimerManager`/`TimerWheel`) are demoted to `package`.
 
-## Embedded gate (the milestone): `--target QUIC -c release` does NOT compile
+## Embedded gate (the milestone): `--target QUIC -c release` COMPILES (quic Slice C)
 
-This is the irreducible blocker, identical in shape to swift-tls's Slice B: the
-public facade surface is Foundation `Data` (`QUICStreamProtocol.read()->Data` /
-`write(Data)`) and NIO-bridging (`QUIC.SocketAddress.init(_ nioAddress:)` /
-`toNIOAddress()`), and `QUIC` hard-depends on the host adapters `QUICCore`
-(→`P2PCoreFoundation`/Foundation), `QUICCrypto` (→X509/SwiftASN1/Crypto/Foundation),
-`QUICConnection`, `QUICStream`, `QUICRecovery`, `QUICTransport` (→NIO). swift-libp2p
-is pinned to those exact symbols, so they cannot be gated away. The first failure
-is `P2PCoreFoundation` importing the Embedded-built `P2PCoreBytes` under Foundation.
-A full Embedded `QUIC` compile requires a NEW Foundation-free facade product (a
-`[UInt8]`/`SocketEndpoint` surface over `QUICEngineConnection`) — a follow-up
-slice. The cores, incl. `QUICConnectionEngineCore`, still compile Embedded.
+The `QUIC` target is now DUAL-BUILD via the proven swift-tls Slice B route
+(currency + Foundation-gating; the host spine is NOT rewritten):
+
+- **Host spine gated host-only.** `QUICEndpoint` / `ManagedConnection` /
+  `ManagedStream` / `QUICConnection` (the Foundation-`Data` `QUICStreamProtocol`
+  + NIO `SocketAddress` bridge) / `QUICConfiguration` / `PacketProcessor` /
+  `ConnectionRouter` / `TimerManager` / `VersionNegotiator` are each wrapped
+  whole in `#if !hasFeature(Embedded)`. The public host API
+  (`QUICEndpoint` / `ManagedConnection` / `QUICConnectionProtocol` /
+  `QUICStreamProtocol` / `QUICConfiguration` / `QUIC.SocketAddress`) is UNCHANGED,
+  so swift-libp2p builds unchanged.
+- **Conditional dependencies.** `Package.swift`'s `quicFacadeDependencies` drops
+  the host adapter targets (`QUICCore` / `QUICCrypto` / `QUICConnection` /
+  `QUICStream` / `QUICRecovery` / `QUICTransport` + `Logging`) under
+  `P2P_CORE_EMBEDDED=1`; the `QUIC` target carries `swiftSettings: coreSettings`.
+- **The Embedded surface** is the `[UInt8]`/`SocketEndpoint` facade: the cored,
+  sans-IO `QUICEngineConnection` driver plus the public concrete
+  `QUICEngineClient` (pinned to `DefaultCryptoProvider`) over it, with the
+  dual-build seams `FacadeLock` / `AsyncTimerClock` (host-gated impl) /
+  `QUICEngineConfigurationStrategy` (host X.509 vs Embedded RPK, fail-closed).
+
+Phase-2 features (Retry / 0-RTT / connection-migration / peer-initiated
+key-update live-wiring) are DEFERRED — the engine drops/does-not-wire them and the
+facade surfaces them as a typed throw (`QUICEngineError.invalidState`), never a
+silent fallback.
 
 ## Build
 
-- Host: `swift build` / `swift test --skip QUICBenchmarks`. The seam driver
-  (`QUICEngineConnection`) is dual-build-shaped (cores + seams only); the facade
-  module is host-only until the Foundation-free facade product lands.
+- Host: `swift build` / `swift test --skip QUICBenchmarks`. The full Foundation/NIO
+  spine compiles; `QUICEngineClient` / `QUICEngineConnection` compile alongside it.
+- Embedded (the milestone): `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1
+  swiftly run +6.3.1 swift build --target QUIC -c release`. Only the cores + the
+  `[UInt8]` engine facade compile; the host spine is gated away.
