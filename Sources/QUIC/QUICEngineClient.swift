@@ -153,6 +153,13 @@ public final class QUICEngineClient<
         connection.readStream(id)
     }
 
+    /// Whether the stream's receive side has finished: the peer sent FIN (or RESET)
+    /// and every byte before it has been drained. A reader uses this to detect clean
+    /// end-of-stream at the stream level (distinct from the connection closing).
+    public func streamReadFinished(_ id: UInt64) -> Bool {
+        connection.streamReadFinished(id)
+    }
+
     /// Marks a stream's send side finished (queues FIN) and flushes.
     public func finishStream(_ id: UInt64) async throws(QUICEngineError) {
         try await connection.finishStream(id)

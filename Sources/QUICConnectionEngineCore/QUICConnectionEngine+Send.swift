@@ -52,6 +52,18 @@ extension QUICConnectionEngine {
         streams.receiveStreams[id]?.hasDataToRead ?? false
     }
 
+    /// Whether the stream's receive side is finished: the peer sent a FIN (or a
+    /// RESET) and every byte before it has been drained, so no further bytes will
+    /// ever arrive. The application read surface uses this to signal clean
+    /// end-of-stream (EOF) at the stream level — distinct from the whole connection
+    /// closing. An unknown stream id is treated as not-yet-finished (a stream the
+    /// peer may still open), never as a silent EOF.
+    public func streamReadFinished(_ id: UInt64) -> Bool {
+        guard let recv = streams.receiveStreams[id] else { return false }
+        if recv.isReceiveClosed { return true }
+        return recv.finReceived && !recv.hasDataToRead
+    }
+
     // MARK: - Handshake / datagram application API
 
     /// Queues outbound CRYPTO bytes at an encryption level (the facade's TLS seam

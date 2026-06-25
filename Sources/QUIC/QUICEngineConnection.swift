@@ -260,6 +260,12 @@ public final class QUICEngineConnection<
         engine.withLock { $0.readStream(id) }
     }
 
+    /// Whether the stream's receive side has finished (FIN/RESET seen and all bytes
+    /// drained), so a reader should observe clean end-of-stream at the stream level.
+    public func streamReadFinished(_ id: UInt64) -> Bool {
+        engine.withLock { $0.streamReadFinished(id) }
+    }
+
     /// Marks a stream's send side finished (queues FIN) and flushes.
     public func finishStream(_ id: UInt64) async throws(QUICEngineError) {
         try run { (e) throws(QUICEngineError) in try e.finishStream(id) }
