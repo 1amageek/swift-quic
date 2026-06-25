@@ -98,6 +98,11 @@ let package = Package(
             name: "QUICTLSCore",
             targets: ["QUICTLSCore"]
         ),
+        // Embedded-clean TLS 1.3 signature provider (DefaultCryptoProvider + DER ECDSA)
+        .library(
+            name: "QUICTLSSignature",
+            targets: ["QUICTLSSignature"]
+        ),
         // Embedded-clean connection state machines (DPLPMTUD search core)
         .library(
             name: "QUICConnectionCore",
@@ -231,6 +236,28 @@ let package = Package(
                 .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
             ],
             path: "Sources/QUICTLSCore",
+            swiftSettings: coreSettings
+        ),
+
+        // MARK: - Embedded-clean TLS signature provider (dual-build: host + Embedded)
+
+        // The crypto provider that drives the TLS 1.3 handshake SIGNATURE path:
+        // `DefaultCryptoProvider` with ECDSA overridden to DER (RFC 8446 §4.4.3 /
+        // X.509 leaf), the encoding go-libp2p / rust-libp2p require on the wire. The
+        // shared provider emits RAW `r || s` (correct for Noise/libp2p, wrong for
+        // TLS), so this composite DER-encodes ONLY the ECDSA signature and inherits
+        // everything else (so handshake keys stay byte-identical). The dual-build
+        // counterpart of the host-only `QUICCryptoProvider`. No Foundation, no `any`,
+        // no swift-crypto — the DER codec is `P2PCoreDER`.
+        .target(
+            name: "QUICTLSSignature",
+            dependencies: [
+                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreDER",    package: "swift-p2p-core"),
+                .product(name: "P2PCrypto",     package: "swift-p2p-crypto"),
+            ],
+            path: "Sources/QUICTLSSignature",
             swiftSettings: coreSettings
         ),
 
@@ -406,6 +433,17 @@ let package = Package(
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
             ],
             path: "Tests/QUICCryptoTests"
+        ),
+
+        .testTarget(
+            name: "QUICTLSSignatureTests",
+            dependencies: [
+                "QUICTLSSignature",
+                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "Crypto", package: "swift-crypto"),
+            ],
+            path: "Tests/QUICTLSSignatureTests"
         ),
 
         .testTarget(
