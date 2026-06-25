@@ -1,164 +1,43 @@
-# QUICConnection Module
+# QUICConnection — CONTEXT
+Scope/role: the host (Foundation) per-connection state machine and TLS integration (`QUICConnectionHandler`); a thin adapter over `QUICConnectionCore`.
+Last reviewed: 2026-06-25
 
-QUIC Connection ハンドラと状態管理。
+Invariants and design intent the source does not state structurally. Read this
+before changing key installation or the TLS integration flow. `QUICConnectionHandler`
+is a host adapter; the pure connection state machines (neither codec nor crypto)
+live in the Embedded-clean `QUICConnectionCore` value types.
 
-## Cored Seam
+## Contracts (the load-bearing rules)
 
-`QUICConnectionHandler` は **host (Foundation) アダプタ**。codec/crypto ではない
-純粋な接続状態機械は Embedded-clean な **QUICConnectionCore** の値型にある:
+- **The state machines live in the core, not here.** `ConnectionStateCore`,
+  `IdleTimeoutCore`, `PathValidationCore`, `PathMTUSearchCore` (DPLPMTUD,
+  RFC 8899 / RFC 9000 §14), `TransportParameterCodecCore` + `IPAddressCodec`
+  (transport-params codec, RFC 9000 §18, Foundation-free IPv4/IPv6 parser), and
+  `PacketParsingCore` (driving `SuiteProtector<C>`) are all in `QUICConnectionCore`.
+  Behaviour fixes belong there.
+- **Key installation must propagate the negotiated cipher suite.** Take
+  `cipherSuite` from `KeysAvailableInfo`, derive read/write `KeyMaterial` with it,
+  and build protectors via the key-derivation factory. Never hardcode AES-128-GCM —
+  it silently breaks ChaCha20-Poly1305. Cipher-suite dispatch is `SuiteProtector<C>`
+  (closed enum), not `any PacketOpener` / `any PacketSealer`.
+- **Read vs write key direction is role-dependent.** Client reads with the server
+  secret and writes with the client secret; server is the mirror. 0-RTT is
+  unidirectional (client write / server read).
 
-- `ConnectionStateCore` / `IdleTimeoutCore` / `PathValidationCore` — 接続ライフ
-  サイクルの状態機械
-- `PathMTUSearchCore` — DPLPMTUD 探索 (RFC 8899 / RFC 9000 §14)
-- `TransportParameterCodecCore` + `IPAddressCodec` — transport-params codec
-  (RFC 9000 §18, Foundation-free な IPv4/IPv6 パーサ)
-- `PacketParsingCore` — packet parse/serialize core（cored `SuiteProtector<C>` を
-  駆動）
+## Invariants (must hold; tests guard them)
 
-key installation は依然として host アダプタの責務だが、cipher-suite dispatch は
-`any PacketOpener`/`Sealer` ではなく `SuiteProtector<C>`（閉じた enum）で行う。
+- **Fail-closed peer authentication.** CertificateVerify is always verified; a
+  server cannot skip Certificate/CertificateVerify, and Finished is accepted only
+  after authentication completes (no unauthenticated/MITM channel).
+- **TLS output is acted on, not dropped.** `TLSOutput.keysAvailable` installs keys
+  (with the cipher suite), `.handshakeComplete` advances to connected, `.error`
+  closes the connection. A `.handshakeData` output is queued for send at its level.
+- **Transport-parameter ↔ Connection-ID cross-validation (RFC 9000 §7.3):**
+  `initial_source_connection_id` / `original_destination_connection_id` /
+  `retry_source_connection_id` are checked against the CIDs observed during the
+  handshake; a mismatch is TRANSPORT_PARAMETER_ERROR.
 
-## Architecture
+## Build
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         QUICConnectionHandler                                 │
-│                    (Per-Connection State Machine)                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                        Connection State                               │   │
-│  │                                                                        │   │
-│  │  ┌─────────┐   ┌───────────┐   ┌───────────┐   ┌──────────┐         │   │
-│  │  │ Initial │ → │ Handshake │ → │ Connected │ → │  Closed  │         │   │
-│  │  └─────────┘   └───────────┘   └───────────┘   └──────────┘         │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                    ↓                                         │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                        Key Management                                 │   │
-│  │                                                                        │   │
-│  │  TLSOutput.keysAvailable(KeysAvailableInfo)                          │   │
-│  │        ↓                                                               │   │
-│  │  installKeys(info, role)                                              │   │
-│  │        ↓                                                               │   │
-│  │  CryptoContext per EncryptionLevel                                   │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Critical: Key Installation
-
-**QUICConnectionHandler.installKeys() も cipher suite を正しく伝播する必要がある。**
-
-PacketProcessor と同様のパターンを適用する。
-
-### 正しいパターン
-
-```swift
-private func installKeys(_ info: KeysAvailableInfo, role: ConnectionRole) throws {
-    let cipherSuite = info.cipherSuite  // ← KeysAvailableInfo から取得
-
-    // 0-RTT handling
-    if info.level == .zeroRTT {
-        let clientKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
-        let (opener, sealer) = try clientKeys.createCrypto()
-        // ...
-        return
-    }
-
-    // Standard bidirectional keys
-    let clientKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
-    let serverKeys = try KeyMaterial.derive(from: serverSecret, cipherSuite: cipherSuite)
-
-    let readKeys: KeyMaterial
-    let writeKeys: KeyMaterial
-    if role == .client {
-        readKeys = serverKeys
-        writeKeys = clientKeys
-    } else {
-        readKeys = clientKeys
-        writeKeys = serverKeys
-    }
-
-    // ファクトリメソッドで正しい型を生成（AES or ChaCha20）
-    let (opener, _) = try readKeys.createCrypto()
-    let (_, sealer) = try writeKeys.createCrypto()
-
-    // CryptoContext に設定
-    // ...
-}
-```
-
-### NG パターン（過去のバグ）
-
-```swift
-// NG: cipher suite を無視して AES をハードコード
-let readKeys = try KeyMaterial.derive(from: serverSecret)   // ← cipherSuite なし
-let writeKeys = try KeyMaterial.derive(from: clientSecret)  // ← cipherSuite なし
-
-let opener = try AES128GCMOpener(keyMaterial: readKeys)     // ← ハードコード
-let sealer = try AES128GCMSealer(keyMaterial: writeKeys)    // ← ハードコード
-```
-
-## TLS Integration Flow
-
-```
-QUICConnectionHandler
-    │
-    ├── processIncomingPacket()
-    │       ↓
-    │   TLSProvider.handleMessage()
-    │       ↓
-    │   TLSOutput (multiple outputs possible)
-    │       │
-    │       ├── .handshakeData(data, level)
-    │       │       → 送信キューに追加
-    │       │
-    │       ├── .keysAvailable(info)
-    │       │       → installKeys(info, role)  ← cipher suite を伝播
-    │       │
-    │       ├── .handshakeComplete(info)
-    │       │       → state = .connected
-    │       │
-    │       └── .error(error)
-    │               → connection close
-    │
-    └── processOutgoingPacket()
-            ↓
-        CryptoContext.sealer.seal()
-```
-
-## Connection Role
-
-```swift
-public enum ConnectionRole: Sendable {
-    case client
-    case server
-}
-```
-
-- **Client**: 接続を開始、Initial パケットを送信
-- **Server**: 接続を受け入れ、Initial パケットに応答
-
-## Files
-
-| ファイル | 責務 |
-|---------|------|
-| `QUICConnectionHandler.swift` | Connection 状態管理, TLS 統合 |
-| `ConnectionState.swift` | Connection 状態定義 |
-| `ConnectionID.swift` | Connection ID 管理 |
-
-## Testing
-
-```bash
-swift test --filter QUICConnectionTests
-```
-
-### 重要なテスト項目
-
-- [ ] Full handshake (client + server)
-- [ ] ChaCha20-Poly1305 cipher suite
-- [ ] 0-RTT data handling
-- [ ] Connection migration
-- [ ] Key update
+- Host only: `swift build` / `swift test --filter QUICConnectionTests`. The
+  underlying `QUICConnectionCore` is part of the Embedded compile.

@@ -1,100 +1,122 @@
-# swift-quic Context
+# swift-quic — CONTEXT
+Scope/role: a pure-Swift QUIC implementation (RFC 9000/9001/9002) used as the libp2p QUIC transport; the public surface is the host `QUIC` facade, layered over a set of Embedded-clean cores.
+Last reviewed: 2026-06-25
 
-QUIC プロトコル (RFC 9000, 9001, 9002) の Swift 実装。
+Invariants and design intent the source does not state structurally. Read this
+before changing the tier split, the crypto seam, or any core. swift-quic is
+**Embedded-first**: the protocol logic lives in value-type, sans-IO *core*
+targets generic over the crypto seam, and the host (Foundation) modules are thin
+adapters over them. The byte currency in the cores is `[UInt8]` / `Bytes`; there
+is no backward-compatibility obligation to the old `Data` API inside a core.
 
-## ディレクトリ構造
+## Tier model (why, not just what)
 
-swift-quic は **Embedded-first**。プロトコルロジックは Embedded-clean な *core*
-ターゲット（値型・呼び出し側ロック・sans-IO・crypto seam にジェネリック）に置き、
-host (Foundation) モジュールはその上の薄いアダプタである。`Package.swift` の
-`P2P_CORE_EMBEDDED=1` トグルで core を Embedded ビルドに切り替える（dual-build）。
+- **Cores (Embedded-clean, dual-build).** Value-type, caller-locked, sans-IO
+  building blocks generic over `C: CryptoProvider`. They compile both as ordinary
+  host libraries and under Embedded Swift. The seven cores:
+  - `QUICWire` — Tier-3 wire codec (varint, frame/packet codecs, version
+    constants). No crypto, no I/O.
+  - `QUICPacketProtectionCore` — `PacketProtector<C, A>` (AEAD + header protection
+    over the seam) and the closed `SuiteProtector<C>` cipher-suite enum.
+  - `QUICRecoveryCore` — loss detection, CUBIC/NewReno, pacing, anti-amplification.
+  - `QUICStreamCore` — send/receive STREAM FSMs, reassembly, flow control.
+  - `QUICTLSCore` — TLS 1.3 key schedule + transcript hash + handshake FSMs.
+  - `QUICConnectionCore` — DPLPMTUD, transport-params codec, packet parse/serialize.
+  - `QUICConnectionEngineCore` — `QUICConnectionEngine<C, T>`, the cored
+    orchestrator that DRIVES the other six (the 7th, newest core). See its own
+    CONTEXT.
+- **Host adapters (Foundation).** `QUICCore` / `QUICCrypto` / `QUICConnection` /
+  `QUICRecovery` / `QUICStream` / `QUICTransport` / `QUIC`. They hold the cores
+  (under `Mutex` where mutable), bridge `Data`/`SymmetricKey`, and add the I/O
+  orchestration. These remain the unchanged public API for callers.
 
-```
-Sources/
-# --- Embedded-clean cores (dual-build: host + Embedded) ---
-├── QUICWire/                 # Tier-3 ワイヤコーデック (Varint, Frame/, Packet/,
-│                             #   Version, ProtocolLimits, SafeConversions, StandardFrameCodec)
-├── QUICPacketProtectionCore/ # PacketProtector<C,A> / SuiteProtector<C> (`any` を置換), 鍵導出
-├── QUICRecoveryCore/         # LossDetectorCore, RTTEstimatorCore, CUBIC/NewReno, Pacer
-├── QUICStreamCore/           # Send/ReceiveStreamCore FSM, ReassemblyBuffer, FlowControllerCore
-├── QUICTLSCore/              # TLS 1.3 鍵スケジュール + transcript hash + handshake FSM
-├── QUICConnectionCore/       # DPLPMTUD, transport-params codec, packet parse/serialize core
-# --- host adapters (Foundation) ---
-├── QUICCore/                 # QUICWire+QUICConnectionCore の Foundation アダプタ
-├── QUICCrypto/               # QUICTLSCore + QUICPacketProtectionCore のアダプタ (C = DefaultCryptoProvider)
-├── QUICConnection/           # 接続状態管理 (QUICConnectionCore の上)
-├── QUICRecovery/             # ロス検出、輻輳制御 (QUICRecoveryCore の上)
-├── QUICStream/               # ストリーム管理 (QUICStreamCore の上)
-├── QUICTransport/            # UDP 統合 (swift-nio-udp)
-└── QUIC/                     # 高レベル API (host orchestrator — まだ core 化されていない)
-```
+## Contracts (the load-bearing rules)
 
-`QUIC`, `QUICConnection`, `QUICCrypto`, `QUICCrypto/TLS`, `QUICRecovery`,
-`QUICStream` には個別の `CONTEXT.md` がある。6 つの core ターゲットには専用の
-`CONTEXT.md` はなく、対応する親アダプタの `CONTEXT.md` で説明する。
+- **The crypto seam is the only crypto path.** Every core is generic over
+  `C: CryptoProvider`; no core imports swift-crypto, CommonCrypto, or BoringSSL
+  directly. The host adapters specialise every generic engine at
+  `C = QUICCryptoProvider` (the unified `DefaultCryptoProvider`, except ECDSA is
+  DER-encoded for the TLS path). Do not reach around the seam.
+- **Cipher-suite dispatch is `SuiteProtector<C>`, a closed enum** over
+  `PacketProtector<C, A>` (AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305). It
+  replaced the old `any PacketOpener` / `any PacketSealer` existentials. Do not
+  reintroduce `any` for cipher-suite polymorphism.
+- **Cipher suite negotiated by TLS must propagate to packet protection.** Carry
+  it through `KeysAvailableInfo.cipherSuite` / `QUICProtectionSuite` and select
+  the protector via the key-derivation factory. Never hardcode AES on the
+  key-installation path.
 
-> **状態 (重要)**: Embedded コンパイルは core を対象とし、接続ファサード全体は
-> まだ対象外。host orchestrator (`QUICEndpoint` ~1280L / `ManagedConnection`
-> ~2257L / `TimerManager` ~329L) は未だ cored engine に移植されていない（"M11"
-> 待ち）。リリース済み `1.3.0` は host API。core は `embedded` ブランチで未リリース
-> （"M8" 待ち）。高レベル API（`QUICEndpoint.serve/dial`,
-> `QUICConfiguration.production`, `MockTLSProvider`）は不変かつ正確。
+## Invariants (must hold; tests guard them)
 
----
+- **Fail-closed peer authentication.** CertificateVerify proof-of-possession is
+  always verified when the peer presents a certificate; a server cannot skip
+  Certificate/CertificateVerify, and Finished is accepted only after
+  authentication completes. There is no silent fallback to an unauthenticated
+  channel (RFC 8446 §4.4.3 / RFC 9001).
+- **ACK processing is DoS-bounded.** Loss detection never iterates an
+  attacker-controlled range. It iterates the locally-known sent packets and tests
+  membership against the ACK ranges, so cost is `O(sentPackets × ranges)`, not
+  `O(Σ range_length)`. ACK ranges are also capped (256) and gap/length arithmetic
+  is underflow-checked.
+- **Loss recovery follows RFC 9002.** Packet-threshold (3) and time-threshold
+  detection, PTO with exponential backoff, persistent-congestion detection.
+- **Flow control is enforced and connection-fatal on violation** (RFC 9000 §4):
+  connection- and stream-level limits; a peer exceeding an advertised limit is a
+  FLOW_CONTROL_ERROR. Final-size immutability (§4.5) is reconciled against
+  buffered out-of-order data.
+- **1-RTT key update is RFC 9001 §6.** Usage-limit-driven initiation (per-suite
+  AEAD confidentiality/integrity limits), cipher-suite-correct next-generation
+  key derivation, key-phase-correct opener selection on receive. Known
+  limitation: continuous multi-generation rotation is not yet live; only the
+  first rotation occurs automatically.
+- **Integer safety throughout.** Network-sourced `UInt64 → Int` conversions go
+  through `SafeConversions`; amplification/byte tracking uses saturating
+  arithmetic; `ConnectionID` is 0–20 bytes via a throwing initializer
+  (RFC 9000 §17.2).
+- **Anti-amplification (RFC 9000 §8.1).** A server sends at most 3× the bytes it
+  received before address validation; a PATH_RESPONSE for an unvalidated path is
+  charged against that budget and sent on the path the challenge arrived on
+  (§8.2.1).
+- **Transport-parameter ↔ Connection-ID cross-validation (RFC 9000 §7.3):**
+  `initial_source_connection_id` / `original_destination_connection_id` /
+  `retry_source_connection_id` checked against the CIDs observed during the
+  handshake; a mismatch is TRANSPORT_PARAMETER_ERROR.
 
-## コードレビュー結果（履歴）
+## Embedded constraints (do not regress)
 
-> **注意**: 以下は **2026-01-19 の Codex CLI レビュー時点のスナップショット**で
-> あり、現在の `embedded` ブランチには当てはまらない。当時 "未対応" だった項目は
-> その後対応済み。最新の設計・対応状況は `PHASE_B_DESIGN.md`（#1/#7/#8 の根本対応）
-> および git 履歴を参照すること。下表は履歴として残す。
+- The cores must stay Embedded-clean: no Foundation, no `any` existentials, no
+  `Mutex` / `ContinuousClock`, no direct crypto library. Typed throws only; closed
+  enums instead of `any`. A cross-type `catch` must live in a NAMED function, not
+  a closure literal (Embedded binds `any Error` inside a closure `catch`).
+- `P2P_CORE_EMBEDDED=1` (a `Context.environment` toggle in `Package.swift`)
+  enables the experimental `Embedded` feature + whole-module optimization for the
+  cores. `Lifetimes` is enabled in BOTH modes (Span-returning members of the
+  `P2PCoreBytes` dependency require `@_lifetime`).
+- Time never enters a core via a clock: it is injected as a monotonic
+  `nowNanos: UInt64`.
 
-| # | 問題 | 重要度 | 当時の状態 | 現状 |
-|---|------|--------|-----------|------|
-| 1 | ACK レンジ DoS (`LossDetector`) | Warning | 未対応 | 対応済み — `PHASE_B_DESIGN.md` (bounded iteration) + その後の硬化。ロジックは `QUICRecoveryCore.LossDetectorCore` に core 化 |
-| 2 | ChaCha20 エンディアン | Warning | 対応済み | 対応済み |
-| 3 | X.509 検証不足 (EKU/SAN/NameConstraints) | Warning | 未対応 | 対応済み — `QUICCrypto/TLS/X509/X509Validator.swift` で EKU(serverAuth)/SAN/NameConstraints を検証 |
-| 4 | MAX_STREAMS ゼロガード | Warning | 対応済み | 対応済み |
-| 5 | MockTLSProvider デフォルト | Warning | 未対応 | 対応済み — TLS プロバイダは必須（insecure default なし）。`.production`/`.development`/`.testing` で明示注入 |
-| 6 | AES HP 非 Apple | Warning | 未対応 | 解消 — HP は `DefaultCryptoProvider` / `QUICPacketProtectionCore` の seam 経由（host swift-crypto / Embedded BoringSSL）。CommonCrypto 直叩きではない |
-| 7 | ヘッダ検証未使用 | Info | 未対応 | `PHASE_B_DESIGN.md` 参照 |
-| 8 | STREAM オーバーヘッド誤差 | Info | 未対応 | `PHASE_B_DESIGN.md` 参照 |
-| 9 | peekBytes コメント | Info | 問題なし | 問題なし |
+## Status: orchestrator not yet rewired (Slice B pending)
 
-crypto は `DefaultCryptoProvider`（host swift-crypto / Embedded BoringSSL）に統一
-され、削除された per-lib `QUICFoundationProvider` を置き換えた。
+The Embedded compile currently covers the cores (including
+`QUICConnectionEngineCore`, which compiles green under `--target
+QUICConnectionEngineCore -c release`), NOT yet the full connection facade. The
+host orchestrator — `QUICEndpoint`, `ManagedConnection` (~2257 lines), and
+`TimerManager` — is **not yet rewired onto `QUICConnectionEngine`**. That facade
+rewire (`FacadeLock<Engine>` + `AsyncTimer` + `DatagramTransport` driver, plus
+`--target QUIC -c release` Embedded compile) is the pending "quic Slice B"
+follow-up (ROADMAP M11). The released `1.3.0` tag is the host API; the Embedded
+cores are unreleased on the `embedded` branch (M8 pending). The high-level usage
+API (`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`)
+is unchanged and accurate.
 
----
+## Build
 
-## セキュリティ強化履歴
+- Host: `swift build` / `swift test` (Swift tools 6.2, platform floor v26).
+- Embedded cores: `P2P_CORE_EMBEDDED=1 swift build --target QUICConnectionEngineCore -c release`
+  (substitute any other core target). The full `QUIC` facade Embedded build is the
+  pending Slice B work.
 
-### Phase 11 (2026-01-19) - 完了
+## References
 
-- `SafeConversions.swift` - 安全な整数変換ユーティリティ
-- `ProtocolLimits.swift` - RFC 準拠のプロトコル制限値
-- `ConnectionID` - throwing イニシャライザに変更
-- `NewConnectionIDFrame` - throwing イニシャライザに変更
-- `FrameCodec` / `PacketCodec` - 安全な変換を適用
-- 全テストファイルを新 API に対応
-
----
-
-## テスト
-
-```bash
-# 通常のテスト
-swift test --filter QUICCoreTests
-swift test --filter QUICCryptoTests
-swift test --filter QUICTests
-
-# ベンチマーク（分離済み）
-swift test --filter QUICBenchmarks
-```
-
----
-
-## 参考
-
-- [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html) - QUIC Transport Protocol
-- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html) - Using TLS to Secure QUIC
-- [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html) - QUIC Loss Detection and Congestion Control
+- RFC 9000 (QUIC Transport), RFC 9001 (QUIC-TLS), RFC 9002 (Loss Detection /
+  Congestion Control), RFC 9218 (priorities), RFC 8446 (TLS 1.3).

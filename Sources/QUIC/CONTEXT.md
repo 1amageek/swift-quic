@@ -1,222 +1,64 @@
-# QUIC Module
+# QUIC — CONTEXT
+Scope/role: the host orchestrator and public entry point (`QUICEndpoint` / `ManagedConnection` / `ManagedStream`); the Foundation facade callers import.
+Last reviewed: 2026-06-25
 
-QUIC Endpoint と Packet Processing の統合層。
+Invariants and design intent the source does not state structurally. Read this
+before changing the I/O loop, key installation, or the connection lifecycle. This
+is a host-only module: it owns the UDP I/O loops, the per-connection async
+orchestration, and the public high-level API. It is NOT yet ported to the cored
+engine (see status below).
 
-## Cored Seam / 状態（重要）
+## Contracts (the load-bearing rules)
 
-このモジュールは **host orchestrator** であり、その per-connection 同期オーケスト
-レーションは cored engine `QUICConnectionEngine<C, T>`（target
-`QUICConnectionEngineCore`）へ移植済み（"M11" engine slice 完了）。engine は
-値型・caller-locked・sans-IO・clock-free（DTLS テンプレート踏襲）で、3 PN spaces /
-key phase+key update / loss・RTT・CC・pacing / ACK 生成 / stream multiplex /
-flow control / idle / path validation を既存 core 駆動で内包する。時刻は
-`nowNanos: UInt64` 注入のみ、`handleTimeout(nowNanos:)` が caller-driven で
-probe/retx/owed-ACK/idle を返す。`--target QUICConnectionEngineCore -c release`
-で Embedded compile 緑。
+- **Cipher-suite dispatch goes through the cored seam.** `PacketProcessor`
+  encryption/decryption selects the cipher suite via `SuiteProtector<C>` (a closed
+  enum, `C = QUICCryptoProvider`), NOT `any PacketOpener` / `any PacketSealer`.
+- **Key installation must propagate the negotiated cipher suite.** Take
+  `cipherSuite` from `KeysAvailableInfo`, derive `KeyMaterial` with it, and build
+  the protector via the key-derivation factory. Never hardcode AES-128-GCM on the
+  install path — that silently breaks ChaCha20-Poly1305 connections.
+- **The I/O loop must be cancellation-clean.** `run(socket:)` wraps its task group
+  in `withTaskCancellationHandler` and stops the socket on cancel; the socket's
+  `shutdown()` MUST `finish()` the incoming-packet continuation. Without this,
+  `for await packet in socket.incomingPackets` blocks forever and `shutdown()`
+  hangs. (See AsyncStream rule: a type vending an AsyncStream must implement
+  `shutdown()` that finishes the continuation.)
 
-ただし `QUICEndpoint`（~1280L, I/O ループ）、`ManagedConnection`（~2257L, 高レベル
-接続）、`TimerManager`（~329L, loss/PTO タイマ）は **まだ engine を driving せず**
-host 専用のまま（facade rewire = `FacadeLock<Engine>`+`AsyncTimer`+
-`DatagramTransport` driver、`--target QUIC -c release` Embedded compile は後続スライス
-= tls Slice B 相当）。Embedded コンパイルは下位の core
-（`QUICWire` / `QUICPacketProtectionCore` / ... / `QUICConnectionEngineCore`）を
-対象とし、この接続ファサード全体（`QUIC` target）はまだ対象外。
+## Invariants (must hold; tests guard them)
 
-ただし `PacketProcessor` の暗号化/復号は cored seam を使う: cipher-suite dispatch
-は `any PacketOpener`/`Sealer` ではなく `SuiteProtector<C>`（閉じた enum, C =
-QUICCryptoProvider）で行う。高レベル API（`QUICEndpoint.serve/dial`,
-`QUICConfiguration.production`, `MockTLSProvider`）は不変かつ正確。
+- **A TLS provider is mandatory — no insecure default.** Configuration is via
+  `.production` / `.development` (caller supplies a provider) or `.testing`
+  (`MockTLSProvider`, DEBUG-guarded). There is no path that runs without one.
+- **Graceful shutdown prevents continuation leaks.** `shutdown()` and `close()`
+  guard against concurrent/duplicate calls; `start()` / `startWith0RTT()` is an
+  atomic state transition (double-start prevention).
+- **Fail-closed peer authentication** is enforced through the crypto/TLS layer:
+  CertificateVerify is always verified and Finished is accepted only after
+  authentication; the facade never exposes an unauthenticated connection.
 
-## Architecture
+## Packet flow
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                             QUICEndpoint                                      │
-│                        (Server/Client Endpoint)                               │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                          run(socket:)                                 │   │
-│  │                                                                        │   │
-│  │    withTaskGroup {                                                    │   │
-│  │        ├── packetReceiveLoop()   ← socket.incomingPackets             │   │
-│  │        └── timerProcessingLoop() ← loss detection, PTO               │   │
-│  │    }                                                                  │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                    ↓                                         │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                        PacketProcessor                                │   │
-│  │  - installKeys(KeysAvailableInfo, isClient)                          │   │
-│  │  - encryptPacket() / decryptPacket()                                 │   │
-│  │  - CryptoContext per EncryptionLevel                                 │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+- Inbound: UDP datagram → `CoalescedPacketParser.parse` (split coalesced packets)
+  → `PacketProcessor.decryptPacket` (extract header info, pick the per-level
+  `CryptoContext`, remove header protection, AEAD-open) → parsed frames.
+- Outbound: frames + header → `PacketProcessor.encrypt{Long,Short}HeaderPacket`
+  (AEAD-seal, apply header protection) → encrypted packet → coalesce → send.
+- Encryption levels (packet-number spaces): Initial, 0-RTT (client only),
+  Handshake, Application (1-RTT short header).
 
-## Critical: I/O Loop Lifecycle
+## Status: not yet rewired onto the cored engine (Slice B pending)
 
-### 問題のあるパターン（過去のバグ）
+The cored orchestration engine `QUICConnectionEngine<C, T>` (target
+`QUICConnectionEngineCore`) exists and compiles green Embedded, but the host
+orchestrator here — `QUICEndpoint`, `ManagedConnection` (~2257 lines),
+`TimerManager` — does NOT yet drive it. The facade rewire (`FacadeLock<Engine>` +
+`AsyncTimer` + `DatagramTransport` driver, and the `--target QUIC -c release`
+Embedded compile) is the pending "quic Slice B" follow-up (ROADMAP M11). Until
+then the Embedded compile covers the cores, not this facade. The public API
+(`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`) is
+unchanged and accurate.
 
-```swift
-// NG: AsyncStream が finish されないと for await が永久にブロック
-public func run(socket: any QUICSocket) async throws {
-    await withTaskGroup(of: Void.self) { group in
-        group.addTask {
-            for await packet in socket.incomingPackets {  // ← ここでブロック
-                guard !shouldStop else { break }
-                // ...
-            }
-        }
-        // ...
-    }
-}
+## Build
 
-public func shutdown() async {
-    shouldStop = true
-    ioTask?.cancel()  // ← ioTask は nil、意味がない
-}
-```
-
-### 正しいパターン
-
-```swift
-// OK: withTaskCancellationHandler で socket を停止
-public func run(socket: any QUICSocket) async throws {
-    try await withTaskCancellationHandler {
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await self.packetReceiveLoop(socket: socket) }
-            group.addTask { await self.timerProcessingLoop(socket: socket) }
-            await group.waitForAll()
-        }
-    } onCancel: {
-        Task { await socket.shutdown() }
-    }
-}
-
-public func shutdown() async {
-    shouldStop = true
-    // socket.shutdown() で AsyncStream が finish される
-    if let socket = socket {
-        await socket.shutdown()
-    }
-}
-```
-
-### Socket 側の要件
-
-```swift
-// QUICSocket 実装は stop() で continuation を finish する必要がある
-public func shutdown() async {
-    await transport.shutdown()
-    incomingContinuation.finish()  // ← 必須: これがないと for await が終了しない
-}
-```
-
-## Critical: Key Installation
-
-**PacketProcessor.installKeys() は cipher suite を正しく伝播する必要がある。**
-
-### 正しいパターン
-
-```swift
-public func installKeys(_ info: KeysAvailableInfo, isClient: Bool) throws {
-    let cipherSuite = info.cipherSuite  // ← KeysAvailableInfo から取得
-
-    // 0-RTT (単方向)
-    if info.level == .zeroRTT {
-        let clientKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
-        let (opener, sealer) = try clientKeys.createCrypto()  // ← ファクトリ使用
-        // ...
-        return
-    }
-
-    // 双方向鍵
-    let clientKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
-    let serverKeys = try KeyMaterial.derive(from: serverSecret, cipherSuite: cipherSuite)
-
-    let readKeys = isClient ? serverKeys : clientKeys
-    let writeKeys = isClient ? clientKeys : serverKeys
-
-    // ファクトリメソッドで正しい型を生成
-    let (opener, _) = try readKeys.createCrypto()
-    let (_, sealer) = try writeKeys.createCrypto()
-
-    let context = CryptoContext(opener: opener, sealer: sealer)
-    installContext(context, for: info.level)
-}
-```
-
-### NG パターン（過去のバグ）
-
-```swift
-// NG: cipher suite を無視して AES をハードコード
-let clientKeys = try KeyMaterial.derive(from: clientSecret)  // ← cipherSuite なし
-let opener = try AES128GCMOpener(keyMaterial: readKeys)      // ← ハードコード
-let sealer = try AES128GCMSealer(keyMaterial: writeKeys)     // ← ハードコード
-```
-
-## Packet Flow
-
-### Inbound (Decryption)
-
-```
-UDP Datagram
-    ↓
-CoalescedPacketParser.parse()   ← 複数パケットを分離
-    ↓
-PacketProcessor.decryptPacket()
-    ├── extractHeaderInfo()     ← DCID, packet type 取得
-    ├── context(for: level)     ← 暗号化レベルの CryptoContext 取得
-    ├── opener.removeHeaderProtection()
-    └── opener.open()           ← AEAD 復号
-    ↓
-ParsedPacket(header, packetNumber, frames)
-```
-
-### Outbound (Encryption)
-
-```
-Frames + Header
-    ↓
-PacketProcessor.encryptLongHeaderPacket() or encryptShortHeaderPacket()
-    ├── context(for: level)     ← CryptoContext 取得
-    ├── sealer.seal()           ← AEAD 暗号化
-    └── sealer.applyHeaderProtection()
-    ↓
-Encrypted Packet Data
-```
-
-## Encryption Levels
-
-| Level | Usage | Packet Type |
-|-------|-------|-------------|
-| Initial | Connection establishment | Initial |
-| ZeroRTT | Early data (client only) | 0-RTT |
-| Handshake | Handshake messages | Handshake |
-| Application | Application data | 1-RTT (Short Header) |
-
-## Files
-
-| ファイル | 責務 |
-|---------|------|
-| `QUICEndpoint.swift` | Server/Client Endpoint, I/O Loop（host-only, 未 core 化） |
-| `ManagedConnection.swift` | 高レベル接続（async stream）, shutdown lifecycle |
-| `ManagedStream.swift` | `QUICStreamProtocol` を実装する stream wrapper |
-| `PacketProcessor.swift` | Packet 暗号化/復号, 鍵管理（`SuiteProtector<C>` 経由） |
-| `ConnectionRouter.swift` | DCID ベースの packet routing |
-| `TimerManager.swift` | loss-detection / PTO タイマ |
-| `QUICConfiguration.swift` | 設定（`.production` / `.development` / `.testing`） |
-
-## Testing
-
-```bash
-swift test --filter QUICTests
-```
-
-### 重要なテスト項目
-
-- [ ] Endpoint start/stop lifecycle
-- [ ] ChaCha20-Poly1305 packet encryption/decryption
-- [ ] Coalesced packet handling
-- [ ] Key update (1-RTT key rotation)
+- Host only: `swift build` / `swift test --filter QUICTests`. This module is not
+  yet part of the Embedded compile.

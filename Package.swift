@@ -239,6 +239,7 @@ let package = Package(
                 .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
             ],
             path: "Sources/QUICConnectionEngineCore",
+            exclude: ["CONTEXT.md"],
             swiftSettings: coreSettings
         ),
 

@@ -1,207 +1,57 @@
-# QUICCrypto/TLS Module
+# QUICCrypto/TLS — CONTEXT
+Scope/role: the host TLS 1.3 handshake adapter (`TLS13Handler`, RFC 8446 + RFC 9001 integration); thin layer over the `QUICTLSCore` FSMs and key schedule.
+Last reviewed: 2026-06-25
 
-TLS 1.3 ハンドシェイク実装 (RFC 8446) と QUIC 統合 (RFC 9001)。
+Invariants and design intent the source does not state structurally. Read this
+before changing the handshake FSM, the keys-available output, or PSK resumption.
+`TLS13Handler` is a host adapter; the TLS 1.3 logic (FSMs, key schedule,
+transcript hash, message/extension wire codecs) lives in the Embedded-clean
+`QUICTLSCore`, generic over `C: CryptoProvider`. This adapter specialises it at
+`C = QUICCryptoProvider` and bridges `Data` / `SymmetricKey`.
 
-## Cored Seam（重要）
+## Contracts (the load-bearing rules)
 
-`TLS13Handler` は **host アダプタ**。TLS 1.3 のロジック本体は Embedded-clean な
-**QUICTLSCore** にある（`C: CryptoProvider` にジェネリック）:
+- **The FSMs and key schedule live in `QUICTLSCore`.** `TLSKeyScheduleCore`
+  (early/handshake/master secrets, HKDF-Expand-Label, Derive-Secret, traffic
+  secrets, finished key / verify-data, RFC 8446 §7.1), `TLSTranscriptHashCore`,
+  and `QUICClientHandshake` / `QUICServerHandshake` / `QUICClientAuthMachine`. Do
+  not reimplement them here.
+- **`KeysAvailableInfo` MUST carry the negotiated cipher suite.** Without
+  `cipherSuite`, the packet-protection layer cannot select the correct AEAD. Every
+  `.keysAvailable` output sets it from the negotiated suite. The TLS↔QUIC suite
+  mapping must be exact (ChaCha20-Poly1305-SHA256, AES-128-GCM-SHA256;
+  AES-256-GCM-SHA384 maps with SHA-384 as the hash).
+- **Signing/verification is injected via the seam** (`TLSSignatureSigner` /
+  `TLSSignatureVerifier` in the core); this adapter supplies the host
+  swift-certificates / swift-crypto implementation.
 
-- `TLSKeyScheduleCore` — early/handshake/master secret, HKDF-Expand-Label,
-  Derive-Secret, traffic secret, finished key / verify-data (RFC 8446 §7.1)
-- `TLSTranscriptHashCore` — incremental transcript hash
-- `QUICClientHandshake` / `QUICServerHandshake` / `QUICClientAuthMachine` —
-  handshake FSM（pre/post-ServerHello, client auth）
-- handshake message body + extension の wire codec（ClientHello, ServerHello,
-  Certificate, CertificateVerify, Finished, ... ）
+## Invariants (must hold; tests guard them)
 
-host の `TLS13Handler` はこれらを `C = QUICCryptoProvider` で特殊化し、`Data` /
-`SymmetricKey` を橋渡しする。signature の sign/verify は `TLSSignatureSigner` /
-`TLSSignatureVerifier`（同じく core, seam 経由）。
+- **Fail-closed peer authentication.** CertificateVerify is always verified; a
+  server cannot skip Certificate/CertificateVerify, and Finished is accepted only
+  after authentication completes. There is no silent fallback to an
+  unauthenticated channel (RFC 8446 §4.4.3).
+- **PSK resumption preserves `ticketNonce`.** `StoredSession` must keep the
+  ticket nonce — it is required to derive the PSK; a placeholder must not be used
+  during resumption validation.
+- **The binder transcript hash is selected by the session's cipher suite**
+  (SHA-384 for AES-256-GCM-SHA384, else SHA-256), never hardcoded to SHA-256.
+- **0-RTT early data is replay-protected**; the early-data path uses the
+  resumption secret and the recorded `maxEarlyDataSize`.
 
-## Architecture
+## Embedded constraints (do not regress)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            TLS13Handler                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌─────────────────────────────┐    ┌─────────────────────────────┐        │
-│  │     ClientStateMachine      │    │     ServerStateMachine      │        │
-│  │  - Start → Wait ServerHello │    │  - Start → Wait ClientHello │        │
-│  │  - ServerHello → Handshake  │    │  - ClientHello → ServerHello│        │
-│  │  - Finished → Connected     │    │  - Finished → Connected     │        │
-│  └─────────────────────────────┘    └─────────────────────────────┘        │
-│                   ↓                               ↓                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                          TLSOutput                                    │   │
-│  │  - handshakeData(Data, level)                                        │   │
-│  │  - keysAvailable(KeysAvailableInfo)  ← cipher suite を含む          │   │
-│  │  - handshakeComplete(HandshakeCompleteInfo)                          │   │
-│  │  - needMoreData                                                       │   │
-│  │  - error(TLSError)                                                   │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+- `QUICTLSCore` stays Embedded-clean: no Foundation, no `any`, no `Mutex`, no
+  direct crypto. The host X.509 / Foundation surface (swift-certificates) lives in
+  this adapter so the core needs neither.
 
-## Critical: KeysAvailableInfo に Cipher Suite を含める
+## Wire protocol notes
 
-**TLS で negotiation した cipher suite を KeysAvailableInfo に含めないと、
-PacketProcessor が正しい暗号アルゴリズムを選択できない。**
+- Handshake messages and extensions are wire-coded in `QUICTLSCore`: ClientHello,
+  ServerHello, Certificate, CertificateVerify, Finished, NewSessionTicket, and the
+  TLS extensions (RFC 8446 §4 / §4.2).
 
-### KeysAvailableInfo 構造
+## Build
 
-```swift
-public struct KeysAvailableInfo: Sendable {
-    public let level: EncryptionLevel
-    public let clientSecret: SymmetricKey?
-    public let serverSecret: SymmetricKey?
-    public let cipherSuite: QUICCipherSuite  // ← 必須: negotiation 結果
-}
-```
-
-### TLS13Handler での設定
-
-```swift
-// ServerStateMachine - ServerHello 送信時
-outputs.append(.keysAvailable(KeysAvailableInfo(
-    level: .handshake,
-    clientSecret: clientSecret,
-    serverSecret: serverSecret,
-    cipherSuite: toQUICCipherSuite(state.context.cipherSuite)  // ← 必須
-)))
-
-// TLS CipherSuite → QUICCipherSuite 変換
-private func toQUICCipherSuite(_ suite: CipherSuite) -> QUICCipherSuite {
-    switch suite {
-    case .tls_chacha20_poly1305_sha256:
-        return .chacha20Poly1305Sha256
-    case .tls_aes_256_gcm_sha384:
-        return .aes128GcmSha256  // SHA-384 はハッシュのみ、鍵は AES-128
-    default:
-        return .aes128GcmSha256
-    }
-}
-```
-
-## PSK / Session Resumption
-
-### Session Ticket Data Model
-
-**重要**: `StoredSession` には `ticketNonce` を必ず含める。
-
-```swift
-public struct StoredSession: Sendable {
-    public let resumptionMasterSecret: SymmetricKey
-    public let cipherSuite: CipherSuite
-    public let createdAt: Date
-    public let lifetime: UInt32
-    public let ticketAgeAdd: UInt32
-    public let alpn: String?
-    public let maxEarlyDataSize: UInt32
-    public let ticketNonce: Data  // ← 必須: PSK derivation に必要
-}
-```
-
-### PSK Flow
-
-```
-Server:
-1. Handshake 完了後、NewSessionTicket を生成
-2. ticket_nonce をランダム生成
-3. StoredSession に ticket_nonce を保存
-4. NewSessionTicket(ticket_nonce, ticket_lifetime, ...) を送信
-
-Client (Resumption):
-1. ClientHello に pre_shared_key extension を含める
-2. binder を計算 (ticket_nonce から PSK を導出)
-
-Server (Resumption Validation):
-1. ticket_id から StoredSession を検索
-2. session.ticketNonce を使って PSK を導出  ← placeholder を使わない
-3. binder を検証
-```
-
-### Binder Hash Algorithm
-
-**重要**: Binder hash は session の cipher suite に基づいて選択する。
-
-```swift
-// NG: 常に SHA-256
-let transcriptHash = Data(SHA256.hash(data: truncatedTranscript))
-
-// OK: cipher suite に基づいて選択
-let transcriptHash: Data
-switch session.cipherSuite {
-case .tls_aes_256_gcm_sha384:
-    transcriptHash = Data(SHA384.hash(data: truncatedTranscript))
-default:
-    transcriptHash = Data(SHA256.hash(data: truncatedTranscript))
-}
-```
-
-## Key Schedule
-
-```
-                    PSK (or 0)
-                       |
-                       v
-            +---> HKDF-Extract = Early Secret
-            |
-            +-----> Derive-Secret(., "ext binder" | "res binder", "")
-            |                     = binder_key
-            |
-            +-----> Derive-Secret(., "c e traffic", ClientHello)
-            |                     = client_early_traffic_secret
-            |
-      0 ----+
-            |
-            v
-      +---> HKDF-Extract = Handshake Secret
-      |
-      +-----> Derive-Secret(., "c hs traffic", ClientHello...ServerHello)
-      |                     = client_handshake_traffic_secret
-      |
-      +-----> Derive-Secret(., "s hs traffic", ClientHello...ServerHello)
-      |                     = server_handshake_traffic_secret
-      |
-      0 ----+
-            |
-            v
-      +---> HKDF-Extract = Master Secret
-      |
-      +-----> Derive-Secret(., "c ap traffic", ClientHello...server Finished)
-      |                     = client_application_traffic_secret_0
-      |
-      +-----> Derive-Secret(., "s ap traffic", ClientHello...server Finished)
-      |                     = server_application_traffic_secret_0
-      |
-      +-----> Derive-Secret(., "res master", ClientHello...client Finished)
-                            = resumption_master_secret
-```
-
-## Files
-
-| ファイル | 責務 | RFC参照 |
-|---------|------|--------|
-| `TLS13Handler.swift` | Client/Server State Machine | RFC 8446 |
-| `TLSOutput.swift` | TLS 処理結果の型定義 | - |
-| `KeySchedule/TLSKeySchedule.swift` | TLS 1.3 Key Schedule | RFC 8446 Section 7 |
-| `Session/SessionTicketStore.swift` | Session Ticket 管理 | RFC 8446 Section 4.6.1 |
-| `Messages/*.swift` | TLS Message 型定義 | RFC 8446 Section 4 |
-| `Extensions/*.swift` | TLS Extension 型定義 | RFC 8446 Section 4.2 |
-
-## Testing
-
-```bash
-swift test --filter TLSTests
-```
-
-### テスト項目
-
-- [ ] Full handshake (ECDHE)
-- [ ] PSK resumption (0-RTT)
-- [ ] ChaCha20-Poly1305 negotiation
-- [ ] Certificate validation
-- [ ] ALPN negotiation
+- Host: `swift build` / `swift test --filter TLSTests` (the underlying
+  `QUICTLSCore` is part of the Embedded compile).
