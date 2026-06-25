@@ -21,7 +21,7 @@
 /// same key material as before the refactor.
 ///
 /// Generic over `C: CryptoProvider`; the adapter specialises at
-/// `C = QUICFoundationProvider`. Embedded-clean: no Foundation, no `any`, no Mutex,
+/// `C = QUICCryptoProvider`. Embedded-clean: no Foundation, no `any`, no Mutex,
 /// no swift-crypto, typed throws.
 
 import P2PCoreBytes
