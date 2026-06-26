@@ -207,6 +207,40 @@ struct QUICConnectionEngineTests {
         }
     }
 
+    @Test("ACK delay conversion honors transport parameter exponent")
+    func ackDelayConversionHonorsTransportParameterExponent() {
+        #expect(Engine.ackDelayWireUnits(delayNanos: 10_000_000, exponent: 3) == 1_250)
+        #expect(Engine.ackDelayNanos(wireUnits: 1_250, exponent: 3) == 10_000_000)
+        #expect(Engine.ackDelayNanos(wireUnits: 1, exponent: 10) == 1_024_000)
+    }
+
+    @Test("peer ACK transport parameters update RTT and PTO inputs")
+    func peerAckTransportParametersUpdateRTTAndPTOInputs() throws {
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let scid = try #require(ConnectionID.random(length: 8))
+        var engine = try Engine(configuration: makeConfig(role: .client, dcid: dcid, scid: scid), nowNanos: 0)
+
+        var peerTP = TransportParametersCore()
+        peerTP.ackDelayExponent = 10
+        peerTP.maxAckDelay = 100
+
+        engine.applyPeerTransportParameters(peerTP)
+
+        #expect(engine.peerAckDelayExponent == 10)
+        #expect(engine.peerMaxAckDelayNanos == 100_000_000)
+    }
+
+    @Test("ACK delay measures from largest acknowledged packet receive time")
+    func ackDelayMeasuresFromLargestAcknowledgedReceiveTime() {
+        var space = PacketNumberSpace()
+
+        space.recordReceived(packetNumber: 1, ackEliciting: true, nowNanos: 1_000)
+        space.recordReceived(packetNumber: 3, ackEliciting: true, nowNanos: 9_000)
+
+        #expect(space.largestReceived == 3)
+        #expect(space.largestReceivedTimeNanos == 9_000)
+    }
+
     // MARK: - Clock-free PTO probe
 
     @Test("PTO probe is produced via handleTimeout after an ack-eliciting send (clock-free)")

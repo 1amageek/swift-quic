@@ -10,7 +10,7 @@ import Testing
 import Foundation
 @testable import QUICCore
 
-@Suite("QUICCore Performance Benchmarks")
+@Suite("QUICCore Performance Benchmarks", .serialized)
 struct CoreBenchmarks {
 
     // MARK: - Varint Benchmarks

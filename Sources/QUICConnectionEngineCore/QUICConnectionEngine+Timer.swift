@@ -151,7 +151,7 @@ extension QUICConnectionEngine {
             }
         }
         guard let oldest else { return nil }
-        let basePTO = rtt.probeTimeoutNanos(maxAckDelayNanos: config.maxAckDelayNanos)
+        let basePTO = rtt.probeTimeoutNanos(maxAckDelayNanos: peerMaxAckDelayNanos)
         let backoff = UInt64(1) << UInt64(min(ptoCount, 20))
         let (scaled, overflow) = basePTO.multipliedReportingOverflow(by: backoff)
         let pto = overflow ? UInt64.max : scaled

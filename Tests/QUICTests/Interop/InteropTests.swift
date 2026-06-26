@@ -1248,7 +1248,7 @@ struct QuinnInteropTests {
 /// ```
 ///
 /// Note: These tests are disabled when ngtcp2 is not running
-@Suite("ngtcp2 Interoperability Tests", .tags(.interop, .docker))
+@Suite("ngtcp2 Interoperability Tests", .tags(.interop, .docker), DockerRequired())
 struct Ngtcp2InteropTests {
 
     let serverAddress = InteropTestHelper.ngtcp2ServerAddress

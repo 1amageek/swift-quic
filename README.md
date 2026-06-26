@@ -557,7 +557,7 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 Run benchmarks:
 
 ```bash
-swift test --filter QUICBenchmarks
+SWIFT_QUIC_ENABLE_BENCHMARKS=1 swift test --filter QUICBenchmarks
 swift test --filter RecoveryBenchmarkTests
 ```
 

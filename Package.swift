@@ -58,6 +58,22 @@ let quicFacadeDependencies: [Target.Dependency] = {
     return d
 }()
 
+// Microbenchmarks are opt-in because SwiftPM runs every test target by default,
+// while throughput assertions are host-load dependent and not correctness gates.
+// Run them with:
+//   SWIFT_QUIC_ENABLE_BENCHMARKS=1 swift test --filter QUICBenchmarks
+let benchmarkTargets: [Target] = Context.environment["SWIFT_QUIC_ENABLE_BENCHMARKS"] == "1" ? [
+    .testTarget(
+        name: "QUICBenchmarks",
+        dependencies: [
+            "QUIC",
+            "QUICCore",
+            "QUICCrypto",
+        ],
+        path: "Tests/QUICBenchmarks"
+    ),
+] : []
+
 let package = Package(
     name: "swift-quic",
     platforms: [
@@ -123,13 +139,7 @@ let package = Package(
     ],
     dependencies: [
         // UDP transport
-        // embedded-branch only; restore URL before release.
-        // Local path so the whole embedded composition (swift-libp2p pulls quic +
-        // SWIM + mDNS + nio-udp together) resolves nio-udp against ONE working tree.
-        // A URL pin here collides with swift-libp2p's local-path nio-udp and trips
-        // SwiftPM's "Conflicting identity for swift-nio-udp" diagnostic (escalating
-        // to an error in future SwiftPM). Original: .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.2")
-        .package(path: "../swift-nio-udp"),
+        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.2"),
 
         // Cryptography.
         // Range (not `from: 4.2.0`) so the apple/swift-crypto identity resolves to a
@@ -150,14 +160,14 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
 
         // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter) + crypto seam
-        .package(path: "../swift-p2p-core"),
+        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.1.0"),
 
         // Unified crypto provider: surfaces `DefaultCryptoProvider` (host
         // swift-crypto / Embedded BoringSSL). Replaces the deleted per-lib
         // QUICFoundationProvider (embedded-first-api.md §2.2). Its vendored
         // BoringSSL has a distinct `p2p-boringssl` identity + renamed C symbols, so
         // it coexists with apple/swift-crypto + swift-certificates with no conflict.
-        .package(path: "../swift-p2p-crypto"),
+        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.0"),
     ],
     targets: [
         // MARK: - Embedded-clean wire codec (dual-build: host + Embedded)
@@ -322,7 +332,8 @@ let package = Package(
                 "QUICConnectionCore",
                 .product(name: "P2PCoreFoundation", package: "swift-p2p-core"),
             ],
-            path: "Sources/QUICCore"
+            path: "Sources/QUICCore",
+            exclude: ["QUICCore.docc"]
         ),
 
         // MARK: - Crypto Layer
@@ -411,7 +422,7 @@ let package = Package(
             name: "QUIC",
             dependencies: quicFacadeDependencies,
             path: "Sources/QUIC",
-            exclude: ["CONTEXT.md"],
+            exclude: ["CONTEXT.md", "QUIC.docc"],
             swiftSettings: coreSettings
         ),
 
@@ -496,16 +507,5 @@ let package = Package(
             path: "Tests/QUICEngineConnectionTests"
         ),
 
-        // MARK: - Benchmarks (run separately with: swift test --filter QUICBenchmarks)
-
-        .testTarget(
-            name: "QUICBenchmarks",
-            dependencies: [
-                "QUIC",
-                "QUICCore",
-                "QUICCrypto",
-            ],
-            path: "Tests/QUICBenchmarks"
-        ),
-    ]
+    ] + benchmarkTargets
 )

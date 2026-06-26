@@ -66,6 +66,7 @@ public final class QUICEngineConnection<
     /// host adapter (or an Embedded consumer) drains these to wake stream reads,
     /// surface incoming streams, and observe handshake completion / close.
     private let events: FacadeLock<EventState>
+    private let timerWakeups: FacadeLock<TimerWakeState>
 
     private struct EventState: Sendable {
         var newStreams: [UInt64] = []
@@ -76,6 +77,17 @@ public final class QUICEngineConnection<
         var peerClosed: Bool = false
         var closeReason: ConnectionCloseInfo? = nil
         var lastReceiveError: QUICEngineError? = nil
+    }
+
+    private enum TimerWakeReason: Sendable {
+        case signaled
+        case terminated
+    }
+
+    private struct TimerWakeState: Sendable {
+        var pendingSignals: UInt64 = 0
+        var waiter: CheckedContinuation<TimerWakeReason, Never>? = nil
+        var terminated = false
     }
 
     /// The last fatal receive error the engine surfaced (a per-packet decrypt
@@ -101,6 +113,7 @@ public final class QUICEngineConnection<
         self.timer = timer
         self.peer = peer
         self.events = FacadeLock(EventState())
+        self.timerWakeups = FacadeLock(TimerWakeState())
     }
 
     // MARK: - Run loop (I/O inversion + timer loop)
@@ -116,6 +129,9 @@ public final class QUICEngineConnection<
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.receiveLoop() }
             group.addTask { await self.timerLoop() }
+            await group.next()
+            self.terminateTimerWakeups()
+            group.cancelAll()
             await group.waitForAll()
         }
     }
@@ -127,6 +143,7 @@ public final class QUICEngineConnection<
             for try await datagram in transport.incoming {
                 let now = timer.monotonicNanos()
                 let datagramsToSend = self.receive(datagram.payload, nowNanos: now)
+                signalTimer()
                 await sendAll(datagramsToSend)
                 if isClosed { break }
             }
@@ -134,30 +151,65 @@ public final class QUICEngineConnection<
             // Transport iteration ended (closed / I/O failure). The connection
             // tears down; we do not silently retry.
         }
+        markConnectionClosed()
     }
 
     /// The timer loop: parks against the engine's earliest deadline and drives
     /// `handleTimeout` on wake. No `ContinuousClock` / `Task.sleep` — the wait is
     /// the injected `AsyncTimer.sleep(untilNanos:)`.
     private func timerLoop() async {
-        while !isClosed {
+        while !Task.isCancelled && !isClosed {
             let now = timer.monotonicNanos()
             let deadline = engine.withLock { $0.deadlines(nowNanos: now).earliestDeadlineNanos }
-            guard let deadline else {
-                // No timer armed: park briefly and re-evaluate (a send on another
-                // task can arm one). A small fixed quantum keeps this responsive
-                // without a busy-loop; it is still seam-sourced, not ContinuousClock.
-                do { try await timer.sleep(untilNanos: now &+ 50_000_000) }
-                catch { return }
+            switch await waitForTimer(deadline: deadline) {
+            case .signaled:
                 continue
+            case .cancelled:
+                return
+            case .elapsed:
+                break
             }
-            do { try await timer.sleep(untilNanos: deadline) }
-            catch { return }   // cancelled
 
             let wakeNow = timer.monotonicNanos()
             let (datagrams, idleExpired) = self.handleTimeout(nowNanos: wakeNow)
             await sendAll(datagrams)
-            if idleExpired { return }
+            if idleExpired {
+                markConnectionClosed()
+                return
+            }
+        }
+    }
+
+    private enum TimerWaitOutcome: Sendable {
+        case elapsed
+        case signaled
+        case cancelled
+    }
+
+    private func waitForTimer(deadline: UInt64?) async -> TimerWaitOutcome {
+        guard !Task.isCancelled else { return .cancelled }
+
+        guard let deadline else {
+            return await waitForTimerSignal() == .terminated ? .cancelled : .signaled
+        }
+
+        return await withTaskGroup(of: TimerWaitOutcome.self) { group in
+            group.addTask {
+                do {
+                    try await self.timer.sleep(untilNanos: deadline)
+                    return .elapsed
+                } catch {
+                    return .cancelled
+                }
+            }
+            group.addTask {
+                await self.waitForTimerSignal() == .terminated ? .cancelled : .signaled
+            }
+
+            let outcome = await group.next() ?? .cancelled
+            group.cancelAll()
+            await group.waitForAll()
+            return outcome
         }
     }
 
@@ -194,6 +246,7 @@ public final class QUICEngineConnection<
             // policy via the surfaced close); a per-packet decrypt failure is
             // already dropped (non-fatal) inside the engine per RFC 9001 §5.5.
             events.withLock { $0.lastReceiveError = error }
+            markConnectionClosed()
             return []
         }
     }
@@ -306,6 +359,7 @@ public final class QUICEngineConnection<
     /// Applies the peer's validated transport parameters.
     public func applyPeerTransportParameters(_ tp: TransportParametersCore) {
         engine.withLock { $0.applyPeerTransportParameters(tp) }
+        signalTimer()
     }
 
     /// Marks the handshake complete (the TLS seam reports completion).
@@ -373,10 +427,66 @@ public final class QUICEngineConnection<
         }
         switch result {
         case .success(let datagrams):
+            signalTimer()
             await sendAll(datagrams)
         case .failure:
             return
         }
+    }
+
+    private func waitForTimerSignal() async -> TimerWakeReason {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let immediate = timerWakeups.withLock { state -> TimerWakeReason? in
+                    if state.terminated { return .terminated }
+                    if state.pendingSignals > 0 {
+                        state.pendingSignals -= 1
+                        return .signaled
+                    }
+                    state.waiter = continuation
+                    return nil
+                }
+                if let immediate {
+                    continuation.resume(returning: immediate)
+                }
+            }
+        } onCancel: {
+            let waiter = timerWakeups.withLock { state -> CheckedContinuation<TimerWakeReason, Never>? in
+                let waiter = state.waiter
+                state.waiter = nil
+                return waiter
+            }
+            waiter?.resume(returning: .terminated)
+        }
+    }
+
+    private func signalTimer() {
+        let waiter = timerWakeups.withLock { state -> CheckedContinuation<TimerWakeReason, Never>? in
+            guard !state.terminated else { return nil }
+            if let waiter = state.waiter {
+                state.waiter = nil
+                return waiter
+            }
+            state.pendingSignals &+= 1
+            return nil
+        }
+        waiter?.resume(returning: .signaled)
+    }
+
+    private func terminateTimerWakeups() {
+        let waiter = timerWakeups.withLock { state -> CheckedContinuation<TimerWakeReason, Never>? in
+            state.terminated = true
+            state.pendingSignals = 0
+            let waiter = state.waiter
+            state.waiter = nil
+            return waiter
+        }
+        waiter?.resume(returning: .terminated)
+    }
+
+    private func markConnectionClosed() {
+        engine.withLock { $0.markClosed() }
+        terminateTimerWakeups()
     }
 
     /// Runs an engine op under the lock, returning its typed result. The engine

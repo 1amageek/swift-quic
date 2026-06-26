@@ -114,6 +114,12 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
     var pendingPing: [EncryptionLevel: Bool] = [:]
     /// Whether a local PATH_CHALLENGE is outstanding (arms the validation timer).
     var pathValidationPending = false
+    /// ACK delay exponent this endpoint advertised and uses when encoding ACKs.
+    let localAckDelayExponent: UInt64
+    /// ACK delay exponent advertised by the peer and used when decoding ACKs.
+    var peerAckDelayExponent: UInt64
+    /// Peer-advertised max_ack_delay in nanoseconds, used by RTT/PTO logic.
+    var peerMaxAckDelayNanos: UInt64
 
     // MARK: - Init
 
@@ -137,6 +143,9 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
         self.antiAmplification = AntiAmplificationCore(isServer: configuration.role == .server)
 
         let tp = configuration.localTransportParameters
+        self.localAckDelayExponent = Self.boundedAckDelayExponent(tp.ackDelayExponent)
+        self.peerAckDelayExponent = Self.defaultAckDelayExponent
+        self.peerMaxAckDelayNanos = Self.defaultMaxAckDelayNanos
         let fc = FlowControllerCore(
             isClient: configuration.role == .client,
             initialMaxData: tp.initialMaxData,
@@ -211,5 +220,31 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
     /// the current key availability (1-RTT once application write keys exist).
     var currentSendLevel: EncryptionLevel {
         keys.hasWriteKeys(for: .application) ? .application : .initial
+    }
+
+    static var defaultAckDelayExponent: UInt64 { 3 }
+    static var maxAckDelayExponent: UInt64 { 20 }
+    static var defaultMaxAckDelayNanos: UInt64 { 25_000_000 }
+
+    static func boundedAckDelayExponent(_ exponent: UInt64) -> UInt64 {
+        min(exponent, maxAckDelayExponent)
+    }
+
+    static func millisecondsToNanos(_ milliseconds: UInt64) -> UInt64 {
+        let (nanos, overflow) = milliseconds.multipliedReportingOverflow(by: 1_000_000)
+        return overflow ? UInt64.max : nanos
+    }
+
+    static func ackDelayWireUnits(delayNanos: UInt64, exponent: UInt64) -> UInt64 {
+        let delayMicros = delayNanos / 1_000
+        return delayMicros >> boundedAckDelayExponent(exponent)
+    }
+
+    static func ackDelayNanos(wireUnits: UInt64, exponent: UInt64) -> UInt64 {
+        let multiplier = UInt64(1) << boundedAckDelayExponent(exponent)
+        let (micros, microsOverflow) = wireUnits.multipliedReportingOverflow(by: multiplier)
+        if microsOverflow { return UInt64.max }
+        let (nanos, nanosOverflow) = micros.multipliedReportingOverflow(by: 1_000)
+        return nanosOverflow ? UInt64.max : nanos
     }
 }

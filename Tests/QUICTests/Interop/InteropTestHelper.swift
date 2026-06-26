@@ -21,33 +21,34 @@ public enum InteropTestHelper {
             return isContainerRunning(named: "quinn-interop")
         }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["docker", "compose", "ps", "--services", "--filter", "status=running"]
-        process.currentDirectoryURL = dockerDir
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return output.contains("quinn")
-        } catch {
-            // Fall back to checking container directly
+        guard let output = runDockerCommand(
+            arguments: ["compose", "ps", "--services", "--filter", "status=running"],
+            currentDirectoryURL: dockerDir
+        ) else {
             return isContainerRunning(named: "quinn-interop")
         }
+        return output.contains("quinn")
     }
 
     /// Check if a specific Docker container is running
     private static func isContainerRunning(named containerName: String) -> Bool {
+        guard let output = runDockerCommand(
+            arguments: ["ps", "--filter", "name=\(containerName)", "--filter", "status=running", "-q"]
+        ) else {
+            return false
+        }
+        return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private static func runDockerCommand(
+        arguments: [String],
+        currentDirectoryURL: URL? = nil,
+        timeout: TimeInterval = 2
+    ) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["docker", "ps", "--filter", "name=\(containerName)", "--filter", "status=running", "-q"]
+        process.arguments = ["docker"] + arguments
+        process.currentDirectoryURL = currentDirectoryURL
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -55,14 +56,26 @@ public enum InteropTestHelper {
 
         do {
             try process.run()
-            process.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         } catch {
-            return false
+            return nil
         }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+
+        guard !process.isRunning else {
+            process.terminate()
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     /// Find the docker directory in the project

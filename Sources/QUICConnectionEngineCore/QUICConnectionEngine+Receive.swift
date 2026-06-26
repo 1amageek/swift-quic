@@ -292,13 +292,14 @@ extension QUICConnectionEngine {
 
         // RTT update from the largest newly-acked ack-eliciting packet.
         if let sample = result.rttSampleNanos {
-            // ACK delay is in microseconds scaled by the exponent; treat the wire
-            // value as already in the peer's units. Apply only after handshake.
-            let ackDelayNanos = ack.ackDelay &* 1000
+            let ackDelayNanos = Self.ackDelayNanos(
+                wireUnits: ack.ackDelay,
+                exponent: peerAckDelayExponent
+            )
             rtt.update(
                 latestRttNanos: sample,
                 ackDelayNanos: ackDelayNanos,
-                maxAckDelayNanos: config.maxAckDelayNanos,
+                maxAckDelayNanos: peerMaxAckDelayNanos,
                 handshakeConfirmed: handshakeConfirmed)
         }
 

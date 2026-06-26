@@ -7,7 +7,7 @@ import Foundation
 @testable import QUICRecovery
 @testable import QUICCore
 
-@Suite("Recovery Performance Benchmarks")
+@Suite("Recovery Performance Benchmarks", .serialized)
 struct RecoveryBenchmarkTests {
 
     // MARK: - AckManager Benchmarks

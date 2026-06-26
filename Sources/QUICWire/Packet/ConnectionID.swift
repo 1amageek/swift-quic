@@ -12,6 +12,9 @@ import P2PCoreBytes
 public struct ConnectionID: Hashable, Sendable {
     /// The raw bytes of the connection ID (0-20 bytes)
     public let bytes: [UInt8]
+    private let hashWord0: UInt64
+    private let hashWord1: UInt64
+    private let hashWord2: UInt64
 
     /// Maximum length of a connection ID
     public static let maxLength = 20
@@ -33,7 +36,11 @@ public struct ConnectionID: Hashable, Sendable {
                 maxAllowed: Self.maxLength
             )
         }
+        let hashWords = Self.packHashWords(bytes)
         self.bytes = bytes
+        self.hashWord0 = hashWords.0
+        self.hashWord1 = hashWords.1
+        self.hashWord2 = hashWords.2
     }
 
     /// Creates a connection ID from raw bytes without validation
@@ -48,7 +55,11 @@ public struct ConnectionID: Hashable, Sendable {
     internal init(uncheckedBytes bytes: [UInt8]) {
         assert(bytes.count <= Self.maxLength,
                "ConnectionID unchecked init called with \(bytes.count) bytes (max: \(Self.maxLength))")
+        let hashWords = Self.packHashWords(bytes)
         self.bytes = bytes
+        self.hashWord0 = hashWords.0
+        self.hashWord1 = hashWords.1
+        self.hashWord2 = hashWords.2
     }
 
     /// Creates a connection ID from a byte sequence with validation
@@ -64,6 +75,16 @@ public struct ConnectionID: Hashable, Sendable {
         case tooLong(length: Int, maxAllowed: Int)
     }
 
+    public static func == (lhs: ConnectionID, rhs: ConnectionID) -> Bool {
+        lhs.bytes == rhs.bytes
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hashWord0)
+        hasher.combine(hashWord1)
+        hasher.combine(hashWord2)
+    }
+
     /// The length of this connection ID in bytes
     public var length: Int {
         bytes.count
@@ -72,6 +93,27 @@ public struct ConnectionID: Hashable, Sendable {
     /// Whether this is an empty connection ID
     public var isEmpty: Bool {
         bytes.isEmpty
+    }
+
+    private static func packHashWords(_ bytes: [UInt8]) -> (UInt64, UInt64, UInt64) {
+        var word0: UInt64 = 0
+        var word1: UInt64 = 0
+        var word2: UInt64 = 0
+
+        for (index, byte) in bytes.enumerated() {
+            let shift = UInt64((index & 7) * 8)
+            switch index >> 3 {
+            case 0:
+                word0 |= UInt64(byte) << shift
+            case 1:
+                word1 |= UInt64(byte) << shift
+            default:
+                word2 |= UInt64(byte) << shift
+            }
+        }
+
+        word2 |= UInt64(bytes.count) << 56
+        return (word0, word1, word2)
     }
 
     /// Generates a random connection ID of the specified length

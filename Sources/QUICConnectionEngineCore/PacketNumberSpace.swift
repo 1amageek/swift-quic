@@ -17,6 +17,9 @@ struct PacketNumberSpace: Sendable {
 
     /// The largest packet number received in this space (for PN decoding).
     var largestReceived: UInt64?
+    /// Receive time for the current largest acknowledged packet, used to encode
+    /// ACK Delay as time since that packet arrived (RFC 9000 §19.3).
+    var largestReceivedTimeNanos: UInt64?
 
     /// The loss detector for this space (sorted-array threshold detection).
     var lossDetector: LossDetectorCore = LossDetectorCore()
@@ -67,9 +70,13 @@ struct PacketNumberSpace: Sendable {
     /// set, and tracks whether an ACK is owed.
     mutating func recordReceived(packetNumber pn: UInt64, ackEliciting: Bool, nowNanos: UInt64) {
         if let largest = largestReceived {
-            if pn > largest { largestReceived = pn }
+            if pn > largest {
+                largestReceived = pn
+                largestReceivedTimeNanos = nowNanos
+            }
         } else {
             largestReceived = pn
+            largestReceivedTimeNanos = nowNanos
         }
 
         insertIntoAckRanges(pn)
@@ -91,9 +98,9 @@ struct PacketNumberSpace: Sendable {
 
     /// Builds the wire ACK frame for the currently-tracked ranges (RFC 9000
     /// §19.3), encoding the gap/length form from the descending intervals.
-    /// `ackDelayMicros` is the measured delay scaled by the ACK delay exponent
-    /// (the caller pre-scales it). Returns `nil` if nothing is acknowledgeable.
-    func makeAckFrame(ackDelayScaled: UInt64) -> AckFrame? {
+    /// `ackDelayWireUnits` is the measured delay already scaled by the local ACK
+    /// delay exponent. Returns `nil` if nothing is acknowledgeable.
+    func makeAckFrame(ackDelayWireUnits: UInt64) -> AckFrame? {
         guard !ackRanges.isEmpty else { return nil }
         // ackRanges is sorted descending by start; the first interval contains
         // the largest acknowledged.
@@ -112,7 +119,7 @@ struct PacketNumberSpace: Sendable {
             ranges.append(AckRange(gap: gap, rangeLength: len))
             previousStart = interval.start
         }
-        return AckFrame(largestAcknowledged: largest, ackDelay: ackDelayScaled, ackRanges: ranges, ecnCounts: nil)
+        return AckFrame(largestAcknowledged: largest, ackDelay: ackDelayWireUnits, ackRanges: ranges, ecnCounts: nil)
     }
 
     /// Marks the current ranges as acknowledged to the peer and clears the

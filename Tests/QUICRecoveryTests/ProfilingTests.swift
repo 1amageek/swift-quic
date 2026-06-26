@@ -8,7 +8,7 @@ import Synchronization
 @testable import QUICRecovery
 @testable import QUICCore
 
-@Suite("Recovery Profiling Tests")
+@Suite("Recovery Profiling Tests", .serialized)
 struct ProfilingTests {
 
     // MARK: - Configuration

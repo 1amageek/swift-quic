@@ -97,6 +97,8 @@ extension QUICConnectionEngine {
         streams.peerInitialMaxStreamDataBidiRemote = tp.initialMaxStreamDataBidiRemote
         streams.peerInitialMaxStreamDataUni = tp.initialMaxStreamDataUni
         peerMaxDatagramFrameSize = tp.maxDatagramFrameSize
+        peerAckDelayExponent = Self.boundedAckDelayExponent(tp.ackDelayExponent)
+        peerMaxAckDelayNanos = Self.millisecondsToNanos(tp.maxAckDelay)
     }
 
     /// Marks the handshake complete (called by the facade once the TLS seam
@@ -133,6 +135,15 @@ extension QUICConnectionEngine {
         pendingClose = ConnectionCloseInfo(
             errorCode: errorCode, isApplicationError: isApplicationError, frameType: nil, reasonPhrase: reason)
         status = .closing
+    }
+
+    /// Marks the connection closed without emitting a CONNECTION_CLOSE frame.
+    ///
+    /// The async facade uses this when the datagram transport ends or a fatal
+    /// receive error already makes the connection unusable.
+    public mutating func markClosed() {
+        status = .closed
+        pendingClose = nil
     }
 
     // MARK: - Flush
@@ -192,9 +203,17 @@ extension QUICConnectionEngine {
         }
 
         // 1) Owed ACK (RFC 9000 §13.2).
+        let localAckDelayExponent = self.localAckDelayExponent
         if let ack = withSpace(level, { sp -> AckFrame? in
             guard sp.ackElicitingPending, sp.hasNewAckInformation else { return nil }
-            return sp.makeAckFrame(ackDelayScaled: 0)
+            let ackDelayNanos = sp.largestReceivedTimeNanos.map {
+                nowNanos >= $0 ? nowNanos - $0 : 0
+            } ?? 0
+            let ackDelayWireUnits = Self.ackDelayWireUnits(
+                delayNanos: ackDelayNanos,
+                exponent: localAckDelayExponent
+            )
+            return sp.makeAckFrame(ackDelayWireUnits: ackDelayWireUnits)
         }) {
             frames.append(.ack(ack))
             withSpace(level) { $0.onAckSent() }

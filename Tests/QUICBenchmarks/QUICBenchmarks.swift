@@ -13,7 +13,7 @@ import Crypto
 @testable import QUICCore
 @testable import QUICCrypto
 
-@Suite("QUIC Performance Benchmarks")
+@Suite("QUIC Performance Benchmarks", .serialized)
 struct QUICBenchmarks {
 
     // MARK: - ConnectionRouter Benchmarks

@@ -146,6 +146,43 @@ struct QUICEngineConnectionTests {
         #expect(!conn.isClosed)
     }
 
+    @Test("run exits when the transport incoming stream finishes", .timeLimit(.minutes(1)))
+    func runExitsWhenTransportIncomingFinishes() async throws {
+        let (client, _) = try makeEstablishedPair()
+        let (clientEP, serverEP) = endpoints()
+        let clientT = LoopbackTransport(selfEndpoint: clientEP)
+        let conn = QUICEngineConnection(
+            engine: client, transport: clientT, timer: AsyncTimerClock(), peer: serverEP)
+
+        let runTask = Task { await conn.run() }
+
+        await clientT.close()
+
+        let completed = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await runTask.value
+                return true
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: .milliseconds(200))
+                } catch {
+                    return false
+                }
+                return false
+            }
+            let completed = await group.next() ?? false
+            group.cancelAll()
+            return completed
+        }
+
+        if !completed {
+            runTask.cancel()
+        }
+        #expect(completed)
+        #expect(conn.isClosed)
+    }
+
     // MARK: - Application-data round trip over the seams
 
     @Test("client STREAM write surfaces on the server via the seam-driven loops")

@@ -15,7 +15,8 @@ public struct AckFrame: Sendable, Hashable {
     /// Largest packet number being acknowledged
     public let largestAcknowledged: UInt64
 
-    /// Time since the largest acknowledged packet was received (in microseconds)
+    /// Time since the largest acknowledged packet was received, encoded as
+    /// microseconds shifted by the sender's ACK delay exponent.
     public let ackDelay: UInt64
 
     /// Acknowledged packet number ranges

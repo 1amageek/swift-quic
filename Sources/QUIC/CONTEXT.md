@@ -104,8 +104,11 @@ silent fallback.
 
 ## Build
 
-- Host: `swift build` / `swift test --skip QUICBenchmarks`. The full Foundation/NIO
+- Host: `swift build` / `swift test`. The full Foundation/NIO
   spine compiles; `QUICEngineClient` / `QUICEngineConnection` compile alongside it.
+- Benchmarks: `SWIFT_QUIC_ENABLE_BENCHMARKS=1 swift test --filter QUICBenchmarks`.
+  The package manifest leaves throughput benchmarks out of the default test graph
+  because SwiftPM runs every test target by default.
 - Embedded (the milestone): `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1
   swiftly run +6.3.1 swift build --target QUIC -c release`. Only the cores + the
   `[UInt8]` engine facade compile; the host spine is gated away.
