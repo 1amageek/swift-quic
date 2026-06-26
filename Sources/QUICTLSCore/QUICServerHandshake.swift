@@ -522,11 +522,14 @@ public struct QUICServerHandshake<C: CryptoProvider>: Sendable {
             throw .unexpectedMessage(state.tag)
         }
 
-        // The algorithm must be one the server offered in CertificateRequest.
-        if let sentAlgs = sentSignatureAlgorithms {
-            guard sentAlgs.contains(algorithm) else {
-                throw .signatureVerificationFailed
-            }
+        // The algorithm MUST be one the server offered in its CertificateRequest.
+        // RFC 8446 §4.3.2 makes signature_algorithms mandatory in a CertificateRequest,
+        // and this point is reached only after one was sent (requestedClientCertificate
+        // == true). A missing record is therefore a server misconfiguration — fail
+        // closed rather than skipping the check ("absent ⇒ accept any" is a silent
+        // relaxation of the offered-algorithms constraint).
+        guard let sentAlgs = sentSignatureAlgorithms, sentAlgs.contains(algorithm) else {
+            throw .signatureVerificationFailed
         }
 
         guard let key = clientPublicKey else {

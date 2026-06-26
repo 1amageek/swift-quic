@@ -50,6 +50,13 @@ public struct CertificateEntry: Sendable {
 
     public static func decode(from reader: inout ByteReader) throws(TLSWireError) -> CertificateEntry {
         let certData = try reader.wReadVector24()
+        // RFC 8446 §4.4.2: cert_data is `<1..2^24-1>`. A zero-length entry is
+        // malformed — reject it at the TLS layer. (Otherwise an empty leaf yields a
+        // non-empty certificate_list that passes the driver's `!isEmpty` guard and is
+        // only caught later by the RPK verifier; fail closed here instead.)
+        guard !certData.isEmpty else {
+            throw .invalidFormat("CertificateEntry cert_data must be non-empty (RFC 8446 §4.4.2)")
+        }
         let extensionData = try reader.wReadVector16()
 
         var extensions: [TLSExtension] = []
