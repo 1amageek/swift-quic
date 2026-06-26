@@ -139,7 +139,7 @@ let package = Package(
     ],
     dependencies: [
         // UDP transport
-        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.2"),
+        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.3"),
 
         // Cryptography.
         // Range (not `from: 4.2.0`) so the apple/swift-crypto identity resolves to a
