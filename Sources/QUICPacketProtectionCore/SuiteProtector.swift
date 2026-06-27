@@ -8,7 +8,7 @@
 /// the generic ``PacketProtector`` specialised at each of the provider's three
 /// AEAD associated types. A generic upper layer (`<C: CryptoProvider>`)
 /// specialises cleanly under Embedded Swift; the adapter instantiates it at
-/// `C = FoundationCryptoProvider`.
+/// `C = FoundationEssentialsCryptoProvider`.
 ///
 /// Embedded-clean: no Foundation, no `any`, no swift-crypto, typed throws.
 

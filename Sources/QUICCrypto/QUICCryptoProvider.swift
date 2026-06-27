@@ -6,7 +6,7 @@
 /// hashing, HKDF, HMAC, header protection, key agreement, Ed25519 signing, entropy
 /// and the monotonic clock — bringing the shared provider's bulk-copy primitives.
 ///
-/// The ONE exception is ECDSA: the shared `FoundationCryptoProvider` emits ECDSA
+/// The ONE exception is ECDSA: the shared `FoundationEssentialsCryptoProvider` emits ECDSA
 /// signatures in *raw* `r||s` form (correct for Noise/libp2p), whereas the TLS 1.3
 /// CertificateVerify wire format (RFC 8446 §4.2.3) requires *DER*. Emitting raw
 /// ECDSA on the QUIC TLS wire would silently break interop and is caught by
@@ -27,9 +27,9 @@ import P2PCoreCrypto
 // resolves to the same backend in each build (QUICCrypto is the host adapter, so
 // in practice this is always the Foundation branch).
 #if hasFeature(Embedded)
-import P2PCryptoEmbedded
+import P2PCryptoBoringSSL
 #else
-import P2PCryptoFoundation
+import P2PCryptoFoundationEssentials
 #endif
 
 /// The crypto provider the QUIC TLS engine specialises at. Identical to

@@ -8,7 +8,7 @@
 /// keep their `Data`-based public API (so existing call sites and tests compile
 /// unchanged), but all AEAD and header-protection crypto now routes through the
 /// `CryptoProvider` / `HeaderProtectionProvider` seam, specialised at
-/// `C = FoundationCryptoProvider`. The generic `PacketProtector<C, A>` /
+/// `C = FoundationEssentialsCryptoProvider`. The generic `PacketProtector<C, A>` /
 /// `SuiteProtector<C>` value types live in `QUICPacketProtectionCore`; the
 /// connection/codec layers now hold the concrete ``QUICPacketProtector`` (a
 /// `SuiteProtector<QUICCryptoProvider>` wrapper) directly, so no

@@ -346,7 +346,7 @@ let package = Package(
                 "QUICPacketProtectionCore",
                 "QUICTLSCore",
                 // Unified provider: the host adapter specialises every generic
-                // engine at C = DefaultCryptoProvider (= FoundationCryptoProvider),
+                // engine at C = DefaultCryptoProvider (= FoundationEssentialsCryptoProvider),
                 // replacing the deleted QUICFoundationProvider.
                 .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
                 .product(name: "Crypto", package: "swift-crypto"),

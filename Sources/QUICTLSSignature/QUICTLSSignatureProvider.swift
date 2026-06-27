@@ -29,9 +29,9 @@ import P2PCoreBytes
 // below. Mirror `DefaultCryptoProvider`'s own backend selection so this composite
 // resolves to the same backend in each build (host swift-crypto / Embedded BoringSSL).
 #if hasFeature(Embedded)
-import P2PCryptoEmbedded
+import P2PCryptoBoringSSL
 #else
-import P2PCryptoFoundation
+import P2PCryptoFoundationEssentials
 #endif
 
 /// The crypto provider the libp2p-over-QUIC TLS handshake driver specialises at.

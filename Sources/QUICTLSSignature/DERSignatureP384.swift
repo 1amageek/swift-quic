@@ -12,9 +12,9 @@ import P2PCrypto   // DefaultCryptoProvider
 // The backend module makes `DefaultCryptoProvider.P384Signature`'s nested key types
 // nameable here (matching `DefaultCryptoProvider`'s own backend selection).
 #if hasFeature(Embedded)
-import P2PCryptoEmbedded
+import P2PCryptoBoringSSL
 #else
-import P2PCryptoFoundation
+import P2PCryptoFoundationEssentials
 #endif
 
 /// ECDSA over P-384 for the QUIC TLS handshake (DER signatures). Conforms

@@ -8,7 +8,7 @@
 ///   (`x963Representation`).
 /// - **Signatures are DER-encoded** (`derRepresentation`) — the TLS 1.3 wire
 ///   format for ECDSA CertificateVerify (RFC 8446 §4.2.3). The shared
-///   `P2PCrypto.FoundationCryptoProvider` emits *raw* `r||s` ECDSA signatures
+///   `P2PCrypto.FoundationEssentialsCryptoProvider` emits *raw* `r||s` ECDSA signatures
 ///   (correct for Noise/libp2p, WRONG for the TLS wire), so the QUIC composite
 ///   provider (``QUICCryptoProvider``) overrides only `P256Signature`/`P384Signature`
 ///   with these DER schemes; every other primitive comes from the shared provider.
