@@ -90,8 +90,8 @@ the crypto seam), and the host (Foundation) modules are thin adapters over them.
 > yet the full connection facade. The host orchestrator
 > (`QUICEndpoint` ~1280L / `ManagedConnection` ~2257L / `TimerManager` ~329L) is
 > **not** yet ported to a cored engine — that port is pending (milestone "M11").
-> The released `1.3.0` tag is the host API. The Embedded cores are unreleased on
-> the `embedded` branch (milestone "M8" pending). The high-level usage API
+> The released `1.3.3` tag includes the host API and the Embedded-clean cores.
+> The high-level usage API
 > (`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`)
 > is unchanged and accurate.
 
@@ -525,7 +525,7 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] QUICTLSCore (key schedule + transcript hash + handshake FSMs)
 - [x] QUICConnectionCore (DPLPMTUD + transport-params codec + packet parse/serialize)
 - [x] Crypto unified on DefaultCryptoProvider (QUICFoundationProvider deleted)
-- [ ] Tagged release of the cores (milestone "M8")
+- [x] Tagged release of the cores (milestone "M8")
 - [ ] Port the host orchestrator (QUICEndpoint / ManagedConnection / TimerManager)
       to a cored connection engine (milestone "M11"). Until then the Embedded
       compile covers the cores, not the full connection facade.
@@ -536,9 +536,8 @@ Verify against `Package.swift` (Swift tools 6.2; platforms macOS/iOS/tvOS/watchO
 
 ```swift
 dependencies: [
-    // UDP transport — local-path on the embedded branch (a URL pin collides with
-    // swift-libp2p's local-path nio-udp via SwiftPM identity). Restore URL before release.
-    .package(path: "../swift-nio-udp"),
+    // UDP transport.
+    .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
 
     // Cryptography — range (not `from:`) so apple/swift-crypto resolves to a single
     // version compatible with swift-p2p-crypto (3.x floor) and swift-certificates.
@@ -555,11 +554,11 @@ dependencies: [
     .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
 
     // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter) + crypto seam
-    .package(path: "../swift-p2p-core"),
+    .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.2.1"),
 
     // Unified crypto provider: surfaces `DefaultCryptoProvider` (host swift-crypto /
     // Embedded BoringSSL). Replaces the deleted per-lib QUICFoundationProvider.
-    .package(path: "../swift-p2p-crypto"),
+    .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.1"),
 ]
 ```
 

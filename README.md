@@ -2,7 +2,7 @@
 
 A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002), designed for the swift-libp2p networking stack. It is **Embedded-first**: the protocol logic lives in value-type, sans-IO core targets whose byte currency is `[UInt8]` / `Span`, with thin Foundation host adapters over them.
 
-> **Release status.** The released `1.3.0` ships the prior host API. The Embedded-first cores documented here live on the unreleased `embedded` branch (M8 pending) and are not tagged — pin to the branch to use them. The host orchestrator (`QUICEndpoint` / `ManagedConnection` / `TimerManager`) is not yet rewired onto the cored `QUICConnectionEngine` (quic Slice B / M11 pending).
+> **Release status.** Current release: `1.3.3`. The host orchestrator (`QUICEndpoint` / `ManagedConnection` / `TimerManager`) is not yet rewired onto the cored `QUICConnectionEngine` (quic Slice B / M11 pending).
 
 ## Features
 
@@ -33,20 +33,7 @@ Add swift-quic to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-quic.git", from: "1.3.0")
-]
-```
-
-The latest released tag is `1.3.0`, which ships the host API (Foundation-backed
-`QUIC` / `QUICCore` / `QUICCrypto` ...). The Embedded-clean core targets described
-under [Products](#products) — `QUICWire`, `QUICPacketProtectionCore`,
-`QUICRecoveryCore`, `QUICStreamCore`, `QUICTLSCore`, `QUICConnectionCore`,
-`QUICConnectionEngineCore` — are **unreleased**: they live on the `embedded`
-branch and are not yet part of a tagged release. To use them, point at the branch:
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/1amageek/swift-quic.git", branch: "embedded")
+    .package(url: "https://github.com/1amageek/swift-quic.git", from: "1.3.3")
 ]
 ```
 
@@ -61,7 +48,7 @@ swift-quic uses the following libraries:
 - [swift-docc-plugin](https://github.com/swiftlang/swift-docc-plugin) (`1.4.3+`) - Documentation
 - swift-p2p-core - Embedded-clean byte primitives (`Bytes`/`ByteReader`/`ByteWriter`) + crypto seam
 - swift-p2p-crypto - Unified `DefaultCryptoProvider` (host swift-crypto / Embedded BoringSSL)
-- swift-nio-udp - UDP transport (local-path dependency on the `embedded` branch)
+- swift-nio-udp - UDP transport
 
 ## Quick Start
 

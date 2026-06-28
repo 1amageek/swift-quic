@@ -139,7 +139,7 @@ let package = Package(
     ],
     dependencies: [
         // UDP transport
-        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.3"),
+        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
 
         // Cryptography.
         // Range (not `from: 4.2.0`) so the apple/swift-crypto identity resolves to a
@@ -160,14 +160,14 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
 
         // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter) + crypto seam
-        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.1.0"),
+        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.2.1"),
 
         // Unified crypto provider: surfaces `DefaultCryptoProvider` (host
         // swift-crypto / Embedded BoringSSL). Replaces the deleted per-lib
         // QUICFoundationProvider (embedded-first-api.md §2.2). Its vendored
         // BoringSSL is wired as local C targets with renamed symbols, so
         // it coexists with apple/swift-crypto + swift-certificates with no conflict.
-        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.0"),
+        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.1"),
     ],
     targets: [
         // MARK: - Embedded-clean wire codec (dual-build: host + Embedded)
