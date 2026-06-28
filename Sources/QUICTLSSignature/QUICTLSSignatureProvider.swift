@@ -24,16 +24,6 @@
 import P2PCrypto
 import P2PCoreCrypto
 import P2PCoreBytes
-// The concrete primitive types behind `DefaultCryptoProvider`'s associated types
-// live in the backend module; importing it makes them nameable in the typealiases
-// below. Mirror `DefaultCryptoProvider`'s own backend selection so this composite
-// resolves to the same backend in each build (host swift-crypto / Embedded BoringSSL).
-#if hasFeature(Embedded)
-import P2PCryptoBoringSSL
-#else
-import P2PCryptoFoundationEssentials
-#endif
-
 /// The crypto provider the libp2p-over-QUIC TLS handshake driver specialises at.
 /// Identical to ``DefaultCryptoProvider`` except ECDSA signatures are DER-encoded
 /// for the TLS CertificateVerify + X.509 leaf wire (RFC 8446 §4.4.3).

@@ -21,17 +21,6 @@
 
 import P2PCrypto
 import P2PCoreCrypto
-// The concrete primitive types behind `DefaultCryptoProvider`'s associated types
-// live in the backend module; importing it makes them nameable in the typealiases
-// below. Mirror `DefaultCryptoProvider`'s own backend selection so this composite
-// resolves to the same backend in each build (QUICCrypto is the host adapter, so
-// in practice this is always the Foundation branch).
-#if hasFeature(Embedded)
-import P2PCryptoBoringSSL
-#else
-import P2PCryptoFoundationEssentials
-#endif
-
 /// The crypto provider the QUIC TLS engine specialises at. Identical to
 /// ``DefaultCryptoProvider`` except ECDSA signatures are DER-encoded for the TLS
 /// CertificateVerify wire (RFC 8446 §4.2.3).

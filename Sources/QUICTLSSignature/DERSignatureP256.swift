@@ -15,14 +15,6 @@
 import P2PCoreBytes
 import P2PCoreCrypto
 import P2PCrypto   // DefaultCryptoProvider
-// The backend module makes `DefaultCryptoProvider.P256Signature`'s nested key types
-// nameable here (matching `DefaultCryptoProvider`'s own backend selection).
-#if hasFeature(Embedded)
-import P2PCryptoBoringSSL
-#else
-import P2PCryptoFoundationEssentials
-#endif
-
 /// ECDSA over P-256 for the QUIC TLS handshake (DER signatures). Conforms
 /// `P2PCoreCrypto.SignatureScheme`; wraps `DefaultCryptoProvider.P256Signature`.
 public enum DERSignatureP256: P2PCoreCrypto.SignatureScheme {

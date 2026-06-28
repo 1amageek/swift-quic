@@ -165,7 +165,7 @@ let package = Package(
         // Unified crypto provider: surfaces `DefaultCryptoProvider` (host
         // swift-crypto / Embedded BoringSSL). Replaces the deleted per-lib
         // QUICFoundationProvider (embedded-first-api.md §2.2). Its vendored
-        // BoringSSL has a distinct `p2p-boringssl` identity + renamed C symbols, so
+        // BoringSSL is wired as local C targets with renamed symbols, so
         // it coexists with apple/swift-crypto + swift-certificates with no conflict.
         .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.0"),
     ],
@@ -346,7 +346,7 @@ let package = Package(
                 "QUICPacketProtectionCore",
                 "QUICTLSCore",
                 // Unified provider: the host adapter specialises every generic
-                // engine at C = DefaultCryptoProvider (= FoundationEssentialsCryptoProvider),
+                // engine at C = DefaultCryptoProvider,
                 // replacing the deleted QUICFoundationProvider.
                 .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
                 .product(name: "Crypto", package: "swift-crypto"),
