@@ -1,11 +1,42 @@
 import Testing
 import Foundation
 import Crypto
+import P2PCoreCrypto
+import QUICPacketProtectionCore
 @testable import QUICCore
 @testable import QUICCrypto
 
 @Suite("AEAD Header Protection Tests")
 struct AEADHeaderProtectionTests {
+
+    @Test("Primitive failures retain their operation at the adapter boundary")
+    func primitiveFailureMappingRetainsOperation() {
+        let aead = PacketProtectionError.aead(
+            P2PCoreCrypto.CryptoError.invalidKeyMaterial
+        ).asCryptoError
+        guard case .aeadFailed = aead else {
+            Issue.record("Expected aeadFailed, got \(aead)")
+            return
+        }
+
+        let headerProtection = PacketProtectionError.headerProtection(
+            P2PCoreCrypto.CryptoError.providerFailure
+        ).asCryptoError
+        guard case .headerProtectionFailed = headerProtection else {
+            Issue.record(
+                "Expected headerProtectionFailed, got \(headerProtection)"
+            )
+            return
+        }
+
+        let keyDerivation = PacketProtectionError.keyDerivation(
+            P2PCoreCrypto.CryptoError.providerFailure
+        ).asCryptoError
+        guard case .keyDerivationFailed = keyDerivation else {
+            Issue.record("Expected keyDerivationFailed, got \(keyDerivation)")
+            return
+        }
+    }
 
     // MARK: - RFC 9001 Appendix A Test Vectors
 

@@ -86,14 +86,15 @@ the crypto seam), and the host (Foundation) modules are thin adapters over them.
   dispatch is `SuiteProtector<C>` (a closed enum over `PacketProtector<C, A>`),
   which replaced the old `any PacketOpener`/`any PacketSealer` existentials.
 
-> **IMPORTANT — current status.** The Embedded compile covers the **cores**, not
-> yet the full connection facade. The host orchestrator
-> (`QUICEndpoint` ~1280L / `ManagedConnection` ~2257L / `TimerManager` ~329L) is
-> **not** yet ported to a cored engine — that port is pending (milestone "M11").
-> The released `1.3.3` tag includes the host API and the Embedded-clean cores.
-> The high-level usage API
-> (`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`)
-> is unchanged and accurate.
+> **IMPORTANT — current status.** The canonical TLS path is implemented. Live
+> host and Embedded-capable QUIC factories use `swift-tls-sessions/QUICTLS`
+> backed by `swift-ssl/SSLQUIC`; the historical `QUICTLSCore` and
+> `TLS13Handler` sources are excluded from active targets and are deletion
+> candidates. The host orchestrator remains a host adapter over the cored
+> protocol state, while the portable `QUIC` product uses the Embedded-clean
+> engine path. External peer interoperability, sanitizer coverage, performance
+> gates, and release dependency pinning remain open. Testing mode must not be
+> used as a production TLS backend.
 
 ## Module Structure
 
@@ -134,13 +135,8 @@ swift-quic/
 │   │   ├── StreamReassemblyBuffer.swift
 │   │   └── FlowControllerCore.swift
 │   │
-│   ├── QUICTLSCore/             # Embedded-clean TLS 1.3 key schedule + handshake (dual-build)
-│   │   ├── TLSKeyScheduleCore.swift    # RFC 8446 §7.1 key schedule
-│   │   ├── TLSTranscriptHashCore.swift # incremental transcript hash
-│   │   ├── QUICClientHandshake.swift   # client handshake FSM
-│   │   ├── QUICServerHandshake.swift   # server handshake FSM
-│   │   ├── QUICClientAuthMachine.swift # post-ServerHello auth FSM
-│   │   └── ...                         # message + extension wire codecs
+│   ├── QUICTLSCore/             # Historical TLS sources; excluded from active targets
+│   │   └── ...                         # canonical mechanism now lives in swift-ssl/SSLQUIC
 │   │
 │   ├── QUICConnectionCore/      # Embedded-clean connection state machines (dual-build)
 │   │   ├── PathMTUSearchCore.swift     # DPLPMTUD (RFC 8899 / RFC 9000 §14)
@@ -156,8 +152,8 @@ swift-quic/
 │   │   ├── Compat/                     # Data-based views over the wire codec
 │   │   └── ...
 │   │
-│   ├── QUICCrypto/              # TLS 1.3 + packet-protection adapter (over QUICTLSCore + QUICPacketProtectionCore)
-│   │   ├── TLS/TLS13Handler.swift      # TLS 1.3 state machine (host adapter)
+│   ├── QUICCrypto/              # Packet-protection and host adapter (TLS via swift-ssl)
+│   │   ├── TLS/SwiftSSLQUICTLSProvider.swift # canonical session adapter
 │   │   ├── InitialSecrets.swift        # Initial key derivation, KeyMaterial, QUICCipherSuite
 │   │   ├── AEAD.swift                  # AES-GCM / ChaCha20-Poly1305 over PacketProtector<C,A>
 │   │   ├── CryptoState.swift           # CryptoContext, HeaderProtection
@@ -467,14 +463,15 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] HKDF key derivation
 - [x] Initial secrets (derived from Connection ID)
 - [x] AES-128-GCM AEAD (over PacketProtector<C, A>)
-- [x] AES Header protection (routed through the HeaderProtectionProvider seam — DefaultCryptoProvider: host swift-crypto / Embedded BoringSSL; no longer CommonCrypto-direct)
+- [x] AES Header protection (routed through the HeaderProtectionProvider seam and the common DefaultCryptoProvider)
 - [x] ChaCha20-Poly1305 AEAD
 - [x] ChaCha20 Header protection (via the seam)
-- [x] Cross-platform support (host swift-crypto / Embedded BoringSSL)
+- [x] Cross-platform support through the same swift-crypto fork
 
-### Phase 3: TLS 1.3 Integration ✅
-- [x] TLS13Provider protocol
-- [x] Full TLS 1.3 state machine (ClientHello → Finished)
+### Phase 3: TLS 1.3 Integration (canonical provider implemented)
+- [x] `TLS13Provider` host contract backed by `SwiftSSLQUICTLSProvider`
+- [x] Full TLS 1.3 state machine through `swift-tls-sessions/QUICTLS` and
+      `swift-ssl/SSLQUIC` (ClientHello → Finished)
 - [x] X.509 certificate validation
   - [x] EKU (Extended Key Usage)
   - [x] SAN (Subject Alternative Name)
@@ -484,8 +481,9 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] KeySchedule with key update
 - [x] Session resumption (PSK)
 - [x] 0-RTT early data
-- [x] MockTLSProvider for testing (#if DEBUG guarded)
-- [x] TLS 1.3 handshake + key schedule cored into QUICTLSCore (client/server/auth FSMs)
+- [ ] Mock TLS provider (testing mode is fail-closed until a canonical test
+      provider is supplied)
+- [x] QUIC TLS handshake + key schedule owned by `swift-ssl/SSLQUIC`
 - [ ] libp2p extension support (OID 1.3.6.1.4.1.53594.1.1)
 
 ### Phase 4: Connection Layer ✅
@@ -517,35 +515,41 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] libp2p Transport wrapper
 - [x] Interoperability testing (quinn, ngtcp2; Docker-based)
 
-### Phase 8: Embedded-first re-tier (cores) — in progress
+### Phase 8: Embedded-first re-tier (cores) — canonical boundary implemented
 - [x] QUICWire (Tier-3 wire codec) extracted from QUICCore
 - [x] QUICPacketProtectionCore (PacketProtector<C,A> / SuiteProtector<C>)
 - [x] QUICRecoveryCore (CUBIC + NewReno + pacing)
 - [x] QUICStreamCore (Send/Receive FSMs + reassembly + flow control)
-- [x] QUICTLSCore (key schedule + transcript hash + handshake FSMs)
+- [x] `swift-tls-sessions/QUICTLS` adapter over `swift-ssl/SSLQUIC`
 - [x] QUICConnectionCore (DPLPMTUD + transport-params codec + packet parse/serialize)
 - [x] Crypto unified on DefaultCryptoProvider (QUICFoundationProvider deleted)
 - [x] Tagged release of the cores (milestone "M8")
-- [ ] Port the host orchestrator (QUICEndpoint / ManagedConnection / TimerManager)
-      to a cored connection engine (milestone "M11"). Until then the Embedded
-      compile covers the cores, not the full connection facade.
+- [x] Portable `QUIC` product compiles against the canonical session provider
+- [ ] Complete host-orchestrator migration to the cored connection engine;
+      this is independent of TLS mechanism ownership and remains a separate
+      release gate.
 
 ## Dependencies
 
-Verify against `Package.swift` (Swift tools 6.2; platforms macOS/iOS/tvOS/watchOS/visionOS v26).
+Verify against `Package.swift` (Swift tools 6.4; platforms macOS/iOS/tvOS/watchOS/visionOS v26).
 
 ```swift
 dependencies: [
     // UDP transport.
     .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
 
-    // Cryptography — range (not `from:`) so apple/swift-crypto resolves to a single
-    // version compatible with swift-p2p-crypto (3.x floor) and swift-certificates.
-    .package(url: "https://github.com/apple/swift-crypto.git", "3.12.3"..<"5.0.0"),
+    // Public session contracts and Pure Swift TLS mechanism.
+    // The current workspace checkout is P2P/swift-tls. Replace this with the
+    // tagged swift-tls-sessions repository URL before publishing a release.
+    .package(path: "../swift-tls"),
+    .package(url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
+
+    // Cryptography shared by Native, WASM, and Embedded.
+    .package(url: "https://github.com/1amageek/swift-crypto.git", branch: "main"),
 
     // X.509 + ASN.1
-    .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.0"),
-    .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.0"),
+    .package(url: "https://github.com/1amageek/swift-certificates.git", branch: "main"),
+    .package(url: "https://github.com/1amageek/swift-asn1.git", branch: "main"),
 
     // Logging
     .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
@@ -553,18 +557,14 @@ dependencies: [
     // Documentation
     .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
 
-    // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter) + crypto seam
-    .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.2.1"),
-
-    // Unified crypto provider: surfaces `DefaultCryptoProvider` (host swift-crypto /
-    // Embedded BoringSSL). Replaces the deleted per-lib QUICFoundationProvider.
-    .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.1"),
+    // Embedded-clean primitives, crypto seam, and DefaultCryptoProvider.
+    .package(url: "https://github.com/1amageek/swift-p2p-core.git", branch: "main"),
 ]
 ```
 
 The unified provider: `QUICCryptoProvider` is the host adapter's concrete crypto
-provider — it mirrors `DefaultCryptoProvider` (host swift-crypto / Embedded
-BoringSSL) except ECDSA signatures are DER-encoded for the TLS path. Every generic
+provider — it mirrors `DefaultCryptoProvider` except ECDSA signatures are
+DER-encoded for the TLS path. Every generic
 core engine is specialised at `C = QUICCryptoProvider` in the host adapters.
 
 ## References

@@ -8,7 +8,7 @@
 ///   (`x963Representation`).
 /// - **Signatures are DER-encoded** (`derRepresentation`) — the TLS 1.3 wire
 ///   format for ECDSA CertificateVerify (RFC 8446 §4.2.3). The shared
-///   `P2PCrypto.FoundationEssentialsCryptoProvider` emits *raw* `r||s` ECDSA signatures
+///   `P2PCrypto.DefaultCryptoProvider` emits *raw* `r||s` ECDSA signatures
 ///   (correct for Noise/libp2p, WRONG for the TLS wire), so the QUIC composite
 ///   provider (``QUICCryptoProvider``) overrides only `P256Signature`/`P384Signature`
 ///   with these DER schemes; every other primitive comes from the shared provider.
@@ -40,20 +40,26 @@ public enum QUICDERSignatureP256: P2PCoreCrypto.SignatureScheme {
     }
 
     public static func signingKey(rawRepresentation: Span<UInt8>) throws(P2PCoreCrypto.CryptoError) -> SigningKey {
+        guard rawRepresentation.count == 32 else {
+            throw .invalidLength(expected: 32, actual: rawRepresentation.count)
+        }
         do {
             return SigningKey(key: try P256.Signing.PrivateKey(
                 rawRepresentation: Data(rawRepresentation.quicDERArray())))
         } catch {
-            throw .invalidLength(expected: 32, actual: rawRepresentation.count)
+            throw .invalidKeyMaterial
         }
     }
 
     public static func verifyingKey(rawRepresentation: Span<UInt8>) throws(P2PCoreCrypto.CryptoError) -> VerifyingKey {
+        guard rawRepresentation.count == 65 else {
+            throw .invalidLength(expected: 65, actual: rawRepresentation.count)
+        }
         do {
             return VerifyingKey(key: try P256.Signing.PublicKey(
                 x963Representation: Data(rawRepresentation.quicDERArray())))
         } catch {
-            throw .invalidLength(expected: 65, actual: rawRepresentation.count)
+            throw .invalidKeyMaterial
         }
     }
 

@@ -1,7 +1,7 @@
 // DERSignatureP384.swift
 // ECDSA over P-384 with **DER** signatures for the TLS 1.3 CertificateVerify wire
 // (RFC 8446 §4.4.3), backed by the shared `DefaultCryptoProvider.P384Signature`
-// (host swift-crypto / Embedded BoringSSL). See ``DERSignatureP256`` for the
+// from the common swift-crypto backend. See ``DERSignatureP256`` for the
 // DER-vs-raw rationale; this is the 48-byte-scalar counterpart.
 //
 // Dual-build (host + Embedded): no Foundation, no `any`, no swift-crypto.
@@ -12,9 +12,6 @@ import P2PCrypto   // DefaultCryptoProvider
 /// ECDSA over P-384 for the QUIC TLS handshake (DER signatures). Conforms
 /// `P2PCoreCrypto.SignatureScheme`; wraps `DefaultCryptoProvider.P384Signature`.
 public enum DERSignatureP384: P2PCoreCrypto.SignatureScheme {
-    /// The P-384 coordinate width; a raw ECDSA signature is `2 * scalarLength` bytes.
-    private static var scalarLength: Int { 48 }
-
     fileprivate typealias Base = DefaultCryptoProvider.P384Signature
 
     public struct SigningKey: Sendable {
@@ -50,8 +47,9 @@ public enum DERSignatureP384: P2PCoreCrypto.SignatureScheme {
     }
 
     public static func sign(_ message: Span<UInt8>, with signingKey: SigningKey) throws(CryptoError) -> [UInt8] {
-        let raw = try Base.sign(message, with: signingKey.inner)
-        return try ECDSADERConversion.encode(raw: raw, scalarLength: scalarLength)
+        // The shared swift-ssl backend already emits RFC 8446 DER. Re-encoding
+        // it here would interpret the DER sequence as a raw r || s value.
+        return try Base.sign(message, with: signingKey.inner)
     }
 
     public static func isValid(
@@ -59,11 +57,6 @@ public enum DERSignatureP384: P2PCoreCrypto.SignatureScheme {
         for message: Span<UInt8>,
         with verifyingKey: VerifyingKey
     ) -> Bool {
-        guard let raw = ECDSADERConversion.decode(
-            der: signature.tlsSignatureArray(), scalarLength: scalarLength
-        ) else {
-            return false
-        }
-        return Base.isValid(signature: raw.span, for: message, with: verifyingKey.inner)
+        return Base.isValid(signature: signature, for: message, with: verifyingKey.inner)
     }
 }

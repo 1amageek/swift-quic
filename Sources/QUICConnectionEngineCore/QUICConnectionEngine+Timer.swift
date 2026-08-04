@@ -68,7 +68,7 @@ extension QUICConnectionEngine {
         // 2) Loss detection (RFC 9002 §6.1/§6.2): detect time-threshold losses,
         // feed congestion control, and on PTO send a probe.
         var output = QUICEngineOutput()
-        let lossFired = try detectAndHandleLosses(nowNanos: nowNanos)
+        let lossFired = try handleLossDetection(nowNanos: nowNanos)
         if lossFired { result.firedTimers.append(.lossDetection) }
 
         // 3) Path-validation timeouts.
@@ -92,7 +92,7 @@ extension QUICConnectionEngine {
 
     // MARK: - Private
 
-    private mutating func detectAndHandleLosses(nowNanos: UInt64) throws(QUICEngineError) -> Bool {
+    private mutating func handleLossDetection(nowNanos: UInt64) throws(QUICEngineError) -> Bool {
         var anyLoss = false
         let latestRTT = rtt.latestRTTNanos
         let smoothedRTT = rtt.smoothedRTTNanos

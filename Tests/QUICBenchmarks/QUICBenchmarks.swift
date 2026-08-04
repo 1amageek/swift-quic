@@ -101,7 +101,7 @@ struct QUICBenchmarks {
         let start = Date.timeIntervalSinceReferenceDate
         for _ in 0..<iterations {
             let processor = PacketProcessor(dcidLength: 8)
-            _ = try processor.deriveAndInstallInitialKeys(
+            _ = try processor.installInitialKeys(
                 connectionID: connectionID,
                 isClient: true,
                 version: .v1

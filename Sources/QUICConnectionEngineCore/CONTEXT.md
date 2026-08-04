@@ -94,10 +94,9 @@ seam-based driver `QUICEngineConnection` (`Sources/QUIC/QUICEngineConnection.swi
 a `final class & Sendable` holding `FacadeLock<QUICConnectionEngine>` over the
 `DatagramTransport` + `AsyncTimer` seams, exercised end-to-end by
 `QUICEngineConnectionTests`. The driver is additive — the public `QUIC` facade
-keeps its proven host spine so its Foundation/NIO API + 895 tests stay intact — so
-the engine is wired but not yet the live data path. The full `--target QUIC -c
-release` Embedded compile remains blocked by the facade's Foundation `Data`/NIO
-public surface (see `Sources/QUIC/CONTEXT.md`), not by this core.
+keeps its proven Native host spine so its Foundation/NIO API stays intact. Under
+normal WASI and Embedded WASM, the host spine and host-only dependencies are
+excluded and this engine-driven `[UInt8]` surface is the live `QUIC` product path.
 
 Fix landed in this slice: `collectStreamFrames` no longer emits a spurious
 RESET_STREAM for an idle send stream (a stream with no pending data this tick) —

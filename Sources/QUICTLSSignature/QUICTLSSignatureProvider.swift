@@ -1,17 +1,9 @@
 // QUICTLSSignatureProvider.swift
-// The crypto provider that drives the libp2p-over-QUIC TLS 1.3 handshake SIGNATURE
-// path. It is the shared ``DefaultCryptoProvider`` for every primitive EXCEPT the
-// two ECDSA signature schemes, which are overridden with the DER-encoded wrappers
-// (``DERSignatureP256`` / ``DERSignatureP384``) the TLS wire mandates.
-//
-// WHY: the shared provider emits ECDSA signatures in *raw* `r || s` form (correct
-// for Noise / libp2p), whereas the TLS 1.3 CertificateVerify (RFC 8446 §4.4.3) and
-// the self-signed X.509 leaf signature require *DER* `SEQUENCE { INTEGER r, INTEGER
-// s }`. Emitting raw ECDSA on the TLS wire silently breaks interop with
-// go-libp2p / rust-libp2p QUIC peers. This composite fixes ONLY the ECDSA signature
-// encoding; AEAD / packet-protection / hashing / HKDF / x25519 / Ed25519 / entropy
-// are inherited unchanged from the shared provider (so handshake keys are
-// byte-identical to a `DefaultCryptoProvider`-driven engine).
+// The crypto provider that drives the libp2p-over-QUIC TLS 1.3 handshake
+// signature path. The canonical swift-ssl P-256 TLS scheme emits DER directly;
+// the raw P-256 scheme is a separate capability used by Noise and identity
+// proofs. Keeping these as distinct associated types prevents a wire-format
+// conversion from being accidentally applied twice.
 //
 // Ed25519 stays RAW: the libp2p RPK extension's proof-of-possession is raw Ed25519
 // over the SPKI (the libp2p-tls spec encoding) — it must NOT be DER-wrapped.
@@ -51,11 +43,13 @@ public enum QUICTLSSignatureProvider: CryptoProvider {
     public typealias P256Agreement = DefaultCryptoProvider.P256Agreement
     public typealias P384Agreement = DefaultCryptoProvider.P384Agreement
 
-    // Signatures — Ed25519 inherited (raw 64-byte, identical wire form, libp2p PoP);
-    // ECDSA OVERRIDDEN to DER for the TLS CertificateVerify + X.509 leaf wire.
+    // Signatures — Ed25519 and P-256 are supplied by the canonical backend.
+    // P-256 is DER for TLS; RawP256Signature is P1363 for non-TLS protocols.
     public typealias Ed25519       = DefaultCryptoProvider.Ed25519
-    public typealias P256Signature = DERSignatureP256
-    public typealias P384Signature = DERSignatureP384
+    public typealias P256Signature = DefaultCryptoProvider.P256Signature
+    public typealias P384Signature = DefaultCryptoProvider.P384Signature
+    public typealias RawP256Signature = DefaultCryptoProvider.RawP256Signature
+    public typealias RawP384Signature = DefaultCryptoProvider.RawP384Signature
 
     // Ambient capabilities — inherited.
     public typealias Random           = DefaultCryptoProvider.Random

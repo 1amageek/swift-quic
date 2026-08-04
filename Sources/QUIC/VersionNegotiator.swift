@@ -7,7 +7,7 @@
 /// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
 /// only the cores + the `[UInt8]` engine facade (quic Slice C).
 
-#if !hasFeature(Embedded)
+#if !hasFeature(Embedded) && !os(WASI)
 
 import Foundation
 import QUICCore
@@ -58,7 +58,9 @@ public struct VersionNegotiator: Sendable {
     /// - Parameter data: The complete Version Negotiation packet data
     /// - Returns: Array of offered QUIC versions
     /// - Throws: QUICVersionError if the packet is malformed
-    public static func parseVersions(from data: Data) throws -> [QUICVersion] {
+    public static func parseVersions(
+        from data: Data
+    ) throws(QUICVersionError) -> [QUICVersion] {
         // Minimum size: 1 (first byte) + 4 (version=0) + 1 (dcid len) + 1 (scid len) + 4 (at least one version)
         guard data.count >= 11 else {
             throw QUICVersionError.packetTooShort(expected: 11, actual: data.count)
@@ -90,6 +92,15 @@ public struct VersionNegotiator: Sendable {
         }
         guard reader.readBytes(Int(scidLength)) != nil else {
             throw QUICVersionError.packetTooShort(expected: Int(scidLength), actual: reader.remainingCount)
+        }
+
+        // RFC 9000 §17.2.1: the remainder is a sequence of 32-bit versions.
+        // Accepting trailing bytes would let two implementations disagree about
+        // the authenticated negotiation input.
+        guard reader.remainingCount.isMultiple(of: 4) else {
+            throw QUICVersionError.invalidPacketFormat(
+                reason: "Version list length must be a multiple of 4 bytes"
+            )
         }
 
         // Parse version list
@@ -181,7 +192,7 @@ public struct VersionNegotiator: Sendable {
 
     // MARK: - Validation
 
-    /// Validates a Version Negotiation packet received by a client
+    /// Returns versions offered by a Version Negotiation packet received by a client.
     ///
     /// RFC 9000 Section 6.2: A client MUST discard any Version Negotiation packet
     /// if it has received and successfully processed any other packet.
@@ -190,14 +201,53 @@ public struct VersionNegotiator: Sendable {
     ///   - data: The received packet data
     ///   - originalDCID: The DCID the client sent in its Initial packet
     ///   - originalSCID: The SCID the client sent in its Initial packet
+    ///   - attemptedVersion: The version used in the client's triggering packet
     /// - Returns: List of versions offered by the server
     /// - Throws: QUICVersionError if validation fails
+    public static func offeredVersions(
+        inVersionNegotiationPacket data: Data,
+        originalDCID: ConnectionID,
+        originalSCID: ConnectionID,
+        attemptedVersion: QUICVersion
+    ) throws(QUICVersionError) -> [QUICVersion] {
+        try validatedVersions(
+            inVersionNegotiationPacket: data,
+            originalDCID: originalDCID,
+            originalSCID: originalSCID,
+            attemptedVersion: attemptedVersion
+        )
+    }
+
+    /// Compatibility validation for callers of the original API.
+    ///
+    /// This validates packet format and connection IDs, but cannot perform RFC 9000
+    /// §6.2 attempted-version spoofing protection because the original API did not
+    /// receive the version used in the triggering packet. New code must call
+    /// ``offeredVersions(inVersionNegotiationPacket:originalDCID:originalSCID:attemptedVersion:)``.
+    @available(
+        *,
+        deprecated,
+        message: "Use offeredVersions(inVersionNegotiationPacket:originalDCID:originalSCID:attemptedVersion:)"
+    )
     public static func validateAndParseVersionNegotiation(
         _ data: Data,
         originalDCID: ConnectionID,
         originalSCID: ConnectionID
-    ) throws -> [QUICVersion] {
-        // Parse the packet first
+    ) throws(QUICVersionError) -> [QUICVersion] {
+        try validatedVersions(
+            inVersionNegotiationPacket: data,
+            originalDCID: originalDCID,
+            originalSCID: originalSCID,
+            attemptedVersion: nil
+        )
+    }
+
+    private static func validatedVersions(
+        inVersionNegotiationPacket data: Data,
+        originalDCID: ConnectionID,
+        originalSCID: ConnectionID,
+        attemptedVersion: QUICVersion?
+    ) throws(QUICVersionError) -> [QUICVersion] {
         let versions = try parseVersions(from: data)
 
         // Extract connection IDs from the packet for validation
@@ -221,8 +271,23 @@ public struct VersionNegotiator: Sendable {
 
         // RFC 9000 Section 6.2: The Destination Connection ID field MUST
         // match the Source Connection ID field from the Initial packet sent by the client
-        let receivedDCID = try ConnectionID(bytes: dcidBytes)
-        let receivedSCID = try ConnectionID(bytes: scidBytes)
+        let receivedDCID: ConnectionID
+        do {
+            receivedDCID = try ConnectionID(bytes: dcidBytes)
+        } catch {
+            throw QUICVersionError.invalidPacketFormat(
+                reason: "Invalid DCID: \(error)"
+            )
+        }
+
+        let receivedSCID: ConnectionID
+        do {
+            receivedSCID = try ConnectionID(bytes: scidBytes)
+        } catch {
+            throw QUICVersionError.invalidPacketFormat(
+                reason: "Invalid SCID: \(error)"
+            )
+        }
 
         guard receivedDCID == originalSCID else {
             throw QUICVersionError.invalidPacketFormat(
@@ -236,10 +301,13 @@ public struct VersionNegotiator: Sendable {
             )
         }
 
-        // RFC 9000 Section 6.2: The client MUST check that the server has
-        // selected a version that was not in the initial Client Hello.
-        // This is checked by ensuring none of our supported versions are in the list
-        // if we're receiving a VN packet after sending a supported version.
+        // RFC 9000 §6.2: a client MUST discard a Version Negotiation packet that
+        // includes the version used in the packet that triggered the response.
+        if let attemptedVersion, versions.contains(attemptedVersion) {
+            throw QUICVersionError.invalidPacketFormat(
+                reason: "Version list includes the attempted version \(attemptedVersion)"
+            )
+        }
 
         return versions
     }

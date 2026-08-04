@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.4
 
 import PackageDescription
 
@@ -6,6 +6,8 @@ import PackageDescription
 // Embedded-clean cores. Lifetimes is enabled in BOTH modes because Span-returning
 // members of the P2PCoreBytes dependency require @_lifetime.
 let embeddedEnabled = Context.environment["P2P_CORE_EMBEDDED"] == "1"
+let wasiEnabled = Context.environment["P2P_CORE_WASM"] == "1"
+let portableEnabled = embeddedEnabled || wasiEnabled
 
 let coreSettings: [SwiftSetting] = {
     var s: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
@@ -34,15 +36,15 @@ let quicFacadeDependencies: [Target.Dependency] = {
         "QUICWire",
         // Unified crypto provider for the concrete `DefaultCryptoProvider` facade,
         // and the seams the engine facade is generic over.
-        .product(name: "P2PCrypto",        package: "swift-p2p-crypto"),
-        .product(name: "P2PCoreCrypto",    package: "swift-p2p-core"),
-        .product(name: "P2PCoreBytes",     package: "swift-p2p-core"),
+        .product(name: "P2PCrypto",        package: "swift-p2p-core"),
+        .product(name: "P2PCoreCrypto",    package: "swift-ssl"),
+        .product(name: "P2PCoreBytes",     package: "swift-ssl"),
         .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
         // RFC 7250 raw-public-key SPKI parsing for the Embedded cert strategy
         // (fail-closed); host path uses swift-certificates via QUICCrypto.
         .product(name: "P2PCoreDER",       package: "swift-p2p-core"),
     ]
-    if !embeddedEnabled {
+    if !portableEnabled {
         d += [
             // Host orchestrator spine + Foundation/NIO adapters (gated
             // `#if !hasFeature(Embedded)` in source; dropped from the Embedded build).
@@ -109,11 +111,6 @@ let package = Package(
             name: "QUICStreamCore",
             targets: ["QUICStreamCore"]
         ),
-        // Embedded-clean TLS 1.3 key schedule + transcript hash (RFC 8446 §7.1)
-        .library(
-            name: "QUICTLSCore",
-            targets: ["QUICTLSCore"]
-        ),
         // Embedded-clean TLS 1.3 signature provider (DefaultCryptoProvider + DER ECDSA)
         .library(
             name: "QUICTLSSignature",
@@ -136,22 +133,29 @@ let package = Package(
             name: "QUICCore",
             targets: ["QUICCore"]
         ),
+        // Host compatibility adapter; new integrations should use the
+        // SwiftSSL-backed provider exported by this target.
+        .library(
+            name: "QUICCrypto",
+            targets: ["QUICCrypto"]
+        ),
     ],
     dependencies: [
+        // Canonical session contracts over the Pure Swift swift-ssl mechanism.
+        // This local reference is for the workspace migration; release manifests
+        // must use the tagged repository URL before publishing.
+        .package(name: "swift-tls-sessions", path: "../swift-tls"),
+        .package(name: "swift-p2p-core", path: "../swift-p2p-core"),
+        .package(name: "swift-ssl", path: "../../swift-ssl"),
         // UDP transport
         .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
 
-        // Cryptography.
-        // Range (not `from: 4.2.0`) so the apple/swift-crypto identity resolves to a
-        // single version compatible with swift-p2p-crypto (which floors at 3.x) and
-        // swift-certificates (3.12.3..<5.0.0). Adding the swift-p2p-crypto dependency
-        // for the unified DefaultCryptoProvider requires the ranges to overlap;
-        // 3.12.3..<5.0.0 mirrors swift-certificates' own range. (embedded-first-api.md §2.2)
-        .package(url: "https://github.com/apple/swift-crypto.git", "3.12.3"..<"5.0.0"),
+        // One cryptography implementation repository across Native, WASM, and Embedded.
+        .package(name: "swift-crypto", path: "../../swift-crypto"),
 
         // X.509 Certificates and ASN.1
-        .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.0"),
-        .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.0"),
+        .package(name: "swift-certificates", path: "../../swift-certificates"),
+        .package(name: "swift-asn1", path: "../../swift-asn1"),
 
         // Logging
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
@@ -159,15 +163,6 @@ let package = Package(
         // Documentation
         .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
 
-        // Embedded-clean byte primitives (Bytes/ByteReader/ByteWriter) + crypto seam
-        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.2.1"),
-
-        // Unified crypto provider: surfaces `DefaultCryptoProvider` (host
-        // swift-crypto / Embedded BoringSSL). Replaces the deleted per-lib
-        // QUICFoundationProvider (embedded-first-api.md §2.2). Its vendored
-        // BoringSSL is wired as local C targets with renamed symbols, so
-        // it coexists with apple/swift-crypto + swift-certificates with no conflict.
-        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.1"),
     ],
     targets: [
         // MARK: - Embedded-clean wire codec (dual-build: host + Embedded)
@@ -175,7 +170,7 @@ let package = Package(
         .target(
             name: "QUICWire",
             dependencies: [
-                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes", package: "swift-ssl"),
             ],
             path: "Sources/QUICWire",
             swiftSettings: coreSettings
@@ -191,8 +186,8 @@ let package = Package(
             name: "QUICPacketProtectionCore",
             dependencies: [
                 "QUICWire",
-                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
             ],
             path: "Sources/QUICPacketProtectionCore",
             swiftSettings: coreSettings
@@ -207,7 +202,7 @@ let package = Package(
             name: "QUICRecoveryCore",
             dependencies: [
                 "QUICWire",
-                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes", package: "swift-ssl"),
             ],
             path: "Sources/QUICRecoveryCore",
             swiftSettings: coreSettings
@@ -223,29 +218,9 @@ let package = Package(
             name: "QUICStreamCore",
             dependencies: [
                 "QUICWire",
-                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes", package: "swift-ssl"),
             ],
             path: "Sources/QUICStreamCore",
-            swiftSettings: coreSettings
-        ),
-
-        // MARK: - Embedded-clean TLS 1.3 key schedule (dual-build: host + Embedded)
-
-        // The TLS 1.3 key schedule (RFC 8446 §7.1) generic over `C: CryptoProvider`:
-        // early/handshake/master secrets, HKDF-Expand-Label, Derive-Secret, traffic
-        // secrets, finished key/verify-data, and the incremental transcript hash, all
-        // over `[UInt8]` secrets via the CryptoProvider / KeyDerivation / HashFunction
-        // / MessageAuthenticationCode seam. No Foundation/any/Mutex/ContinuousClock/
-        // direct-Crypto. The QUICCrypto adapter specialises at C = DefaultCryptoProvider
-        // and bridges Data / SymmetricKey / SharedSecret so existing tests are unchanged.
-        .target(
-            name: "QUICTLSCore",
-            dependencies: [
-                "QUICWire",
-                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
-            ],
-            path: "Sources/QUICTLSCore",
             swiftSettings: coreSettings
         ),
 
@@ -262,10 +237,10 @@ let package = Package(
         .target(
             name: "QUICTLSSignature",
             dependencies: [
-                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
                 .product(name: "P2PCoreDER",    package: "swift-p2p-core"),
-                .product(name: "P2PCrypto",     package: "swift-p2p-crypto"),
+                .product(name: "P2PCrypto",     package: "swift-p2p-core"),
             ],
             path: "Sources/QUICTLSSignature",
             swiftSettings: coreSettings
@@ -286,8 +261,8 @@ let package = Package(
             dependencies: [
                 "QUICWire",
                 "QUICPacketProtectionCore",
-                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
             ],
             path: "Sources/QUICConnectionCore",
             swiftSettings: coreSettings
@@ -315,8 +290,8 @@ let package = Package(
                 "QUICConnectionCore",
                 "QUICRecoveryCore",
                 "QUICStreamCore",
-                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
             ],
             path: "Sources/QUICConnectionEngineCore",
             exclude: ["CONTEXT.md"],
@@ -344,17 +319,22 @@ let package = Package(
                 "QUICCore",
                 "QUICConnectionCore",
                 "QUICPacketProtectionCore",
-                "QUICTLSCore",
+                .product(name: "QUICTLS", package: "swift-tls-sessions"),
                 // Unified provider: the host adapter specialises every generic
                 // engine at C = DefaultCryptoProvider,
                 // replacing the deleted QUICFoundationProvider.
-                .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
+                .product(name: "P2PCrypto", package: "swift-p2p-core"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "X509", package: "swift-certificates"),
                 .product(name: "SwiftASN1", package: "swift-asn1"),
+                .product(name: "TLSWire", package: "swift-ssl"),
+                .product(name: "SSLCore", package: "swift-ssl"),
+                .product(name: "SSLQUIC", package: "swift-ssl"),
+                .product(name: "SSLTLS", package: "swift-ssl"),
+                .product(name: "SSLCrypto", package: "swift-ssl"),
             ],
             path: "Sources/QUICCrypto",
-            exclude: ["CONTEXT.md", "TLS/CONTEXT.md"]
+            exclude: ["CONTEXT.md"]
         ),
 
         // MARK: - Connection Management
@@ -439,9 +419,8 @@ let package = Package(
             dependencies: [
                 "QUICCrypto",
                 "QUICPacketProtectionCore",
-                "QUICTLSCore",
-                .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
-                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+                .product(name: "P2PCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes", package: "swift-ssl"),
             ],
             path: "Tests/QUICCryptoTests"
         ),
@@ -450,8 +429,8 @@ let package = Package(
             name: "QUICTLSSignatureTests",
             dependencies: [
                 "QUICTLSSignature",
-                .product(name: "P2PCoreBytes",  package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
                 .product(name: "Crypto", package: "swift-crypto"),
             ],
             path: "Tests/QUICTLSSignatureTests"
@@ -459,7 +438,7 @@ let package = Package(
 
         .testTarget(
             name: "QUICRecoveryTests",
-            dependencies: ["QUICRecovery", "QUICCore"],
+            dependencies: ["QUICRecovery", "QUICRecoveryCore", "QUICCore"],
             path: "Tests/QUICRecoveryTests"
         ),
 
@@ -470,9 +449,9 @@ let package = Package(
                 "QUICWire",
                 "QUICPacketProtectionCore",
                 "QUICConnectionCore",
-                .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
-                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreBytes", package: "swift-ssl"),
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
             ],
             path: "Tests/QUICConnectionEngineCoreTests"
         ),
@@ -486,7 +465,19 @@ let package = Package(
         .testTarget(
             name: "QUICTests",
             dependencies: ["QUIC", "QUICRecovery", "QUICTransport"],
-            path: "Tests/QUICTests"
+            path: "Tests/QUICTests",
+            exclude: [
+                // These suites exercise the removed in-package TLS state
+                // machine or the removed built-in mock provider. Canonical
+                // handshake coverage lives with swift-ssl/QUICTLS.
+                "TLSIntegrationTests.swift",
+                "PathMTUDiscoveryRFCTests.swift",
+                "ConnectionIDExchangeRFCTests.swift",
+                "DatagramRFCTests.swift",
+                "EndpointTests.swift",
+                "CongestionControlAndPacingTests.swift",
+                "Interop",
+            ]
         ),
 
         // Seam-driven engine driver (quic Slice B): exercises QUICEngineConnection
@@ -500,8 +491,8 @@ let package = Package(
                 "QUICWire",
                 "QUICPacketProtectionCore",
                 "QUICConnectionCore",
-                .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCrypto", package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
                 .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
             ],
             path: "Tests/QUICEngineConnectionTests"

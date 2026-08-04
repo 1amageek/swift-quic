@@ -135,7 +135,7 @@ struct EndpointTests {
 
         // Client encrypts with client sealer
         let clientProcessor = PacketProcessor(dcidLength: 8)
-        let (_, _) = try clientProcessor.deriveAndInstallInitialKeys(
+        let (_, _) = try clientProcessor.installInitialKeys(
             connectionID: dcid,
             isClient: true,
             version: .v1
@@ -166,7 +166,7 @@ struct EndpointTests {
 
         // Server decrypts with server opener (using same original DCID for key derivation)
         let serverProcessor = PacketProcessor(dcidLength: 8)
-        let (_, _) = try serverProcessor.deriveAndInstallInitialKeys(
+        let (_, _) = try serverProcessor.installInitialKeys(
             connectionID: dcid,
             isClient: false,
             version: .v1
@@ -393,7 +393,7 @@ struct EndpointTests {
         let scid = try #require(ConnectionID.random(length: 8))
 
         // Derive keys
-        let (_, _) = try processor.deriveAndInstallInitialKeys(
+        let (_, _) = try processor.installInitialKeys(
             connectionID: dcid,
             isClient: true,
             version: .v1

@@ -93,13 +93,13 @@ public struct PacketProtector<C: CryptoProvider, A: AEAD>: Sendable {
         do {
             return try aead.seal(plaintext.span, nonce: nonceBytes.span, aad: header.span)
         } catch {
-            throw .crypto(error)
+            throw .aead(error)
         }
     }
 
     /// Opens `ciphertext || tag` and returns the plaintext (RFC 9001 §5.3).
     ///
-    /// Throws ``PacketProtectionError/crypto(_:)`` wrapping
+    /// Throws ``PacketProtectionError/aead(_:)`` wrapping
     /// ``P2PCoreCrypto/CryptoError/authenticationFailure`` on a tag mismatch — no
     /// silent fallback, never a garbage/empty return.
     public func open(
@@ -114,7 +114,7 @@ public struct PacketProtector<C: CryptoProvider, A: AEAD>: Sendable {
         do {
             return try aead.open(ciphertext.span, nonce: nonceBytes.span, aad: header.span)
         } catch {
-            throw .crypto(error)
+            throw .aead(error)
         }
     }
 
@@ -133,7 +133,7 @@ public struct PacketProtector<C: CryptoProvider, A: AEAD>: Sendable {
                 return try C.HeaderProtection.chaCha20BlockMask(key: hpKey.span, sample: sample.span)
             }
         } catch {
-            throw .crypto(error)
+            throw .headerProtection(error)
         }
     }
 

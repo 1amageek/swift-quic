@@ -8,7 +8,7 @@
 /// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
 /// only the cores + the `[UInt8]` engine facade (quic Slice C).
 
-#if !hasFeature(Embedded)
+#if !hasFeature(Embedded) && !os(WASI)
 
 import Foundation
 import Crypto
@@ -805,13 +805,13 @@ package final class PacketProcessor: Sendable {
 // MARK: - Utility Extensions
 
 extension PacketProcessor {
-    /// Creates initial crypto contexts from a connection ID
+    /// Creates and installs initial crypto contexts from a connection ID
     /// - Parameters:
     ///   - connectionID: The destination connection ID from the first Initial packet
     ///   - isClient: Whether this is the client side
     ///   - version: The QUIC version
     /// - Returns: The client and server key material
-    public func deriveAndInstallInitialKeys(
+    public func installInitialKeys(
         connectionID: ConnectionID,
         isClient: Bool,
         version: QUICVersion

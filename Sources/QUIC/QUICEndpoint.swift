@@ -7,7 +7,7 @@
 /// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
 /// only the cores + the `[UInt8]` engine facade (quic Slice C).
 
-#if !hasFeature(Embedded)
+#if !hasFeature(Embedded) && !os(WASI)
 
 import Foundation
 import Synchronization
@@ -148,15 +148,9 @@ public actor QUICEndpoint {
             case .development(let factory):
                 return factory()
             case .testing:
-                #if DEBUG
-                logger.warning(
-                    "Using MockTLSProvider in testing mode - NOT FOR PRODUCTION USE",
-                    metadata: ["isClient": "\(isClient)"]
+                throw QUICSecurityError.inappropriateSecurityMode(
+                    "Testing mode has no built-in TLS provider; inject a deterministic TLS13Provider in the test configuration."
                 )
-                return MockTLSProvider(configuration: TLSConfiguration())
-                #else
-                fatalError("Testing mode is not available in release builds. Configure a real TLS provider using QUICConfiguration.production() or QUICConfiguration.development().")
-                #endif
             }
         }
 
@@ -194,20 +188,9 @@ public actor QUICEndpoint {
             case .development(let factory):
                 return factory()
             case .testing:
-                #if DEBUG
-                logger.warning(
-                    "Using MockTLSProvider in testing mode - NOT FOR PRODUCTION USE",
-                    metadata: ["isClient": "\(isClient)"]
+                throw QUICSecurityError.inappropriateSecurityMode(
+                    "Testing mode has no built-in TLS provider; inject a deterministic TLS13Provider in the test configuration."
                 )
-                var tlsConfig = TLSConfiguration()
-                tlsConfig.sessionTicket = sessionTicket
-                if let maxSize = maxEarlyDataSize {
-                    tlsConfig.maxEarlyDataSize = maxSize
-                }
-                return MockTLSProvider(configuration: tlsConfig)
-                #else
-                fatalError("Testing mode is not available in release builds. Configure a real TLS provider using QUICConfiguration.production() or QUICConfiguration.development().")
-                #endif
             }
         }
 
@@ -618,7 +601,7 @@ public actor QUICEndpoint {
         // Create TLS provider with session ticket for resumption (fails if not configured)
         let tlsProvider = try createTLSProvider(
             isClient: true,
-            sessionTicket: session.ticket.ticketData,
+            sessionTicket: session.ticket.ticket,
             maxEarlyDataSize: session.maxEarlyDataSize
         )
 
@@ -853,13 +836,14 @@ public actor QUICEndpoint {
             return  // Discard late VN packets
         }
 
-        // Validate and parse the packet
+        // Resolve the offered versions after validating the packet.
         let offeredVersions: [QUICVersion]
         do {
-            offeredVersions = try VersionNegotiator.validateAndParseVersionNegotiation(
-                data,
-                originalDCID: connection.destinationConnectionID,
-                originalSCID: connection.sourceConnectionID
+            offeredVersions = try VersionNegotiator.offeredVersions(
+                inVersionNegotiationPacket: data,
+                originalDCID: connection.originalDestinationConnectionID,
+                originalSCID: connection.sourceConnectionID,
+                attemptedVersion: connection.attemptedVersion
             )
         } catch {
             // Invalid VN packet, discard

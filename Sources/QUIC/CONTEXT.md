@@ -1,12 +1,13 @@
 # QUIC — CONTEXT
-Scope/role: the host orchestrator and public entry point (`QUICEndpoint` / `ManagedConnection` / `ManagedStream`); the Foundation facade callers import.
-Last reviewed: 2026-06-25
+Scope/role: the dual-build `QUIC` entry point: host orchestration on Native and
+the `[UInt8]` engine facade on WASM / Embedded.
+Last reviewed: 2026-08-03
 
 Invariants and design intent the source does not state structurally. Read this
 before changing the I/O loop, key installation, or the connection lifecycle. This
-is a host-only module: it owns the UDP I/O loops, the per-connection async
-orchestration, and the public high-level API. It is NOT yet ported to the cored
-engine (see status below).
+owns the UDP I/O loops, the per-connection async orchestration, and the public
+high-level API on Native. On WASM / Embedded it exposes the cored engine path and
+gates the Foundation/NIO host spine.
 
 ## Contracts (the load-bearing rules)
 
@@ -27,8 +28,8 @@ engine (see status below).
 ## Invariants (must hold; tests guard them)
 
 - **A TLS provider is mandatory — no insecure default.** Configuration is via
-  `.production` / `.development` (caller supplies a provider) or `.testing`
-  (`MockTLSProvider`, DEBUG-guarded). There is no path that runs without one.
+  `.production` / `.development` (caller supplies a provider). The `.testing`
+  mode fails explicitly unless the caller injects its own deterministic provider.
 - **Graceful shutdown prevents continuation leaks.** `shutdown()` and `close()`
   guard against concurrent/duplicate calls; `start()` / `startWith0RTT()` is an
   atomic state transition (double-start prevention).
@@ -52,8 +53,8 @@ The cored orchestration engine `QUICConnectionEngine<C, T>` (target
 `QUICConnectionEngineCore`) is now driven by a seam-based facade alongside the
 proven host orchestrator:
 
-- `FacadeLock.swift` — host `Synchronization.Mutex` typealias / Embedded
-  `Atomic<Bool>` spinlock (verbatim from the proven swift-tls Tier-1 facade).
+- `FacadeLock.swift` — one `Synchronization.Mutex` contract shared by Native,
+  WASM, and Embedded targets.
 - `AsyncTimerClock.swift` — the host `AsyncTimer` (`ContinuousClock`+`Task.sleep`),
   the engine's `T` clock seam (host-gated; Embedded injects its own `AsyncTimer`).
 - `QUICEngineConnection.swift` — the `final class & Sendable` driver holding
@@ -63,9 +64,9 @@ proven host orchestrator:
   `deadlines(nowNanos:)`, `sleep(untilNanos: earliest)`, on wake
   `handleTimeout(nowNanos:)`). No `ContinuousClock`/`Task.sleep`/`Date` in the
   driver — all time flows through the injected `AsyncTimer`.
-- `QUICEngineConfigurationStrategy.swift` — host vs Embedded crypto/cert capability
+- `QUICEngineConfigurationStrategy.swift` — host vs portable crypto/cert capability
   behind one signature: host CSPRNG + injected X.509 validator (fail-closed);
-  Embedded RPK (RFC 7250) leaf-SPKI parsing via `P2PCoreDER` (fail-closed).
+  WASM / Embedded RPK (RFC 7250) leaf-SPKI parsing via `P2PCoreDER` (fail-closed).
 
 The driver is wired and unit-tested end-to-end (`QUICEngineConnectionTests`:
 stream round-trip + close over an in-memory loopback transport), but it is NOT yet
@@ -83,19 +84,20 @@ The `QUIC` target is now DUAL-BUILD via the proven swift-tls Slice B route
   `ManagedStream` / `QUICConnection` (the Foundation-`Data` `QUICStreamProtocol`
   + NIO `SocketAddress` bridge) / `QUICConfiguration` / `PacketProcessor` /
   `ConnectionRouter` / `TimerManager` / `VersionNegotiator` are each wrapped
-  whole in `#if !hasFeature(Embedded)`. The public host API
+  whole in `#if !hasFeature(Embedded) && !os(WASI)`. The public host API
   (`QUICEndpoint` / `ManagedConnection` / `QUICConnectionProtocol` /
   `QUICStreamProtocol` / `QUICConfiguration` / `QUIC.SocketAddress`) is UNCHANGED,
   so swift-libp2p builds unchanged.
 - **Conditional dependencies.** `Package.swift`'s `quicFacadeDependencies` drops
   the host adapter targets (`QUICCore` / `QUICCrypto` / `QUICConnection` /
   `QUICStream` / `QUICRecovery` / `QUICTransport` + `Logging`) under
-  `P2P_CORE_EMBEDDED=1`; the `QUIC` target carries `swiftSettings: coreSettings`.
+  `P2P_CORE_WASM=1` or `P2P_CORE_EMBEDDED=1`; the `QUIC` target carries
+  `swiftSettings: coreSettings`.
 - **The Embedded surface** is the `[UInt8]`/`SocketEndpoint` facade: the cored,
   sans-IO `QUICEngineConnection` driver plus the public concrete
   `QUICEngineClient` (pinned to `DefaultCryptoProvider`) over it, with the
   dual-build seams `FacadeLock` / `AsyncTimerClock` (host-gated impl) /
-  `QUICEngineConfigurationStrategy` (host X.509 vs Embedded RPK, fail-closed).
+  `QUICEngineConfigurationStrategy` (host X.509 vs portable RPK, fail-closed).
 
 Phase-2 features (Retry / 0-RTT / connection-migration / peer-initiated
 key-update live-wiring) are DEFERRED — the engine drops/does-not-wire them and the
@@ -104,11 +106,17 @@ silent fallback.
 
 ## Build
 
-- Host: `swift build` / `swift test`. The full Foundation/NIO
+- Host: `xcodebuild build` / `xcodebuild test`. The full Foundation/NIO
   spine compiles; `QUICEngineClient` / `QUICEngineConnection` compile alongside it.
-- Benchmarks: `SWIFT_QUIC_ENABLE_BENCHMARKS=1 swift test --filter QUICBenchmarks`.
+- Benchmarks: set `SWIFT_QUIC_ENABLE_BENCHMARKS=1` and run the
+  `QUICBenchmarks` suite through `xcodebuild test`.
   The package manifest leaves throughput benchmarks out of the default test graph
   because SwiftPM runs every test target by default.
-- Embedded (the milestone): `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1
-  swiftly run +6.3.1 swift build --target QUIC -c release`. Only the cores + the
+- WASM: use the pinned Swift 6.4 snapshot and matching
+  `swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm` SDK with
+  `P2P_CORE_WASM=1 swift build --target QUIC --configuration release`.
+- Embedded: use the pinned Swift 6.4 snapshot and matching
+  `swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm-embedded` SDK with
+  `P2P_CORE_EMBEDDED=1 swift build --target QUIC
+  --configuration release`. Only the cores + the
   `[UInt8]` engine facade compile; the host spine is gated away.

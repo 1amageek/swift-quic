@@ -4,7 +4,6 @@
 /// when key updates are required. Also manages key update state.
 
 import Foundation
-import QUICTLSCore
 import Synchronization
 
 // MARK: - AEAD Limits

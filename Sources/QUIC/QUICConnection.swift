@@ -8,7 +8,7 @@
 /// only the cores + the `[UInt8]` engine facade (quic Slice C). Under Embedded the
 /// public surface is the `[UInt8]`/`SocketEndpoint` facade instead.
 
-#if !hasFeature(Embedded)
+#if !hasFeature(Embedded) && !os(WASI)
 
 import Foundation
 import QUICCore

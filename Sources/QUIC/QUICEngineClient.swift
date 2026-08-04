@@ -1,8 +1,8 @@
 // QUICEngineClient.swift
 // The public, concrete `[UInt8]`-currency QUIC facade — the QUIC analogue of the
 // proven swift-tls Tier-1 facade (`TLSClient`/`DTLSClient`, fixed to
-// `TLSCryptoProvider`). It pins the crypto seam to `DefaultCryptoProvider` (host
-// swift-crypto / Embedded BoringSSL) so a normal caller never spells the generic
+// `TLSCryptoProvider`). It pins the crypto seam to `DefaultCryptoProvider`, backed
+// by the same swift-crypto fork on every target, so a normal caller never spells the generic
 // `C` parameter, and it carries currency `[UInt8]` / `SocketEndpoint` — never
 // Foundation `Data` or NIO `SocketAddress`.
 //
@@ -35,7 +35,7 @@ import QUICConnectionCore
 import QUICConnectionEngineCore
 import P2PCoreCrypto
 import P2PCoreTransport
-import P2PCrypto   // DefaultCryptoProvider (host swift-crypto / Embedded BoringSSL)
+import P2PCrypto   // DefaultCryptoProvider
 
 /// A QUIC connection with a concrete, Foundation-free `[UInt8]` surface.
 ///

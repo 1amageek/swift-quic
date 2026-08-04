@@ -42,7 +42,7 @@ public enum QUICKeyDerivation<C: CryptoProvider> {
         do {
             return try kdf.expand(prk: secret.span, info: info.span, length: length)
         } catch {
-            throw .crypto(error)
+            throw .keyDerivation(error)
         }
     }
 

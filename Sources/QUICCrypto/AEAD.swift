@@ -8,7 +8,7 @@
 /// keep their `Data`-based public API (so existing call sites and tests compile
 /// unchanged), but all AEAD and header-protection crypto now routes through the
 /// `CryptoProvider` / `HeaderProtectionProvider` seam, specialised at
-/// `C = FoundationEssentialsCryptoProvider`. The generic `PacketProtector<C, A>` /
+/// `C = QUICCryptoProvider`. The generic `PacketProtector<C, A>` /
 /// `SuiteProtector<C>` value types live in `QUICPacketProtectionCore`; the
 /// connection/codec layers now hold the concrete ``QUICPacketProtector`` (a
 /// `SuiteProtector<QUICCryptoProvider>` wrapper) directly, so no
@@ -17,7 +17,6 @@
 /// remain for the existing unit tests and direct callers.
 
 import Foundation
-import QUICTLSCore
 import Crypto
 import QUICCore
 import QUICPacketProtectionCore
@@ -68,18 +67,12 @@ extension PacketProtectionError {
             return .insufficientSample(expected: expected, actual: actual)
         case .ciphertextTooShort:
             return .aeadFailed
-        case .crypto(let cryptoError):
-            switch cryptoError {
-            case .invalidLength(let expected, let actual):
-                return .invalidIVLength(expected: expected, actual: actual)
-            case .authenticationFailure:
-                // AEAD authentication tag verification failed: this is an
-                // AEAD-open failure, not a header-protection failure.
-                return .aeadFailed
-            case .providerFailure, .unsupportedParameter,
-                 .keyAgreementFailure, .invalidSignature:
-                return .headerProtectionFailed
-            }
+        case .aead:
+            return .aeadFailed
+        case .headerProtection:
+            return .headerProtectionFailed
+        case .keyDerivation:
+            return .keyDerivationFailed
         }
     }
 }

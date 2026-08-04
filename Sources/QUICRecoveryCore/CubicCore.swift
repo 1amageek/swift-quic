@@ -12,9 +12,9 @@
 /// unchanged.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`. The
-/// cube root needed for `K` (RFC 9438 §4.2) routes through the libm `cbrt` symbol on
-/// the host (byte-identical to the original implementation) and an Embedded-safe
-/// Newton/Halley fallback under Embedded Swift (where libm `cbrt` is not in scope).
+/// cube root needed for `K` (RFC 9438 §4.2) routes through the libm `cbrt` symbol
+/// where available (byte-identical to the original implementation) and a portable
+/// Halley fallback on WASI/Embedded targets where libm `cbrt` is not in scope.
 #if !hasFeature(Embedded)
 #if canImport(Glibc)
 import Glibc
@@ -237,16 +237,25 @@ public struct CubicCore: Sendable {
 
     /// Cube root of a non-negative value.
     ///
-    /// On the host this is the libm `cbrt` symbol, byte-identical to the original
-    /// `CubicCongestionController`. Under Embedded Swift (where libm `cbrt` is not in
-    /// scope) it uses a Halley-iteration fallback seeded from the binary exponent;
-    /// `K` only feeds the cubic-curve growth region (never the exact-value paths), so
-    /// the tiny ULP difference does not change observable congestion-control behavior.
+    /// On Darwin and Glibc this is the libm `cbrt` symbol, byte-identical to the
+    /// original `CubicCongestionController`. WASI and Embedded Swift use the
+    /// portable Halley implementation because libm `cbrt` is not in scope there.
     @inline(__always)
     static func cubeRoot(_ x: Double) -> Double {
-        #if !hasFeature(Embedded)
+        #if !hasFeature(Embedded) && (canImport(Darwin) || canImport(Glibc))
         return cbrt(x)
         #else
+        return portableCubeRoot(x)
+        #endif
+    }
+
+    /// Computes a cube root without relying on a platform math module.
+    ///
+    /// The seed derived from the binary exponent keeps the iteration in the correct
+    /// magnitude. Eight Halley iterations provide cubic convergence for the values
+    /// used by the RFC 9438 `K` calculation.
+    @inline(__always)
+    static func portableCubeRoot(_ x: Double) -> Double {
         if x == 0 || !x.isFinite { return x }
         let negative = x < 0
         let a = negative ? -x : x
@@ -261,7 +270,6 @@ public struct CubicCore: Sendable {
             y = y * (y3 + a + a) / denom
         }
         return negative ? -y : y
-        #endif
     }
 
     /// Converts a non-negative nanosecond count to seconds, reproducing the host's

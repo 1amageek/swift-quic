@@ -1,9 +1,9 @@
 /// Typed errors for the Embedded-clean QUIC packet-protection core.
 ///
 /// Embedded-clean: no Foundation, no `any`. AEAD/key-derivation failures from the
-/// `CryptoProvider` seam (``P2PCoreCrypto/CryptoError``) are surfaced via
-/// ``crypto(_:)`` rather than swallowed — there is **no silent fallback**: an AEAD
-/// open failure throws ``crypto(_:)`` carrying ``P2PCoreCrypto/CryptoError/authenticationFailure``,
+/// `CryptoProvider` seam (``P2PCoreCrypto/CryptoError``) retain the operation
+/// that failed. There is **no silent fallback**: an AEAD open failure throws
+/// ``aead(_:)`` carrying ``P2PCoreCrypto/CryptoError/authenticationFailure``,
 /// never an empty/garbage plaintext.
 
 import P2PCoreCrypto
@@ -19,8 +19,12 @@ public enum PacketProtectionError: Error, Equatable, Sendable {
     /// The AEAD ciphertext was shorter than the 16-byte authentication tag.
     case ciphertextTooShort(minimum: Int, actual: Int)
 
-    /// A primitive behind the `CryptoProvider`/`HeaderProtectionProvider` seam
-    /// failed. Wraps the typed ``P2PCoreCrypto/CryptoError`` (e.g. an AEAD tag
-    /// mismatch is `.crypto(.authenticationFailure)`).
-    case crypto(CryptoError)
+    /// AEAD construction, sealing, or opening failed.
+    case aead(CryptoError)
+
+    /// Header-protection mask generation failed.
+    case headerProtection(CryptoError)
+
+    /// HKDF extraction or expansion failed while deriving packet keys.
+    case keyDerivation(CryptoError)
 }

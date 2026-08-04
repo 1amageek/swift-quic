@@ -1,6 +1,6 @@
 # swift-quic — CONTEXT
 Scope/role: a pure-Swift QUIC implementation (RFC 9000/9001/9002) used as the libp2p QUIC transport; the public surface is the host `QUIC` facade, layered over a set of Embedded-clean cores.
-Last reviewed: 2026-06-25
+Last reviewed: 2026-07-31
 
 Invariants and design intent the source does not state structurally. Read this
 before changing the tier split, the crypto seam, or any core. swift-quic is
@@ -8,6 +8,24 @@ before changing the tier split, the crypto seam, or any core. swift-quic is
 targets generic over the crypto seam, and the host (Foundation) modules are thin
 adapters over them. The byte currency in the cores is `[UInt8]` / `Bytes`; there
 is no backward-compatibility obligation to the old `Data` API inside a core.
+
+## Target TLS boundary
+
+- `swift-quic` is the sole owner of QUIC CRYPTO offsets/reassembly, transport
+  parameters, packet/header protection, key installation, packet-number spaces,
+  recovery, congestion control, streams, and datagram orchestration.
+- The target handshake dependency is
+  `swift-quic -> swift-tls-sessions/QUICTLS -> swift-ssl`. `swift-tls-sessions`
+  owns the public QUIC TLS session contract; `swift-ssl` owns the TLS 1.3 transcript, key
+  schedule, handshake messages, authentication mechanisms, and emitted traffic
+  secrets.
+- The removed `QUICTLSCore` and `TLS13Handler` files are historical sources only;
+  they are not package targets and have no active consumer.
+- Moving the TLS state machine must not move CRYPTO frame offset handling or
+  reassembly out of `swift-quic`.
+
+See the workspace
+[`SECURE_TRANSPORT_ARCHITECTURE.md`](../../SECURE_TRANSPORT_ARCHITECTURE.md).
 
 ## Tier model (why, not just what)
 
@@ -20,7 +38,6 @@ is no backward-compatibility obligation to the old `Data` API inside a core.
     over the seam) and the closed `SuiteProtector<C>` cipher-suite enum.
   - `QUICRecoveryCore` — loss detection, CUBIC/NewReno, pacing, anti-amplification.
   - `QUICStreamCore` — send/receive STREAM FSMs, reassembly, flow control.
-  - `QUICTLSCore` — TLS 1.3 key schedule + transcript hash + handshake FSMs.
   - `QUICConnectionCore` — DPLPMTUD, transport-params codec, packet parse/serialize.
   - `QUICConnectionEngineCore` — `QUICConnectionEngine<C, T>`, the cored
     orchestrator that DRIVES the other six (the 7th, newest core). See its own
@@ -33,7 +50,7 @@ is no backward-compatibility obligation to the old `Data` API inside a core.
 ## Contracts (the load-bearing rules)
 
 - **The crypto seam is the only crypto path.** Every core is generic over
-  `C: CryptoProvider`; no core imports swift-crypto, CommonCrypto, or BoringSSL
+  `C: CryptoProvider`; no core imports a concrete cryptographic engine
   directly. The host adapters specialise every generic engine at
   `C = QUICCryptoProvider` (the unified `DefaultCryptoProvider`, except ECDSA is
   DER-encoded for the TLS path). Do not reach around the seam.
@@ -95,32 +112,29 @@ is no backward-compatibility obligation to the old `Data` API inside a core.
 - Time never enters a core via a clock: it is injected as a monotonic
   `nowNanos: UInt64`.
 
-## Status: Slice B rails landed (engine-driven facade is additive)
+## Status: portable engine facade compiles as the `QUIC` product
 
-The Embedded compile covers the cores (including `QUICConnectionEngineCore`, green
-under `--target QUICConnectionEngineCore -c release`). The "quic Slice B" facade
-rewire has landed its rails: a seam-based driver `QUICEngineConnection`
+The WASM and Embedded WASM compile covers the `QUIC` product, including its
+cores and portable engine facade. A seam-based driver `QUICEngineConnection`
 (`Sources/QUIC/`) holds `FacadeLock<QUICConnectionEngine>` over the
 `DatagramTransport` (UDP) + `AsyncTimer` (clock+sleep) seams, inverts I/O, and runs
 the clock-free timer loop — unit-tested end-to-end (`QUICEngineConnectionTests`).
 It is ADDITIVE: `QUICEndpoint`/`ManagedConnection` keep their proven
 `QUICConnectionHandler`/`PacketProcessor` spine, so the public Foundation/NIO API
-+ the 895 host tests stay intact and swift-libp2p still builds. The full `--target
-QUIC -c release` Embedded compile remains BLOCKED by the facade's Foundation
-`Data`/NIO public surface + host-adapter deps (`QUICCrypto`→X509, `QUICTransport`→
-NIO, `QUICCore`→`P2PCoreFoundation`); making it Embedded needs a NEW Foundation-free
-facade product (`[UInt8]`/`SocketEndpoint`) over the driver — a follow-up slice.
-The released `1.3.0` tag is the host API; the Embedded cores are unreleased on the
-`embedded` branch (M8 pending). The high-level usage API
-(`QUICEndpoint.serve/dial`, `QUICConfiguration.production`, `MockTLSProvider`) is
-unchanged and accurate.
++ remains intact and swift-libp2p still builds. Normal WASI and Embedded builds
+exclude those host adapters and expose the `[UInt8]` / `SocketEndpoint` engine
+surface from the same `QUIC` product. The host API uses an injected
+`SwiftSSLQUICTLSProviderFactory`; testing mode without an injected provider
+fails explicitly instead of selecting a built-in mock TLS implementation.
 
 ## Build
 
-- Host: `swift build` / `swift test` (Swift tools 6.2, platform floor v26).
-- Embedded cores: `P2P_CORE_EMBEDDED=1 swift build --target QUICConnectionEngineCore -c release`
-  (substitute any other core target). The full `QUIC` facade Embedded build is the
-  pending Slice B work.
+- Host: `xcodebuild build` / `xcodebuild test` with the pinned Swift 6.4
+  development snapshot (Swift tools 6.2, platform floor v26).
+- WASM: use the matching Swift 6.4 WASM SDK with
+  `P2P_CORE_WASM=1 swift build --target QUIC --configuration release`.
+- Embedded WASM: use the matching Swift 6.4 Embedded WASM SDK with
+  `P2P_CORE_EMBEDDED=1 swift build --target QUIC --configuration release`.
 
 ## References
 

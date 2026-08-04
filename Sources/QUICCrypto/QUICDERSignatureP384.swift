@@ -36,20 +36,26 @@ public enum QUICDERSignatureP384: P2PCoreCrypto.SignatureScheme {
     }
 
     public static func signingKey(rawRepresentation: Span<UInt8>) throws(P2PCoreCrypto.CryptoError) -> SigningKey {
+        guard rawRepresentation.count == 48 else {
+            throw .invalidLength(expected: 48, actual: rawRepresentation.count)
+        }
         do {
             return SigningKey(key: try P384.Signing.PrivateKey(
                 rawRepresentation: Data(rawRepresentation.quicDERArray())))
         } catch {
-            throw .invalidLength(expected: 48, actual: rawRepresentation.count)
+            throw .invalidKeyMaterial
         }
     }
 
     public static func verifyingKey(rawRepresentation: Span<UInt8>) throws(P2PCoreCrypto.CryptoError) -> VerifyingKey {
+        guard rawRepresentation.count == 97 else {
+            throw .invalidLength(expected: 97, actual: rawRepresentation.count)
+        }
         do {
             return VerifyingKey(key: try P384.Signing.PublicKey(
                 x963Representation: Data(rawRepresentation.quicDERArray())))
         } catch {
-            throw .invalidLength(expected: 97, actual: rawRepresentation.count)
+            throw .invalidKeyMaterial
         }
     }
 

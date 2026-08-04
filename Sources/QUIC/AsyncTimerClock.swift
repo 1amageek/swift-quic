@@ -11,7 +11,7 @@
 // module so the host facade does not take a transport-implementation dependency
 // just to obtain a clock.
 
-#if !hasFeature(Embedded)
+#if !hasFeature(Embedded) && !os(WASI)
 
 import _Concurrency
 import P2PCoreCrypto

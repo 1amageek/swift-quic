@@ -4,7 +4,6 @@
 /// Handles initial, handshake, application, and key update secrets.
 
 import Foundation
-import QUICTLSCore
 import Crypto
 import QUICCore
 
@@ -135,10 +134,9 @@ public struct KeySchedule: Sendable {
     /// `secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length)`
     ///
     /// This is the single source of truth for QUIC key-update secret derivation:
-    /// both ``updateKeys()`` (the live key-phase rotation) and
-    /// `TLS13Handler.requestKeyUpdate()` route through it so the two paths cannot
-    /// drift. Note the QUIC "quic ku" label, NOT the TLS-over-TCP "traffic upd"
-    /// label of RFC 8446 §7.2.
+    /// the live packet-protection key-phase rotation routes through it. Note the
+    /// QUIC "quic ku" label, NOT the TLS-over-TCP "traffic upd" label of RFC
+    /// 8446 §7.2.
     ///
     /// - Parameter currentSecret: The current application traffic secret.
     /// - Returns: The next-generation application traffic secret (32 bytes).
@@ -169,7 +167,7 @@ public struct KeySchedule: Sendable {
         }
 
         // Derive new secrets using the canonical "quic ku" derivation
-        // (single source of truth shared with TLS13Handler.requestKeyUpdate()).
+        // (single source of truth for packet-protection key-phase rotation).
         let newClientSecret = try Self.nextApplicationTrafficSecret(from: clientAppSecret)
         let newServerSecret = try Self.nextApplicationTrafficSecret(from: serverAppSecret)
 

@@ -42,15 +42,16 @@ public enum ECDSADERConversion {
     ///   bytes (the backend must emit a fixed-width p1363 signature; anything else
     ///   is a backend invariant violation, never silently re-shaped).
     public static func encode(raw: [UInt8], scalarLength: Int) throws(CryptoError) -> [UInt8] {
-        guard raw.count == 2 * scalarLength else {
-            throw .invalidLength(expected: 2 * scalarLength, actual: raw.count)
+        do {
+            return try ECDSASignatureDER.encode(
+                rawRepresentation: raw,
+                scalarByteCount: scalarLength
+            )
+        } catch .invalidECDSASignatureLength(let expected, let actual) {
+            throw .invalidLength(expected: expected, actual: actual)
+        } catch {
+            throw .providerFailure
         }
-        let r = Array(raw[0..<scalarLength])
-        let s = Array(raw[scalarLength..<(2 * scalarLength)])
-        return DERWriter.sequence([
-            DERWriter.encodeInteger(r),
-            DERWriter.encodeInteger(s),
-        ])
     }
 
     /// DER-decode `SEQUENCE { INTEGER r, INTEGER s }` back to a fixed-width raw
@@ -61,43 +62,13 @@ public enum ECDSADERConversion {
     /// does not fit `scalarLength` (e.g. an over-long `r`/`s`) — the caller treats
     /// this as an invalid signature (`false`), never a silent accept.
     public static func decode(der: [UInt8], scalarLength: Int) -> [UInt8]? {
-        var reader = DERReader(der)
-        var rBytes = [UInt8]()
-        var sBytes = [UInt8]()
         do {
-            try reader.readConstructed(.sequence) { (inner) throws(DERError) in
-                rBytes = try inner.readIntegerBytes()
-                sBytes = try inner.readIntegerBytes()
-            }
+            return try ECDSASignatureDER.decode(
+                derRepresentation: der,
+                scalarByteCount: scalarLength
+            )
         } catch {
             return nil
         }
-        // The whole input must be exactly one SEQUENCE (no trailing bytes).
-        guard reader.isAtEnd else { return nil }
-        guard let r = fixedWidth(rBytes, length: scalarLength),
-              let s = fixedWidth(sBytes, length: scalarLength) else {
-            return nil
-        }
-        var raw = [UInt8]()
-        raw.reserveCapacity(2 * scalarLength)
-        raw.append(contentsOf: r)
-        raw.append(contentsOf: s)
-        return raw
-    }
-
-    /// Normalise an ASN.1 INTEGER's content bytes to a fixed-width big-endian
-    /// scalar: drop a leading `0x00` sign byte, then left-pad with zeros to
-    /// `length`. Returns `nil` if the significant value exceeds `length` bytes.
-    private static func fixedWidth(_ integer: [UInt8], length: Int) -> [UInt8]? {
-        var value = integer
-        // Drop ASN.1 sign byte(s): a leading 0x00 only carries the sign bit.
-        while value.count > 1 && value[0] == 0x00 {
-            value.removeFirst()
-        }
-        guard value.count <= length else { return nil }
-        if value.count == length { return value }
-        var padded = [UInt8](repeating: 0, count: length - value.count)
-        padded.append(contentsOf: value)
-        return padded
     }
 }

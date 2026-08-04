@@ -7,8 +7,8 @@
 /// concrete protector behind `any`, `SuiteProtector<C>` is a closed `enum` over
 /// the generic ``PacketProtector`` specialised at each of the provider's three
 /// AEAD associated types. A generic upper layer (`<C: CryptoProvider>`)
-/// specialises cleanly under Embedded Swift; the adapter instantiates it at
-/// `C = FoundationEssentialsCryptoProvider`.
+/// specialises cleanly under Embedded Swift; adapters select their concrete
+/// provider at the composition boundary.
 ///
 /// Embedded-clean: no Foundation, no `any`, no swift-crypto, typed throws.
 
@@ -78,19 +78,19 @@ public enum SuiteProtector<C: CryptoProvider>: Sendable {
         switch suite {
         case .aes128GCM:
             let aead: C.AESGCM128
-            do { aead = try C.makeAESGCM128(key: key.span) } catch { throw .crypto(error) }
+            do { aead = try C.makeAESGCM128(key: key.span) } catch { throw .aead(error) }
             let protector = try PacketProtector<C, C.AESGCM128>(
                 aead: aead, iv: iv, hpKey: hpKey, usesAESHeaderProtection: true)
             return .aes128GCM(protector)
         case .aes256GCM:
             let aead: C.AESGCM256
-            do { aead = try C.makeAESGCM256(key: key.span) } catch { throw .crypto(error) }
+            do { aead = try C.makeAESGCM256(key: key.span) } catch { throw .aead(error) }
             let protector = try PacketProtector<C, C.AESGCM256>(
                 aead: aead, iv: iv, hpKey: hpKey, usesAESHeaderProtection: true)
             return .aes256GCM(protector)
         case .chaCha20Poly1305:
             let aead: C.ChaChaPoly
-            do { aead = try C.makeChaChaPoly(key: key.span) } catch { throw .crypto(error) }
+            do { aead = try C.makeChaChaPoly(key: key.span) } catch { throw .aead(error) }
             let protector = try PacketProtector<C, C.ChaChaPoly>(
                 aead: aead, iv: iv, hpKey: hpKey, usesAESHeaderProtection: false)
             return .chaCha20Poly1305(protector)

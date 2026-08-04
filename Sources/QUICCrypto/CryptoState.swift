@@ -21,6 +21,8 @@ public enum CryptoError: Error, Sendable {
     case unsupportedPlatform(String)
     /// AEAD encryption/decryption failed
     case aeadFailed
+    /// Packet key derivation failed
+    case keyDerivationFailed
 }
 
 // MARK: - Header Protection

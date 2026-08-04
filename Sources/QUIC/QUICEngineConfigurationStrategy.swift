@@ -5,9 +5,10 @@
 // shared signature, mirroring the proven swift-tls split
 // (`TLSConfigurationBridge` host / `TLSEngineEmbeddedStrategy` Embedded).
 //
-// The gate is `hasFeature(Embedded)`, NOT `canImport(Foundation)` (Foundation is
-// importable under Embedded). Each branch provides the SAME function so the
-// facade calls it with no `#if`:
+// The portable gate is `hasFeature(Embedded) || os(WASI)`, NOT
+// `canImport(Foundation)` (Foundation may be importable without the host adapter
+// capabilities). Each branch provides the SAME function so the facade calls it
+// with no `#if`:
 //
 //   * HOST: `randomBytes` over `SystemRandomNumberGenerator`; `validateCertificate`
 //     delegates to the caller-injected X.509 validator (or, when none is given,
@@ -27,7 +28,7 @@ import QUICConnectionCore
 import QUICConnectionEngineCore
 import P2PCoreCrypto
 
-#if hasFeature(Embedded)
+#if hasFeature(Embedded) || os(WASI)
 import P2PCoreDER
 #endif
 
@@ -71,9 +72,9 @@ public enum QUICEngineCapability {
     public static func validateCertificate(
         injected: QUICPeerValidator?
     ) -> QUICPeerValidator {
-        #if hasFeature(Embedded)
+        #if hasFeature(Embedded) || os(WASI)
         return { (chain: [[UInt8]]) throws(QUICEngineError) -> [UInt8]? in
-            try EmbeddedRPKStrategy.validate(chain: chain, injected: injected)
+            try PortableRPKStrategy.validate(chain: chain, injected: injected)
         }
         #else
         return { (chain: [[UInt8]]) throws(QUICEngineError) -> [UInt8]? in
@@ -83,7 +84,7 @@ public enum QUICEngineCapability {
     }
 }
 
-#if !hasFeature(Embedded)
+#if !hasFeature(Embedded) && !os(WASI)
 
 /// The host peer-trust strategy. X.509 verification proper lives in the host
 /// `QUICCrypto`/swift-certificates layer (reached through the injected validator);
@@ -108,7 +109,7 @@ enum HostCertStrategy {
 /// The Embedded raw-public-key (RFC 7250) peer-trust strategy: resolve the peer's
 /// public key from the leaf SubjectPublicKeyInfo, FAIL-CLOSED. An unparseable leaf
 /// (e.g. a full X.509 certificate, which Embedded cannot parse) is rejected.
-enum EmbeddedRPKStrategy {
+enum PortableRPKStrategy {
     static func validate(
         chain: [[UInt8]],
         injected: QUICPeerValidator?

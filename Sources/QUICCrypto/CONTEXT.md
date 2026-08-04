@@ -1,5 +1,5 @@
 # QUICCrypto — CONTEXT
-Scope/role: the host (Foundation) packet-protection + TLS adapter (RFC 9001); thin layer over `QUICPacketProtectionCore` + `QUICTLSCore`, specialised at `C = QUICCryptoProvider`.
+Scope/role: the host (Foundation) packet-protection adapter (RFC 9001); thin layer over `QUICPacketProtectionCore`, specialised at `C = QUICCryptoProvider`.
 Last reviewed: 2026-06-25
 
 Invariants and design intent the source does not state structurally. Read this
@@ -15,18 +15,20 @@ adapter that specialises them at `C = QUICCryptoProvider` (the unified
   (`QUICPacketProtectionCore`) performs AEAD seal/open + header protection over the
   `CryptoProvider` / `HeaderProtectionProvider` seam. Header protection is NOT a
   CommonCrypto-direct call — the AES-ECB and ChaCha20 block masks come from
-  `QUICCryptoProvider.HeaderProtection` (host swift-crypto / Embedded BoringSSL).
+  `QUICCryptoProvider.HeaderProtection`, backed by `swift-ssl` through the shared
+  `P2PCrypto` provider on Native, WASM, and Embedded.
   Do not add a direct-crypto shortcut.
 - **Cipher-suite dispatch is `SuiteProtector<C>`** (closed enum over
   `PacketProtector<C, A>`), not `any PacketOpener` / `any PacketSealer`. It is the
   thing that replaced those existentials.
 - **The negotiated cipher suite MUST propagate from TLS to packet protection.**
-  `TLS13Handler` puts it in `KeysAvailableInfo.cipherSuite`; key derivation must be
+  The `swift-tls-sessions/QUICTLS` adapter puts it in `TLSOutput.keysAvailable`;
+  key derivation must be
   called WITH that suite, and the protector chosen via the factory. Never default
   to AES-128-GCM when a suite is available — it silently breaks ChaCha20-Poly1305.
-- **The TLS 1.3 key schedule lives in `QUICTLSCore`** (`TLSKeyScheduleCore`,
-  RFC 8446 §7.1; `TLSTranscriptHashCore`). This adapter bridges it; it does not
-  reimplement the schedule.
+- **The TLS 1.3 key schedule is not owned by this adapter.** The canonical
+  `swift-ssl/SSLQUIC` session owns RFC 8446 key schedule and transcript state;
+  this package only installs the resulting QUIC secrets into packet protection.
 
 ## Invariants (must hold; tests guard them)
 
@@ -49,10 +51,10 @@ adapter that specialises them at `C = QUICCryptoProvider` (the unified
 
 ## Embedded constraints (do not regress)
 
-- The cores (`QUICPacketProtectionCore`, `QUICTLSCore`) stay Embedded-clean: no
-  Foundation, no `any`, no `Mutex`, no direct crypto. This adapter holds the
-  Foundation/X.509 surface (swift-crypto, swift-certificates) so the cores need
-  neither.
+- The packet-protection core stays Embedded-clean: no Foundation, no `any`, no
+  `Mutex`, and no direct crypto. The canonical provider imports `swift-ssl`; the
+  legacy host certificate adapter remains isolated until the QUIC credential
+  boundary is migrated.
 
 ## Wire protocol notes
 
@@ -65,4 +67,4 @@ adapter that specialises them at `C = QUICCryptoProvider` (the unified
 ## Build
 
 - Host: `swift build` / `swift test --filter QUICCryptoTests` (also exercises
-  `QUICPacketProtectionCore` + `QUICTLSCore`).
+  `QUICPacketProtectionCore` + the `swift-ssl/SSLQUIC` adapter boundary).

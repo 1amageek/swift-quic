@@ -6,7 +6,7 @@
 /// hashing, HKDF, HMAC, header protection, key agreement, Ed25519 signing, entropy
 /// and the monotonic clock — bringing the shared provider's bulk-copy primitives.
 ///
-/// The ONE exception is ECDSA: the shared `FoundationEssentialsCryptoProvider` emits ECDSA
+/// The ONE exception is ECDSA: the shared `DefaultCryptoProvider` emits ECDSA
 /// signatures in *raw* `r||s` form (correct for Noise/libp2p), whereas the TLS 1.3
 /// CertificateVerify wire format (RFC 8446 §4.2.3) requires *DER*. Emitting raw
 /// ECDSA on the QUIC TLS wire would silently break interop and is caught by
@@ -53,6 +53,8 @@ public enum QUICCryptoProvider: CryptoProvider {
     public typealias Ed25519       = DefaultCryptoProvider.Ed25519
     public typealias P256Signature = QUICDERSignatureP256
     public typealias P384Signature = QUICDERSignatureP384
+    public typealias RawP256Signature = DefaultCryptoProvider.RawP256Signature
+    public typealias RawP384Signature = DefaultCryptoProvider.RawP384Signature
 
     // Ambient capabilities — inherited.
     public typealias Random           = DefaultCryptoProvider.Random

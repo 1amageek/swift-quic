@@ -45,7 +45,7 @@ extension PacketParsingError {
             return conversionError
         case .protection(let protectionError):
             switch protectionError {
-            case .crypto(.authenticationFailure), .ciphertextTooShort:
+            case .aead(.authenticationFailure), .ciphertextTooShort:
                 // AEAD open/seal failure: the prior QUICPacketProtector.open threw
                 // QUICError.decryptionFailed (which the coalesced-skip path catches).
                 return QUICError.decryptionFailed

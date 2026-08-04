@@ -128,4 +128,41 @@ struct DERSignatureTests {
             _ = try ECDSADERConversion.encode(raw: tooShort, scalarLength: 32)
         }
     }
+
+    @Test("Negative and non-minimal DER INTEGERs are rejected")
+    func nonCanonicalIntegersFailClosed() {
+        let redundantZero = [UInt8]([
+            0x30, 0x07,
+            0x02, 0x02, 0x00, 0x01,
+            0x02, 0x01, 0x01,
+        ])
+        let negative = [UInt8]([
+            0x30, 0x06,
+            0x02, 0x01, 0x80,
+            0x02, 0x01, 0x01,
+        ])
+
+        #expect(ECDSADERConversion.decode(
+            der: redundantZero,
+            scalarLength: 32
+        ) == nil)
+        #expect(ECDSADERConversion.decode(
+            der: negative,
+            scalarLength: 32
+        ) == nil)
+    }
+
+    @Test("Invalid scalar widths fail without integer overflow")
+    func invalidScalarWidthFailsWithoutOverflow() {
+        #expect(throws: CryptoError.providerFailure) {
+            _ = try ECDSADERConversion.encode(
+                raw: [],
+                scalarLength: Int.max
+            )
+        }
+        #expect(ECDSADERConversion.decode(
+            der: [],
+            scalarLength: Int.max
+        ) == nil)
+    }
 }

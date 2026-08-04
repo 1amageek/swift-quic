@@ -354,7 +354,7 @@ struct WireFormatTests {
         let dcid = try #require(ConnectionID.random(length: 8))
         let scid = try #require(ConnectionID.random(length: 8))
 
-        let (_, _) = try processor.deriveAndInstallInitialKeys(
+        let (_, _) = try processor.installInitialKeys(
             connectionID: dcid,
             isClient: true,
             version: .v1
@@ -387,7 +387,7 @@ struct WireFormatTests {
         let dcid = try #require(ConnectionID.random(length: 8))
         let scid = try #require(ConnectionID.random(length: 8))
 
-        let (_, _) = try processor.deriveAndInstallInitialKeys(
+        let (_, _) = try processor.installInitialKeys(
             connectionID: dcid,
             isClient: true,
             version: .v1
@@ -473,7 +473,7 @@ struct PacketCoalescingTests {
         let scid = try #require(ConnectionID.random(length: 8))
 
         let processor = PacketProcessor(dcidLength: 8)
-        let (_, _) = try processor.deriveAndInstallInitialKeys(
+        let (_, _) = try processor.installInitialKeys(
             connectionID: dcid,
             isClient: true,
             version: .v1
@@ -512,7 +512,7 @@ struct PacketCoalescingTests {
         let scid = try #require(ConnectionID.random(length: 8))
 
         let clientProcessor = PacketProcessor(dcidLength: 8)
-        let (_, _) = try clientProcessor.deriveAndInstallInitialKeys(
+        let (_, _) = try clientProcessor.installInitialKeys(
             connectionID: dcid,
             isClient: true,
             version: .v1
@@ -538,7 +538,7 @@ struct PacketCoalescingTests {
 
         // Server decrypts
         let serverProcessor = PacketProcessor(dcidLength: 8)
-        let (_, _) = try serverProcessor.deriveAndInstallInitialKeys(
+        let (_, _) = try serverProcessor.installInitialKeys(
             connectionID: dcid,
             isClient: false,
             version: .v1

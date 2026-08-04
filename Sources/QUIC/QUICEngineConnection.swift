@@ -26,6 +26,7 @@
 // unbroken) and is the host adapter over this driver.
 
 import _Concurrency   // REQUIRED under Embedded for AsyncStream/Task/withTaskGroup
+import Synchronization
 import QUICWire
 import QUICPacketProtectionCore
 import QUICConnectionCore

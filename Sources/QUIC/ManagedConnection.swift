@@ -7,7 +7,7 @@
 /// `#if !hasFeature(Embedded)` so the `QUIC` target compiles under Embedded with
 /// only the cores + the `[UInt8]` engine facade (quic Slice C).
 
-#if !hasFeature(Embedded)
+#if !hasFeature(Embedded) && !os(WASI)
 
 import Foundation
 import Synchronization
@@ -311,7 +311,7 @@ public final class ManagedConnection: Sendable {
         // RFC 9001: Both client and server derive Initial keys from the
         // Destination Connection ID in the first Initial packet sent by the client
         // PacketProcessor is the single source of truth for crypto contexts
-        let (_, _) = try packetProcessor.deriveAndInstallInitialKeys(
+        let (_, _) = try packetProcessor.installInitialKeys(
             connectionID: originalConnectionID,
             isClient: role == .client,
             version: handler.version
@@ -356,7 +356,7 @@ public final class ManagedConnection: Sendable {
         }
 
         // Derive initial keys using the original connection ID
-        let (_, _) = try packetProcessor.deriveAndInstallInitialKeys(
+        let (_, _) = try packetProcessor.installInitialKeys(
             connectionID: originalConnectionID,
             isClient: true,
             version: handler.version
@@ -367,8 +367,8 @@ public final class ManagedConnection: Sendable {
         try tlsProvider.setLocalTransportParameters(encodedParams)
 
         // Configure TLS for session resumption with 0-RTT
-        // This must be done BEFORE startHandshake() so the ClientStateMachine
-        // can derive 0-RTT keys using the correct ClientHello transcript hash
+        // This must be done BEFORE startHandshake() so the canonical QUIC TLS
+        // session can derive 0-RTT keys using the correct ClientHello transcript hash
         try tlsProvider.configureResumption(
             ticket: session.sessionTicketData,
             attemptEarlyData: earlyData != nil
@@ -697,7 +697,7 @@ public final class ManagedConnection: Sendable {
         packetProcessor.discardKeys(for: .initial)
 
         // Derive new Initial keys using the server's SCID (our new DCID)
-        let (_, _) = try packetProcessor.deriveAndInstallInitialKeys(
+        let (_, _) = try packetProcessor.installInitialKeys(
             connectionID: sourceCID,
             isClient: true,
             version: version
@@ -1119,7 +1119,7 @@ public final class ManagedConnection: Sendable {
                 // For now, we throw an error which will be handled by the caller
                 throw TLSError.handshakeFailed(
                     alert: alert.alertDescription.rawValue,
-                    description: alert.description
+                    description: String(describing: alert.alertDescription)
                 )
 
             case .newSessionTicket(let ticketInfo):
@@ -1790,6 +1790,16 @@ extension ManagedConnection {
     /// Destination connection ID
     public var destinationConnectionID: ConnectionID {
         state.withLock { $0.destinationConnectionID }
+    }
+
+    /// The destination connection ID sent in the client's first Initial packet.
+    var originalDestinationConnectionID: ConnectionID {
+        originalConnectionID
+    }
+
+    /// The QUIC version used by the packet that can trigger Version Negotiation.
+    var attemptedVersion: QUICVersion {
+        handler.version
     }
 
     /// Current handshake state

@@ -2,7 +2,7 @@
 ///
 /// The DER ECDSA signature schemes (``QUICDERSignatureP256`` /
 /// ``QUICDERSignatureP384``) bridge the protocol's borrowed `Span<UInt8>` surface
-/// into swift-crypto's `Data` / `[UInt8]` APIs. swift-p2p-crypto keeps its own
+/// into swift-crypto's `Data` / `[UInt8]` APIs. `swift-p2p-core/P2PCrypto` keeps its own
 /// equivalent extension *internal* to `P2PCrypto`, so QUICCrypto defines
 /// its own here to avoid depending on another module's internal symbol.
 ///

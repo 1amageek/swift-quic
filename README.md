@@ -2,12 +2,34 @@
 
 A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002), designed for the swift-libp2p networking stack. It is **Embedded-first**: the protocol logic lives in value-type, sans-IO core targets whose byte currency is `[UInt8]` / `Span`, with thin Foundation host adapters over them.
 
-> **Release status.** Current release: `1.3.3`. The host orchestrator (`QUICEndpoint` / `ManagedConnection` / `TimerManager`) is not yet rewired onto the cored `QUICConnectionEngine` (quic Slice B / M11 pending).
+> **Release status.** The canonical TLS path is implemented: live QUIC factories use
+> `swift-tls-sessions/QUICTLS` backed by `swift-ssl/SSLQUIC`. External peer
+> interoperability, sanitizer coverage, performance gates, and release dependency
+> pinning remain open.
+
+## Secure-transport boundary
+
+`swift-quic` owns QUIC
+> CRYPTO offsets and reassembly, transport parameters, packet/header protection,
+> key installation, packet-number spaces, recovery, congestion control, streams,
+> and datagram orchestration. TLS session semantics are consumed through
+> `swift-tls-sessions/QUICTLS`, whose canonical mechanism implementation is
+> `swift-ssl`.
+
+```text
+swift-libp2p -> swift-quic -> swift-tls-sessions / QUICTLS -> swift-ssl
+```
+
+QUIC no longer carries a TLS state machine. QUIC CRYPTO reassembly remains here,
+while handshake semantics are delegated to `swift-tls-sessions/QUICTLS`. See the
+[workspace secure-transport architecture](../../SECURE_TRANSPORT_ARCHITECTURE.md).
 
 ## Features
 
 - **RFC 9000/9001/9002 Compliant**: Full QUIC transport protocol implementation
-- **TLS 1.3 Integration**: Native TLS 1.3 handshake with certificate validation (via [swift-certificates](https://github.com/apple/swift-certificates))
+- **TLS 1.3 Integration**: QUIC TLS session semantics from `swift-tls-sessions`,
+  backed by the Pure Swift `swift-ssl/SSLQUIC` mechanism and certificate policy
+  from the swift-certificates fork
 - **Enforced Peer Authentication**: CertificateVerify signature is always verified; a server cannot skip Certificate/CertificateVerify, and Finished is accepted only after authentication completes (no unauthenticated/MITM channel)
 - **0-RTT Support**: Early data transmission with session resumption
 - **Connection Migration**: PATH_CHALLENGE/RESPONSE with address validation
@@ -24,7 +46,7 @@ A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002
 
 ## Requirements
 
-- Swift tools 6.2+
+- Swift 6.4 development snapshot `2026-07-23` (tools version `6.4`)
 - macOS 26+ / iOS 26+ / tvOS 26+ / watchOS 26+ / visionOS 26+
 
 ## Installation
@@ -33,7 +55,7 @@ Add swift-quic to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-quic.git", from: "1.3.3")
+    .package(url: "https://github.com/1amageek/swift-quic.git", from: "1.4.0")
 ]
 ```
 
@@ -41,14 +63,27 @@ dependencies: [
 
 swift-quic uses the following libraries:
 
-- [swift-crypto](https://github.com/apple/swift-crypto) (`3.12.3 ..< 5.0.0`) - Cryptographic operations
-- [swift-certificates](https://github.com/apple/swift-certificates) (`1.17.0+`) - X.509 certificate handling
-- [swift-asn1](https://github.com/apple/swift-asn1) (`1.5.0+`) - ASN.1 encoding/decoding
+- [swift-crypto](https://github.com/1amageek/swift-crypto) (`main`) - Cryptographic operations for Native, WASM, and Embedded
+- [swift-ssl](https://github.com/1amageek/swift-ssl) (`main`) - Pure Swift cryptography and TLS/QUIC mechanism owner
+- `swift-tls-sessions` (workspace package) - sans-I/O Stream/DTLS/QUIC TLS session contracts
+- [swift-certificates](https://github.com/1amageek/swift-certificates) (`main`) - X.509 certificate handling
+- [swift-asn1](https://github.com/1amageek/swift-asn1) (`main`) - ASN.1 encoding/decoding
 - [swift-log](https://github.com/apple/swift-log) (`1.9.0+`) - Logging
 - [swift-docc-plugin](https://github.com/swiftlang/swift-docc-plugin) (`1.4.3+`) - Documentation
-- swift-p2p-core - Embedded-clean byte primitives (`Bytes`/`ByteReader`/`ByteWriter`) + crypto seam
-- swift-p2p-crypto - Unified `DefaultCryptoProvider` (host swift-crypto / Embedded BoringSSL)
+- swift-p2p-core (`main`) - Embedded-clean byte primitives, crypto seam, and the unified `P2PCrypto.DefaultCryptoProvider`
 - swift-nio-udp - UDP transport
+
+## Migrating to 1.4
+
+- Version Negotiation packets are now rejected when their version list is not
+  aligned to 4-byte entries or when they contain the version attempted by the
+  client, as required by RFC 9000 section 6.2.
+- The endpoint validates Version Negotiation against the original Initial
+  destination connection ID and the actual attempted version.
+- `validateAndParseVersionNegotiation(...)` remains as a deprecated forwarding
+  shim. New code should call `offeredVersions(...)`.
+- Facade state uses the same `Synchronization.Mutex` contract on Native, WASM,
+  and Embedded targets.
 
 ## Quick Start
 
@@ -216,9 +251,11 @@ Value-type STREAM state machines over `[UInt8]` payloads (RFC 9000 §2-4):
 - **StreamReassemblyBuffer**: out-of-order reassembly
 - **FlowControllerCore**: connection + stream-level flow control
 
-#### QUICTLSCore
+#### Historical TLS sources (not an active target)
 
-TLS 1.3 (RFC 8446) handshake + key schedule generic over `C: CryptoProvider`:
+The former in-package TLS 1.3 handshake + key schedule sources are retained only
+for deletion audit. The active QUIC TLS implementation is
+`swift-tls-sessions/QUICTLS` over `swift-ssl/SSLQUIC`:
 
 - **TLSKeyScheduleCore**: early/handshake/master secrets, HKDF-Expand-Label, traffic secrets, finished/verify-data (RFC 8446 §7.1)
 - **TLSTranscriptHashCore**: incremental transcript hash
@@ -243,15 +280,16 @@ flow control, idle, path validation). Timers are clock-free: time is injected as
 `nowNanos: UInt64`, and `deadlines(nowNanos:)` / `handleTimeout(nowNanos:)` mirror
 the DTLS engine pattern. I/O is inverted to the facade, which owns the
 `DatagramTransport` + `AsyncTimer`. Crypto/cert are injected via typed-throws
-closures; X.509 stays out of the engine. **Status:** this is the substrate for the
-upcoming facade rewire — the host orchestrator (`QUICEndpoint` / `ManagedConnection`
-/ `TimerManager`) is **not yet rewired onto it** (quic Slice B / M11 pending).
+closures; X.509 stays out of the engine. **Status:** the portable `QUIC` product
+uses this engine through `QUICEngineConnection`; the Native host orchestrator
+retains its existing `QUICEndpoint` / `ManagedConnection` / `TimerManager` spine.
 
 ### Host Adapters
 
 ### QUIC
 
-High-level API for QUIC connections (host-only; not yet ported to a cored engine):
+High-level Native API for QUIC connections (the WASM / Embedded surface is the
+separate `[UInt8]` engine facade in the same `QUIC` product):
 
 - **QUICEndpoint**: Server and client endpoint management
 - **ManagedConnection**: High-level connection with async stream APIs
@@ -279,22 +317,19 @@ Foundation adapter over `QUICWire` + `QUICConnectionCore`. Restores the historic
 
 ### QUICCrypto
 
-Cryptographic operations (Foundation adapter over `QUICTLSCore` +
-`QUICPacketProtectionCore`, specialised at `C = QUICCryptoProvider`, the unified
-`DefaultCryptoProvider`):
+Packet protection and host-facing adapters (specialised at `C =
+QUICCryptoProvider`, the unified `DefaultCryptoProvider`). TLS handshake state
+is not owned by this target:
 
 - **InitialSecrets**: Initial key derivation (RFC 9001)
 - **KeyMaterial**: Encryption key management
 - **AEAD**: AES-128-GCM and ChaCha20-Poly1305 encryption (over `PacketProtector<C,A>`)
-- **HeaderProtection**: header protection routed through the `HeaderProtectionProvider` seam (`DefaultCryptoProvider`: host swift-crypto / Embedded BoringSSL)
+- **HeaderProtection**: header protection routed through the `HeaderProtectionProvider` seam and the common `DefaultCryptoProvider`
 - **KeyUpdate**: AEAD limit tracking and key rotation (RFC 9001 Section 6)
 - **RetryIntegrityTag**: Retry packet integrity verification (RFC 9001 Section 5.8)
-- **TLS13Handler**: Native TLS 1.3 handshake state machine
-- **SessionTicketStore**: Server-side session ticket management
+- **SwiftSSLQUICTLSProvider**: adapter to `swift-tls-sessions/QUICTLS` and
+  `swift-ssl/SSLQUIC`
 - **ClientSessionCache**: Client-side session resumption
-- **ReplayProtection**: 0-RTT replay attack prevention
-- **X509Certificate**: X.509 certificate handling (via [swift-certificates](https://github.com/apple/swift-certificates))
-- **X509Validator**: Certificate chain validation with EKU/SAN/NameConstraints
 
 ### QUICRecovery
 
@@ -544,8 +579,11 @@ Benchmarks measured on Apple Silicon (arm64-apple-macosx):
 Run benchmarks:
 
 ```bash
-SWIFT_QUIC_ENABLE_BENCHMARKS=1 swift test --filter QUICBenchmarks
-swift test --filter RecoveryBenchmarkTests
+SWIFT_QUIC_ENABLE_BENCHMARKS=1 xcodebuild test \
+  -scheme swift-quic-Package \
+  -destination 'platform=macOS' \
+  -only-testing:QUICBenchmarks \
+  -maximum-test-execution-time-allowance 60
 ```
 
 ## Testing
@@ -553,7 +591,10 @@ swift test --filter RecoveryBenchmarkTests
 Run all tests:
 
 ```bash
-swift test
+xcodebuild test \
+  -scheme swift-quic-Package \
+  -destination 'platform=macOS' \
+  -maximum-test-execution-time-allowance 60
 ```
 
 ### Interoperability Testing
@@ -569,7 +610,12 @@ Run interop tests (requires Docker):
 
 ```bash
 cd docker && docker compose up -d
-swift test --filter "QuinnInteropTests|Ngtcp2InteropTests"
+xcodebuild test \
+  -scheme swift-quic-Package \
+  -destination 'platform=macOS' \
+  -only-testing:QUICTests/QuinnInteropTests \
+  -only-testing:QUICTests/Ngtcp2InteropTests \
+  -maximum-test-execution-time-allowance 60
 ```
 
 ### Unit Tests
@@ -600,12 +646,16 @@ Coverage includes:
 Run specific test suites:
 
 ```bash
-swift test --filter QUICCoreTests      # Core types
-swift test --filter QUICCryptoTests    # Crypto operations
-swift test --filter QUICRecoveryTests  # Loss detection
-swift test --filter QUICStreamTests    # Stream management
-swift test --filter QUICTests          # Integration tests
-swift test --filter QUICBenchmarks     # Benchmarks
+xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
+  -only-testing:QUICCoreTests -maximum-test-execution-time-allowance 60
+xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
+  -only-testing:QUICCryptoTests -maximum-test-execution-time-allowance 60
+xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
+  -only-testing:QUICRecoveryTests -maximum-test-execution-time-allowance 60
+xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
+  -only-testing:QUICStreamTests -maximum-test-execution-time-allowance 60
+xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
+  -only-testing:QUICTests -maximum-test-execution-time-allowance 60
 ```
 
 ## Roadmap
@@ -646,8 +696,6 @@ swift test --filter QUICBenchmarks     # Benchmarks
   - [x] IdleTimeoutManager
 - [x] Phase 7: 0-RTT & Session Resumption
   - [x] ClientSessionCache for session tickets
-  - [x] SessionTicketStore for server-side
-  - [x] ReplayProtection for 0-RTT
   - [x] startWith0RTT() API
 - [x] Phase 8: Quality Improvements
   - [x] ECN support for congestion signaling
