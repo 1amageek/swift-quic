@@ -346,7 +346,14 @@ extension QUICConnectionEngine {
         let ordered = buffer.readAllContiguous()
         cryptoReassembly[level] = buffer
         if let ordered, !ordered.isEmpty {
-            output.handshakeData.append(HandshakeChunk(level: level, data: ordered))
+            var framer = cryptoMessageFraming[level] ?? QUICCryptoMessageFramer()
+            let messages = try framer.append(ordered)
+            cryptoMessageFraming[level] = framer
+            for message in messages {
+                output.handshakeData.append(
+                    HandshakeChunk(level: level, data: message)
+                )
+            }
         }
     }
 

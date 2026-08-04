@@ -39,6 +39,40 @@ struct CryptoBuffer: Sendable {
         mergeSegments()
     }
 
+    /// Checks retransmitted bytes before insertion.  A QUIC CRYPTO range may
+    /// overlap an existing range only when the bytes are identical.
+    func validateNoConflictingOverlap(
+        offset: UInt64,
+        data: Data
+    ) throws(CryptoStreamError) {
+        guard !data.isEmpty else { return }
+        let byteCount = UInt64(data.count)
+        guard offset <= UInt64.max - byteCount else {
+            throw CryptoStreamError.invalidOffset(offset)
+        }
+        let endOffset = offset + byteCount
+
+        for segment in segments {
+            let segmentEnd = segment.offset + UInt64(segment.data.count)
+            let overlapStart = max(offset, segment.offset)
+            let overlapEnd = min(endOffset, segmentEnd)
+            guard overlapStart < overlapEnd else { continue }
+
+            let overlapLength = Int(overlapEnd - overlapStart)
+            let incomingStart = Int(overlapStart - offset)
+            let existingStart = Int(overlapStart - segment.offset)
+            for index in 0..<overlapLength {
+                guard data[data.startIndex + incomingStart + index]
+                    == segment.data[segment.data.startIndex + existingStart + index]
+                else {
+                    throw CryptoStreamError.conflictingOverlap(
+                        offset: overlapStart + UInt64(index)
+                    )
+                }
+            }
+        }
+    }
+
     /// Merges overlapping and adjacent segments
     private mutating func mergeSegments() {
         guard segments.count > 1 else { return }

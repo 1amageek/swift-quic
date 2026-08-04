@@ -376,8 +376,8 @@ public final class QUICEngineConnection<
 
     // MARK: - Event draining (facade consumption)
 
-    /// Drains and returns any handshake CRYPTO chunks the peer delivered, for the
-    /// host TLS seam to consume.
+    /// Drains complete TLS handshake messages the peer delivered, for the host
+    /// TLS seam to consume one message at a time.
     public func takeHandshakeData() -> [HandshakeChunk] {
         events.withLock { e in
             let chunks = e.handshakeData

@@ -53,12 +53,12 @@ public final class CryptoStreamManager: Sendable {
         }
     }
 
-    /// Read available contiguous data for a level
+    /// Read one complete TLS handshake message for a level
     /// - Parameter level: The encryption level
     /// - Returns: Contiguous data if available, nil otherwise
-    public func read(at level: EncryptionLevel) -> Data? {
-        receiveStreams.withLock { streams in
-            streams[level]?.read()
+    public func read(at level: EncryptionLevel) throws -> Data? {
+        try receiveStreams.withLock { streams in
+            try streams[level]?.read()
         }
     }
 

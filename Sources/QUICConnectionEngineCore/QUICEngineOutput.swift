@@ -15,11 +15,9 @@ public struct QUICEngineOutput: Sendable {
     /// Fully protected datagrams to send to the peer, in order.
     public var datagramsToSend: [[UInt8]]
 
-    /// CRYPTO-stream bytes the peer delivered, grouped by encryption level, that
-    /// the facade must feed to its (async) TLS provider. The engine itself does
-    /// not run the async handshake — it reassembles ordered CRYPTO data and hands
-    /// it out so the host TLS seam (or a future cored handshake driver) consumes
-    /// it. Empty once the handshake is complete.
+    /// Complete, header-inclusive TLS handshake messages the peer delivered,
+    /// grouped by encryption level. The engine owns CRYPTO offsets and message
+    /// framing; the facade feeds one message at a time to its TLS provider.
     public var handshakeData: [HandshakeChunk]
 
     /// Stream IDs newly opened by the peer in this step (to be surfaced on the
@@ -71,7 +69,7 @@ public struct QUICEngineOutput: Sendable {
     }
 }
 
-/// Ordered CRYPTO-stream bytes at one encryption level (RFC 9001 §4).
+/// One complete TLS handshake message at one encryption level (RFC 9001 §4).
 public struct HandshakeChunk: Sendable, Equatable {
     public var level: EncryptionLevel
     public var data: [UInt8]

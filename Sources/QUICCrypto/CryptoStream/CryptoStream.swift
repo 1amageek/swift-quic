@@ -11,6 +11,10 @@ public enum CryptoStreamError: Error, Sendable {
     case bufferExceeded(currentSize: Int, maxSize: Int)
     /// Invalid offset (negative or overflow)
     case invalidOffset(UInt64)
+    /// A TLS handshake header declares a message larger than the policy limit.
+    case messageTooLarge(actual: Int, maximum: Int)
+    /// An overlapping range carried bytes different from data already received.
+    case conflictingOverlap(offset: UInt64)
 }
 
 /// Reassembles out-of-order CRYPTO frames for a single encryption level
@@ -45,15 +49,22 @@ public struct CryptoStream: Sendable {
     public mutating func receive(_ frame: CryptoFrame) throws {
         guard !frame.data.isEmpty else { return }
 
-        // Calculate end offset
-        let endOffset = frame.offset + UInt64(frame.data.count)
+        // Calculate end offset with overflow protection.
+        let byteCount = UInt64(frame.data.count)
+        guard frame.offset <= UInt64.max - byteCount else {
+            throw CryptoStreamError.invalidOffset(frame.offset)
+        }
+        let endOffset = frame.offset + byteCount
 
         // Check if this would exceed buffer limit
         // Buffer limit is measured from read offset to end of buffered data
-        if endOffset > readOffset + maxBufferSize {
+        let windowEnd = maxBufferSize > UInt64.max - readOffset
+            ? UInt64.max
+            : readOffset + maxBufferSize
+        if endOffset > windowEnd {
             throw CryptoStreamError.bufferExceeded(
                 currentSize: buffer.totalBytes,
-                maxSize: Int(maxBufferSize)
+                maxSize: maximumBufferSizeAsInt
             )
         }
 
@@ -75,23 +86,41 @@ public struct CryptoStream: Sendable {
         }
 
         // Insert into buffer
+        try buffer.validateNoConflictingOverlap(offset: insertOffset, data: dataToInsert)
         buffer.insert(offset: insertOffset, data: dataToInsert)
         totalReceived += UInt64(dataToInsert.count)
     }
 
-    /// Returns contiguous data available for reading from readOffset
-    /// - Returns: Data if contiguous bytes available, nil otherwise
-    public mutating func read() -> Data? {
+    /// Returns one complete TLS handshake message from readOffset.
+    ///
+    /// A partial header or body remains buffered and returns nil. The caller
+    /// therefore never has to hand an incomplete message to the TLS session.
+    public mutating func read() throws -> Data? {
         guard let data = buffer.readContiguous(from: readOffset) else {
             return nil
         }
 
+        guard data.count >= 4 else { return nil }
+        let bodyByteCount =
+            (Int(data[data.startIndex + 1]) << 16) |
+            (Int(data[data.startIndex + 2]) << 8) |
+            Int(data[data.startIndex + 3])
+        let messageByteCount = 4 + bodyByteCount
+        guard messageByteCount <= maximumBufferSizeAsInt else {
+            throw CryptoStreamError.messageTooLarge(
+                actual: messageByteCount,
+                maximum: maximumBufferSizeAsInt
+            )
+        }
+        guard data.count >= messageByteCount else { return nil }
+
         // Consume the data
-        let newOffset = readOffset + UInt64(data.count)
+        let message = Data(data.prefix(messageByteCount))
+        let newOffset = readOffset + UInt64(messageByteCount)
         buffer.consume(upTo: newOffset)
         readOffset = newOffset
 
-        return data
+        return message
     }
 
     /// Peek at next contiguous data without consuming
@@ -116,5 +145,11 @@ public struct CryptoStream: Sendable {
     /// The amount of buffered data not yet read
     public var bufferedBytes: Int {
         buffer.totalBytes
+    }
+
+    /// Converts the wire-independent UInt64 policy to the host `Int` domain
+    /// without trapping on a 32-bit or adversarially configured target.
+    private var maximumBufferSizeAsInt: Int {
+        maxBufferSize > UInt64(Int.max) ? Int.max : Int(maxBufferSize)
     }
 }

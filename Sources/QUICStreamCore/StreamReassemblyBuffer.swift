@@ -62,7 +62,10 @@ public struct StreamReassemblyBuffer: Sendable {
         }
         let endOffset = rawEndOffset
 
-        // Validate FIN consistency.
+        // Validate FIN consistency without mutating `finalSize`.  All checks are
+        // completed before the buffer state changes so a rejected frame is
+        // transactionally invisible to the caller.
+        var nextFinalSize = finalSize
         if fin {
             if let existingFinalSize = finalSize {
                 guard existingFinalSize == endOffset else {
@@ -82,12 +85,12 @@ public struct StreamReassemblyBuffer: Sendable {
                         )
                     }
                 }
-                finalSize = endOffset
+                nextFinalSize = endOffset
             }
         }
 
         // Check if data exceeds known final size.
-        if let knownFinalSize = finalSize {
+        if let knownFinalSize = nextFinalSize {
             guard endOffset <= knownFinalSize else {
                 throw DataBufferError.dataExceedsFinalSize(
                     finalSize: knownFinalSize,
@@ -97,10 +100,14 @@ public struct StreamReassemblyBuffer: Sendable {
         }
 
         // Don't insert empty data (FIN was already processed above).
-        guard !data.isEmpty else { return }
+        guard !data.isEmpty else {
+            finalSize = nextFinalSize
+            return
+        }
 
         // Skip data that's already been read.
         if endOffset <= readOffset {
+            finalSize = nextFinalSize
             return  // Already consumed
         }
 
@@ -116,13 +123,20 @@ public struct StreamReassemblyBuffer: Sendable {
             insertData = data
         }
 
+        // A retransmission may overlap an existing range only when every
+        // overlapping byte is identical.  Check this before the buffer
+        // changes; silently accepting a conflicting overlap would make the
+        // reassembled stream depend on packet arrival order.
+        try validateNoConflictingOverlap(insertOffset, insertData)
+
         // Check buffer overflow (using actual non-overlapping bytes).
         let actualNewBytes = calculateNonOverlappingBytes(insertOffset, insertData)
-        let newTotal = UInt64(totalBytes) + actualNewBytes
-        guard newTotal <= maxBufferSize else {
+        let (newTotal, totalOverflow) = UInt64(totalBytes).addingReportingOverflow(actualNewBytes)
+        guard !totalOverflow, newTotal <= maxBufferSize,
+              insertData.count <= Int.max - totalBytes else {
             throw DataBufferError.bufferOverflow(
                 maxSize: maxBufferSize,
-                requested: newTotal
+                requested: totalOverflow ? UInt64.max : newTotal
             )
         }
 
@@ -132,9 +146,38 @@ public struct StreamReassemblyBuffer: Sendable {
         // Insert the new segment.
         segments.insert((offset: insertOffset, data: insertData), at: insertIndex)
         totalBytes += insertData.count
+        finalSize = nextFinalSize
 
         // Merge overlapping and adjacent segments.
         mergeSegments()
+    }
+
+    /// Validates that every byte shared with an existing segment is identical.
+    ///
+    /// The stored segments are already range-validated, so converting an
+    /// overlap length to `Int` is safe because it is bounded by `data.count`.
+    private func validateNoConflictingOverlap(
+        _ offset: UInt64,
+        _ data: [UInt8]
+    ) throws(DataBufferError) {
+        guard !data.isEmpty else { return }
+        let endOffset = offset + UInt64(data.count)
+
+        for segment in segments {
+            let segmentEnd = segment.offset + UInt64(segment.data.count)
+            let overlapStart = max(offset, segment.offset)
+            let overlapEnd = min(endOffset, segmentEnd)
+            guard overlapStart < overlapEnd else { continue }
+
+            let overlapLength = Int(overlapEnd - overlapStart)
+            let incomingStart = Int(overlapStart - offset)
+            let existingStart = Int(overlapStart - segment.offset)
+            for index in 0..<overlapLength {
+                guard data[incomingStart + index] == segment.data[existingStart + index] else {
+                    throw DataBufferError.conflictingOverlap(offset: overlapStart + UInt64(index))
+                }
+            }
+        }
     }
 
     /// Finds the insertion index using binary search.

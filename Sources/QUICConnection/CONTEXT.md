@@ -31,7 +31,8 @@ live in the Embedded-clean `QUICConnectionCore` value types.
   after authentication completes (no unauthenticated/MITM channel).
 - **TLS output is acted on, not dropped.** `TLSOutput.keysAvailable` installs keys
   (with the cipher suite), `.handshakeComplete` advances to connected, `.error`
-  closes the connection. A `.handshakeData` output is queued for send at its level.
+  closes the connection. A `.handshakeData` output contains one complete TLS
+  handshake message at its encryption level.
 - **Transport-parameter ↔ Connection-ID cross-validation (RFC 9000 §7.3):**
   `initial_source_connection_id` / `original_destination_connection_id` /
   `retry_source_connection_id` are checked against the CIDs observed during the

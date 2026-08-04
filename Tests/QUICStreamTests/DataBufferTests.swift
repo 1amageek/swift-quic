@@ -95,6 +95,26 @@ struct DataBufferTests {
         #expect(buffer.segmentCount == 1)
     }
 
+    @Test("Rejects conflicting overlapping bytes without mutating state")
+    func conflictingOverlapThrowsTransactionally() throws {
+        var buffer = DataBuffer()
+        try buffer.insert(offset: 0, data: Data([0x01, 0x02, 0x03]), fin: false)
+
+        do {
+            try buffer.insert(offset: 1, data: Data([0x09, 0x03]), fin: false)
+            Issue.record("conflicting overlap was accepted")
+        } catch let error as DataBufferError {
+            guard case .conflictingOverlap(offset: 1) = error else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+        }
+
+        #expect(buffer.totalBytes == 3)
+        #expect(buffer.segmentCount == 1)
+        #expect(buffer.readContiguous() == Data([0x01, 0x02, 0x03]))
+    }
+
     // MARK: - Read Tests
 
     @Test("Read contiguous data")

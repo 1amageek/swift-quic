@@ -17,6 +17,13 @@ public enum DataBufferError: Error, Sendable {
     /// The computed end offset (offset + length) overflows or exceeds 2^62-1
     /// (RFC 9000 §4.5 — final offset bound).
     case finalOffsetOutOfRange(offset: UInt64, length: UInt64)
+    /// An overlapping range carried bytes different from data already received.
+    ///
+    /// QUIC retransmission is allowed to repeat a range, but the bytes for an
+    /// already received offset are immutable.  The offset identifies the first
+    /// conflicting byte so the connection layer can map this to a protocol
+    /// violation without mutating the buffer.
+    case conflictingOverlap(offset: UInt64)
 }
 
 /// Errors for stream send/receive operations.

@@ -82,9 +82,10 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
 
     // MARK: - Connection-level flow / handshake
 
-    /// Reassembled, ordered CRYPTO data per level, ready to hand to the facade's
-    /// TLS seam. Offsets enforced by per-level reassembly buffers.
+    /// Reassembled CRYPTO offsets per level. The companion message framers
+    /// retain partial TLS headers/bodies and emit only complete messages.
     var cryptoReassembly: [EncryptionLevel: StreamReassemblyBuffer] = [:]
+    var cryptoMessageFraming: [EncryptionLevel: QUICCryptoMessageFramer] = [:]
     /// Outbound CRYPTO send offset per level (for framing handshake bytes we send).
     var cryptoSendOffset: [EncryptionLevel: UInt64] = [:]
     /// Queued CRYPTO bytes awaiting framing per level.

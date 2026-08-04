@@ -521,8 +521,10 @@ public final class QUICConnectionHandler: Sendable {
         // Buffer the crypto data
         try cryptoStreamManager.receive(cryptoFrame, at: level)
 
-        // Try to read complete data
-        if let data = cryptoStreamManager.read(at: level) {
+        // Drain every complete TLS handshake message now available. Partial
+        // headers/bodies remain owned by the QUIC CRYPTO stream until the next
+        // frame arrives; TLS never sees an incomplete message.
+        while let data = try cryptoStreamManager.read(at: level) {
             result.cryptoData.append((level, data))
         }
     }
