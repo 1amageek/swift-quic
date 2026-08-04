@@ -218,30 +218,6 @@ public struct VersionNegotiator: Sendable {
         )
     }
 
-    /// Compatibility validation for callers of the original API.
-    ///
-    /// This validates packet format and connection IDs, but cannot perform RFC 9000
-    /// §6.2 attempted-version spoofing protection because the original API did not
-    /// receive the version used in the triggering packet. New code must call
-    /// ``offeredVersions(inVersionNegotiationPacket:originalDCID:originalSCID:attemptedVersion:)``.
-    @available(
-        *,
-        deprecated,
-        message: "Use offeredVersions(inVersionNegotiationPacket:originalDCID:originalSCID:attemptedVersion:)"
-    )
-    public static func validateAndParseVersionNegotiation(
-        _ data: Data,
-        originalDCID: ConnectionID,
-        originalSCID: ConnectionID
-    ) throws(QUICVersionError) -> [QUICVersion] {
-        try validatedVersions(
-            inVersionNegotiationPacket: data,
-            originalDCID: originalDCID,
-            originalSCID: originalSCID,
-            attemptedVersion: nil
-        )
-    }
-
     private static func validatedVersions(
         inVersionNegotiationPacket data: Data,
         originalDCID: ConnectionID,

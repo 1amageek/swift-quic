@@ -305,7 +305,7 @@ struct KeyUpdateCipherSuiteTests {
 
     @Test("Key update under ChaCha20-Poly1305 produces usable keys (round-trip)")
     func chaCha20KeyUpdateRoundTrips() throws {
-        var schedule = try makeSchedule(cipherSuite: .chacha20Poly1305Sha256)
+        let schedule = try makeSchedule(cipherSuite: .chacha20Poly1305Sha256)
 
         // Build a KeyPhaseManager seeded with the current application keys (client perspective).
         let clientKeysBefore = try #require(schedule.clientKeyMaterial(for: .application))
@@ -344,7 +344,7 @@ struct KeyUpdateCipherSuiteTests {
         let cipherSuite: QUICCipherSuite = .chacha20Poly1305Sha256
 
         // Server's KeyPhaseManager seeded with current keys.
-        var serverSchedule = try makeSchedule(cipherSuite: cipherSuite)
+        let serverSchedule = try makeSchedule(cipherSuite: cipherSuite)
         let serverClientKeys = try #require(serverSchedule.clientKeyMaterial(for: .application))
         let serverServerKeys = try #require(serverSchedule.serverKeyMaterial(for: .application))
         let (serverOpener, _) = try serverClientKeys.createCrypto()   // server reads client keys

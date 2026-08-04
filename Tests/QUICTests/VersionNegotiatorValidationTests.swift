@@ -102,25 +102,6 @@ struct VersionNegotiatorValidationTests {
         }
     }
 
-    @Test("Deprecated validation shim remains directly callable")
-    func deprecatedValidationShim() throws {
-        let fixture = try Fixture()
-        let versions = [fixture.attemptedVersion, QUICVersion.v1]
-        let packet = Self.packet(
-            destinationCIDBytes: fixture.originalSCID.bytes,
-            sourceCIDBytes: fixture.originalDCID.bytes,
-            versions: versions
-        )
-
-        let offered = try VersionNegotiator.validateAndParseVersionNegotiation(
-            packet,
-            originalDCID: fixture.originalDCID,
-            originalSCID: fixture.originalSCID
-        )
-
-        #expect(offered == versions)
-    }
-
     private struct Fixture {
         let originalDCID: ConnectionID
         let originalSCID: ConnectionID
