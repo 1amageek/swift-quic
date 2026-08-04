@@ -142,20 +142,18 @@ let package = Package(
     ],
     dependencies: [
         // Canonical session contracts over the Pure Swift swift-ssl mechanism.
-        // This local reference is for the workspace migration; release manifests
-        // must use the tagged repository URL before publishing.
-        .package(name: "swift-tls-sessions", path: "../swift-tls"),
-        .package(name: "swift-p2p-core", path: "../swift-p2p-core"),
-        .package(name: "swift-ssl", path: "../../swift-ssl"),
+        .package(name: "swift-tls-sessions", url: "https://github.com/1amageek/swift-tls.git", branch: "main"),
+        .package(name: "swift-p2p-core", url: "https://github.com/1amageek/swift-p2p-core.git", branch: "main"),
+        .package(name: "swift-ssl", url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
         // UDP transport
         .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
 
         // One cryptography implementation repository across Native, WASM, and Embedded.
-        .package(name: "swift-crypto", path: "../../swift-crypto"),
+        .package(name: "swift-crypto", url: "https://github.com/1amageek/swift-crypto.git", branch: "main"),
 
         // X.509 Certificates and ASN.1
-        .package(name: "swift-certificates", path: "../../swift-certificates"),
-        .package(name: "swift-asn1", path: "../../swift-asn1"),
+        .package(name: "swift-certificates", url: "https://github.com/1amageek/swift-certificates.git", branch: "main"),
+        .package(name: "swift-asn1", url: "https://github.com/1amageek/swift-asn1.git", branch: "main"),
 
         // Logging
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
