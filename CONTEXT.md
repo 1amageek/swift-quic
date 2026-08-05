@@ -15,7 +15,7 @@ is no backward-compatibility obligation to the old `Data` API inside a core.
   parameters, packet/header protection, key installation, packet-number spaces,
   recovery, congestion control, streams, and datagram orchestration.
 - The target handshake dependency is
-  `swift-quic -> swift-tls-sessions/QUICTLS -> swift-ssl`. `swift-tls-sessions`
+  `swift-quic -> swift-tls/QUICTLS -> swift-ssl`. `swift-tls`
   owns the public QUIC TLS session contract; `swift-ssl` owns the TLS 1.3 transcript, key
   schedule, handshake messages, authentication mechanisms, and emitted traffic
   secrets.

@@ -87,7 +87,7 @@ the crypto seam), and the host (Foundation) modules are thin adapters over them.
   which replaced the old `any PacketOpener`/`any PacketSealer` existentials.
 
 > **IMPORTANT — current status.** The canonical TLS path is implemented. Live
-> host and Embedded-capable QUIC factories use `swift-tls-sessions/QUICTLS`
+> host and Embedded-capable QUIC factories use `swift-tls/QUICTLS`
 > backed by `swift-ssl/SSLQUIC`; the former in-package TLS implementation and
 > its obsolete integration tests have been removed. The host orchestrator
 > remains a host adapter over the cored protocol state, while the portable
@@ -467,7 +467,7 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 
 ### Phase 3: TLS 1.3 Integration (canonical provider implemented)
 - [x] `TLS13Provider` host contract backed by `SwiftSSLQUICTLSProvider`
-- [x] Full TLS 1.3 state machine through `swift-tls-sessions/QUICTLS` and
+- [x] Full TLS 1.3 state machine through `swift-tls/QUICTLS` and
       `swift-ssl/SSLQUIC` (ClientHello → Finished)
 - [x] X.509 certificate validation
   - [x] EKU (Extended Key Usage)
@@ -517,7 +517,7 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] QUICPacketProtectionCore (PacketProtector<C,A> / SuiteProtector<C>)
 - [x] QUICRecoveryCore (CUBIC + NewReno + pacing)
 - [x] QUICStreamCore (Send/Receive FSMs + reassembly + flow control)
-- [x] `swift-tls-sessions/QUICTLS` adapter over `swift-ssl/SSLQUIC`
+- [x] `swift-tls/QUICTLS` adapter over `swift-ssl/SSLQUIC`
 - [x] QUICConnectionCore (DPLPMTUD + transport-params codec + packet parse/serialize)
 - [x] Crypto unified on DefaultCryptoProvider (QUICFoundationProvider deleted)
 - [x] Tagged release of the cores (milestone "M8")
@@ -536,7 +536,7 @@ dependencies: [
     .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
 
     // Public session contracts and Pure Swift TLS mechanism.
-    .package(url: "https://github.com/1amageek/swift-tls-sessions.git", branch: "main"),
+    .package(url: "https://github.com/1amageek/swift-tls.git", branch: "main"),
     .package(url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
 
     // Cryptography shared by Native, WASM, and Embedded.

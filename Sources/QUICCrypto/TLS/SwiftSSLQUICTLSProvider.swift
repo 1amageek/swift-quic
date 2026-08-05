@@ -1,4 +1,4 @@
-/// Adapter from the canonical `swift-tls-sessions/QUICTLS` contract to QUIC's
+/// Adapter from the canonical `swift-tls/QUICTLS` contract to QUIC's
 /// transport-facing provider protocol. QUIC owns CRYPTO offsets and reassembly;
 /// this adapter accepts exactly one complete handshake message.
 import Foundation

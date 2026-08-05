@@ -22,7 +22,7 @@ adapter that specialises them at `C = QUICCryptoProvider` (the unified
   `PacketProtector<C, A>`), not `any PacketOpener` / `any PacketSealer`. It is the
   thing that replaced those existentials.
 - **The negotiated cipher suite MUST propagate from TLS to packet protection.**
-  The `swift-tls-sessions/QUICTLS` adapter puts it in `TLSOutput.keysAvailable`;
+  The `swift-tls/QUICTLS` adapter puts it in `TLSOutput.keysAvailable`;
   key derivation must be
   called WITH that suite, and the protector chosen via the factory. Never default
   to AES-128-GCM when a suite is available — it silently breaks ChaCha20-Poly1305.

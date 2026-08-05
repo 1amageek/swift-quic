@@ -3,7 +3,7 @@
 A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002), designed for the swift-libp2p networking stack. It is **Embedded-first**: the protocol logic lives in value-type, sans-IO core targets whose byte currency is `[UInt8]` / `Span`, with thin Foundation host adapters over them.
 
 > **Release status.** The canonical TLS path is implemented: live QUIC factories use
-> `swift-tls-sessions/QUICTLS` backed by `swift-ssl/SSLQUIC`. External peer
+> `swift-tls/QUICTLS` backed by `swift-ssl/SSLQUIC`. External peer
 > interoperability, sanitizer coverage, performance gates, and release dependency
 > pinning remain open.
 
@@ -13,21 +13,21 @@ A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002
 > CRYPTO offsets and reassembly, transport parameters, packet/header protection,
 > key installation, packet-number spaces, recovery, congestion control, streams,
 > and datagram orchestration. TLS session semantics are consumed through
-> `swift-tls-sessions/QUICTLS`, whose canonical mechanism implementation is
+> `swift-tls/QUICTLS`, whose canonical mechanism implementation is
 > `swift-ssl`.
 
 ```text
-swift-libp2p -> swift-quic -> swift-tls-sessions / QUICTLS -> swift-ssl
+swift-libp2p -> swift-quic -> swift-tls / QUICTLS -> swift-ssl
 ```
 
 QUIC no longer carries a TLS state machine. QUIC CRYPTO reassembly remains here,
-while handshake semantics are delegated to `swift-tls-sessions/QUICTLS`. See the
+while handshake semantics are delegated to `swift-tls/QUICTLS`. See the
 [workspace secure-transport architecture](../../SECURE_TRANSPORT_ARCHITECTURE.md).
 
 ## Features
 
 - **RFC 9000/9001/9002 Compliant**: Full QUIC transport protocol implementation
-- **TLS 1.3 Integration**: QUIC TLS session semantics from `swift-tls-sessions`,
+- **TLS 1.3 Integration**: QUIC TLS session semantics from `swift-tls`,
   backed by the Pure Swift `swift-ssl/SSLQUIC` mechanism and certificate policy
   from the swift-certificates fork
 - **Enforced Peer Authentication**: CertificateVerify signature is always verified; a server cannot skip Certificate/CertificateVerify, and Finished is accepted only after authentication completes (no unauthenticated/MITM channel)
@@ -65,7 +65,7 @@ swift-quic uses the following libraries:
 
 - [swift-crypto](https://github.com/1amageek/swift-crypto) (`main`) - Cryptographic operations for Native, WASM, and Embedded
 - [swift-ssl](https://github.com/1amageek/swift-ssl) (`main`) - Pure Swift cryptography and TLS/QUIC mechanism owner
-- `swift-tls-sessions` (workspace package) - sans-I/O Stream/DTLS/QUIC TLS session contracts
+- `swift-tls` (workspace package) - sans-I/O Stream/DTLS/QUIC TLS session contracts
 - [swift-certificates](https://github.com/1amageek/swift-certificates) (`main`) - X.509 certificate handling
 - [swift-asn1](https://github.com/1amageek/swift-asn1) (`main`) - ASN.1 encoding/decoding
 - [swift-log](https://github.com/apple/swift-log) (`1.9.0+`) - Logging
@@ -255,7 +255,7 @@ Value-type STREAM state machines over `[UInt8]` payloads (RFC 9000 §2-4):
 
 The former in-package TLS 1.3 handshake + key schedule sources are retained only
 for deletion audit. The active QUIC TLS implementation is
-`swift-tls-sessions/QUICTLS` over `swift-ssl/SSLQUIC`:
+`swift-tls/QUICTLS` over `swift-ssl/SSLQUIC`:
 
 - **TLSKeyScheduleCore**: early/handshake/master secrets, HKDF-Expand-Label, traffic secrets, finished/verify-data (RFC 8446 §7.1)
 - **TLSTranscriptHashCore**: incremental transcript hash
@@ -327,7 +327,7 @@ is not owned by this target:
 - **HeaderProtection**: header protection routed through the `HeaderProtectionProvider` seam and the common `DefaultCryptoProvider`
 - **KeyUpdate**: AEAD limit tracking and key rotation (RFC 9001 Section 6)
 - **RetryIntegrityTag**: Retry packet integrity verification (RFC 9001 Section 5.8)
-- **SwiftSSLQUICTLSProvider**: adapter to `swift-tls-sessions/QUICTLS` and
+- **SwiftSSLQUICTLSProvider**: adapter to `swift-tls/QUICTLS` and
   `swift-ssl/SSLQUIC`
 - **ClientSessionCache**: Client-side session resumption
 

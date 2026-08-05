@@ -142,7 +142,7 @@ let package = Package(
     ],
     dependencies: [
         // Canonical session contracts over the Pure Swift swift-ssl mechanism.
-        .package(name: "swift-tls-sessions", url: "https://github.com/1amageek/swift-tls-sessions.git", branch: "main"),
+        .package(url: "https://github.com/1amageek/swift-tls.git", branch: "main"),
         .package(name: "swift-p2p-core", url: "https://github.com/1amageek/swift-p2p-core.git", branch: "main"),
         .package(name: "swift-ssl", url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
         // UDP transport
@@ -317,7 +317,7 @@ let package = Package(
                 "QUICCore",
                 "QUICConnectionCore",
                 "QUICPacketProtectionCore",
-                .product(name: "QUICTLS", package: "swift-tls-sessions"),
+                .product(name: "QUICTLS", package: "swift-tls"),
                 // Unified provider: the host adapter specialises every generic
                 // engine at C = DefaultCryptoProvider,
                 // replacing the deleted QUICFoundationProvider.

@@ -2,7 +2,7 @@
 ///
 /// QUIC owns CRYPTO stream offsets, message reassembly, packet protection and
 /// transport parameters. The TLS 1.3 protocol state machine is owned by
-/// `swift-tls-sessions` and ultimately `swift-ssl`; this module only defines the
+/// `swift-tls` and ultimately `swift-ssl`; this module only defines the
 /// narrow adapter contract used by the QUIC host orchestrator.
 
 import Foundation
