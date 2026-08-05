@@ -88,13 +88,13 @@ the crypto seam), and the host (Foundation) modules are thin adapters over them.
 
 > **IMPORTANT — current status.** The canonical TLS path is implemented. Live
 > host and Embedded-capable QUIC factories use `swift-tls-sessions/QUICTLS`
-> backed by `swift-ssl/SSLQUIC`; the historical `QUICTLSCore` and
-> `TLS13Handler` sources are excluded from active targets and are deletion
-> candidates. The host orchestrator remains a host adapter over the cored
-> protocol state, while the portable `QUIC` product uses the Embedded-clean
-> engine path. External peer interoperability, sanitizer coverage, performance
-> gates, and release dependency pinning remain open. Testing mode must not be
-> used as a production TLS backend.
+> backed by `swift-ssl/SSLQUIC`; the former in-package TLS implementation and
+> its obsolete integration tests have been removed. The host orchestrator
+> remains a host adapter over the cored protocol state, while the portable
+> `QUIC` product uses the Embedded-clean engine path. External peer
+> interoperability, sanitizer coverage, performance gates, and release
+> dependency pinning remain open. Testing mode must not be used as a production
+> TLS backend.
 
 ## Module Structure
 
@@ -134,9 +134,6 @@ swift-quic/
 │   │   ├── ReceiveStreamCore.swift     # receive FSM
 │   │   ├── StreamReassemblyBuffer.swift
 │   │   └── FlowControllerCore.swift
-│   │
-│   ├── QUICTLSCore/             # Historical TLS sources; excluded from active targets
-│   │   └── ...                         # canonical mechanism now lives in swift-ssl/SSLQUIC
 │   │
 │   ├── QUICConnectionCore/      # Embedded-clean connection state machines (dual-build)
 │   │   ├── PathMTUSearchCore.swift     # DPLPMTUD (RFC 8899 / RFC 9000 §14)
@@ -192,7 +189,7 @@ swift-quic/
 │
 └── Tests/
     ├── QUICCoreTests/
-    ├── QUICCryptoTests/      # also exercises QUICPacketProtectionCore + QUICTLSCore
+    ├── QUICCryptoTests/      # also exercises QUICPacketProtectionCore
     ├── QUICRecoveryTests/
     ├── QUICStreamTests/
     ├── QUICTests/           # integration

@@ -463,19 +463,7 @@ let package = Package(
         .testTarget(
             name: "QUICTests",
             dependencies: ["QUIC", "QUICRecovery", "QUICTransport"],
-            path: "Tests/QUICTests",
-            exclude: [
-                // These suites exercise the removed in-package TLS state
-                // machine or the removed built-in mock provider. Canonical
-                // handshake coverage lives with swift-ssl/QUICTLS.
-                "TLSIntegrationTests.swift",
-                "PathMTUDiscoveryRFCTests.swift",
-                "ConnectionIDExchangeRFCTests.swift",
-                "DatagramRFCTests.swift",
-                "EndpointTests.swift",
-                "CongestionControlAndPacingTests.swift",
-                "Interop",
-            ]
+            path: "Tests/QUICTests"
         ),
 
         // Seam-driven engine driver (quic Slice B): exercises QUICEngineConnection

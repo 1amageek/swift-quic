@@ -19,8 +19,9 @@ is no backward-compatibility obligation to the old `Data` API inside a core.
   owns the public QUIC TLS session contract; `swift-ssl` owns the TLS 1.3 transcript, key
   schedule, handshake messages, authentication mechanisms, and emitted traffic
   secrets.
-- The removed `QUICTLSCore` and `TLS13Handler` files are historical sources only;
-  they are not package targets and have no active consumer.
+- The former `QUICTLSCore` and `TLS13Handler` implementation and test sources
+  have been removed. There is no compatibility target or active consumer for
+  that design.
 - Moving the TLS state machine must not move CRYPTO frame offset handling or
   reassembly out of `swift-quic`.
 
