@@ -142,7 +142,7 @@ let package = Package(
     ],
     dependencies: [
         // Canonical session contracts over the Pure Swift swift-ssl mechanism.
-        .package(name: "swift-tls-sessions", url: "https://github.com/1amageek/swift-tls.git", branch: "main"),
+        .package(name: "swift-tls-sessions", url: "https://github.com/1amageek/swift-tls-sessions.git", branch: "main"),
         .package(name: "swift-p2p-core", url: "https://github.com/1amageek/swift-p2p-core.git", branch: "main"),
         .package(name: "swift-ssl", url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
         // UDP transport

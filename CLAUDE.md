@@ -536,7 +536,7 @@ dependencies: [
     .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
 
     // Public session contracts and Pure Swift TLS mechanism.
-    .package(url: "https://github.com/1amageek/swift-tls.git", branch: "main"),
+    .package(url: "https://github.com/1amageek/swift-tls-sessions.git", branch: "main"),
     .package(url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
 
     // Cryptography shared by Native, WASM, and Embedded.
