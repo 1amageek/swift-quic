@@ -285,6 +285,16 @@ public struct StreamReassemblyBuffer: Sendable {
         return first.data
     }
 
+    /// Peeks at no more than `maximumCount` contiguous bytes without consuming.
+    public func peekContiguous(maximumCount: Int) -> [UInt8]? {
+        guard maximumCount > 0,
+              let first = segments.first,
+              first.offset == readOffset else {
+            return nil
+        }
+        return Array(first.data.prefix(maximumCount))
+    }
+
     /// Reads all available contiguous data (may span multiple merged segments).
     /// - Returns: All contiguous data available, or nil if none.
     public mutating func readAllContiguous() -> [UInt8]? {
@@ -303,6 +313,32 @@ public struct StreamReassemblyBuffer: Sendable {
 
         totalBytes -= result.count
         return result.isEmpty ? nil : result
+    }
+
+    /// Reads at most `maximumCount` contiguous bytes from the current read offset.
+    ///
+    /// Partial-delivery resets use this to expose exactly the reliable prefix
+    /// without leaking bytes beyond the peer's declared reliable size.
+    public mutating func readContiguous(maximumCount: Int) -> [UInt8]? {
+        guard maximumCount > 0,
+              let first = segments.first,
+              first.offset == readOffset else {
+            return nil
+        }
+
+        let count = min(maximumCount, first.data.count)
+        let result = Array(first.data.prefix(count))
+        if count == first.data.count {
+            segments.removeFirst()
+        } else {
+            segments[0] = (
+                offset: first.offset + UInt64(count),
+                data: Array(first.data.dropFirst(count))
+            )
+        }
+        totalBytes -= count
+        readOffset += UInt64(count)
+        return result
     }
 
     /// Whether there is a gap at the current read position.
@@ -360,6 +396,13 @@ public struct StreamReassemblyBuffer: Sendable {
         segments.removeAll()
         totalBytes = 0
         readOffset = 0
+        finalSize = nil
+    }
+
+    /// Discards unread bytes while preserving the amount already consumed.
+    public mutating func discardUnread() {
+        segments.removeAll()
+        totalBytes = 0
         finalSize = nil
     }
 }

@@ -514,9 +514,8 @@ public final class SwiftSSLQUICTLSProvider: TLS13Provider, Sendable {
                     )
                 }
             case .trafficSecret(let event):
-                let secret = event.withBorrowedSecret { bytes in
-                    SymmetricKey(data: Self.data(bytes))
-                }
+                let secretData = event.withBorrowedSecret { Self.data($0) }
+                let secret = SymmetricKey(data: secretData)
                 let clientSecret: SymmetricKey?
                 let serverSecret: SymmetricKey?
                 if (Self.sessionIsClient(state.session) && event.direction == .write)

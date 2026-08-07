@@ -39,6 +39,44 @@ extension QUICConnectionEngine {
         streams.sendStreams[id] = send
     }
 
+    /// Abruptly resets a stream's send side.
+    public mutating func resetStream(
+        _ id: UInt64,
+        errorCode: UInt64
+    ) throws(QUICEngineError) {
+        guard var send = streams.sendStreams[id] else {
+            throw .invalidState("reset unknown or receive-only stream \(id)")
+        }
+        guard let frame = send.generateResetStream(errorCode: errorCode) else {
+            throw .invalidState("stream \(id) reset already sent")
+        }
+        streams.sendStreams[id] = send
+        pendingFrames[.application, default: []].append(.resetStream(frame))
+    }
+
+    /// Resets a stream after reliably delivering its prefix through `reliableSize`.
+    public mutating func resetStreamAt(
+        _ id: UInt64,
+        errorCode: UInt64,
+        reliableSize: UInt64
+    ) throws(QUICEngineError) {
+        guard peerEnableResetStreamAt else {
+            throw .invalidState("peer did not advertise RESET_STREAM_AT")
+        }
+        guard var send = streams.sendStreams[id] else {
+            throw .invalidState("partial reset of unknown or receive-only stream \(id)")
+        }
+        do {
+            try send.requestResetStreamAt(
+                errorCode: errorCode,
+                reliableSize: reliableSize
+            )
+        } catch {
+            throw .stream(error)
+        }
+        streams.sendStreams[id] = send
+    }
+
     /// Drains contiguous received bytes from a stream's receive buffer.
     public mutating func readStream(_ id: UInt64) -> [UInt8]? {
         guard var recv = streams.receiveStreams[id] else { return nil }
@@ -97,6 +135,7 @@ extension QUICConnectionEngine {
         streams.peerInitialMaxStreamDataBidiRemote = tp.initialMaxStreamDataBidiRemote
         streams.peerInitialMaxStreamDataUni = tp.initialMaxStreamDataUni
         peerMaxDatagramFrameSize = tp.maxDatagramFrameSize
+        peerEnableResetStreamAt = tp.enableResetStreamAt
         peerAckDelayExponent = Self.boundedAckDelayExponent(tp.ackDelayExponent)
         peerMaxAckDelayNanos = Self.millisecondsToNanos(tp.maxAckDelay)
     }
@@ -169,9 +208,13 @@ extension QUICConnectionEngine {
                 frameType: close.frameType,
                 reasonPhrase: String(decoding: close.reasonPhrase, as: UTF8.self),
                 isApplicationError: close.isApplicationError))
-            if let dgram = try buildDatagram(level: level, frames: [frame], nowNanos: nowNanos, padInitial: false) {
-                output.datagramsToSend.append(dgram)
-            }
+            guard let dgram = try buildDatagram(
+                level: level,
+                frames: [frame],
+                nowNanos: nowNanos,
+                padInitial: false
+            ) else { return }
+            output.datagramsToSend.append(dgram)
             status = .closed
             pendingClose = nil
             return
@@ -194,7 +237,7 @@ extension QUICConnectionEngine {
     // MARK: - Frame collection
 
     private mutating func collectFrames(for level: EncryptionLevel, nowNanos: UInt64) throws(QUICEngineError) -> [Frame] {
-        var frames: [Frame] = []
+        var frames = pendingFrames.removeValue(forKey: level) ?? []
 
         // 0) PTO probe (RFC 9002 §6.2.4): an ack-eliciting PING.
         if pendingPing[level] == true {
@@ -279,6 +322,9 @@ extension QUICConnectionEngine {
                 streams.flowController.recordBytesSent(n)
                 connectionBudget = connectionBudget >= n ? connectionBudget - n : 0
             }
+            if let partialReset = send.generateResetStreamAt() {
+                frames.append(.resetStreamAt(partialReset))
+            }
             streams.sendStreams[id] = send
         }
     }
@@ -295,16 +341,30 @@ extension QUICConnectionEngine {
         padInitial: Bool
     ) throws(QUICEngineError) -> [UInt8]? {
         let protector: SuiteProtector<C>
-        do { protector = try keys.writeProtector(for: level) } catch { throw error }
+        do {
+            protector = try keys.writeProtector(for: level)
+        } catch {
+            queueUnsentFrames(frames, level: level)
+            throw error
+        }
 
         let pn: UInt64
         switch level {
         case .initial:
-            do { pn = try initialSpace.takeNextPacketNumber() } catch { throw error }
+            do { pn = try initialSpace.takeNextPacketNumber() } catch {
+                queueUnsentFrames(frames, level: level)
+                throw error
+            }
         case .handshake:
-            do { pn = try handshakeSpace.takeNextPacketNumber() } catch { throw error }
+            do { pn = try handshakeSpace.takeNextPacketNumber() } catch {
+                queueUnsentFrames(frames, level: level)
+                throw error
+            }
         case .zeroRTT, .application:
-            do { pn = try applicationSpace.takeNextPacketNumber() } catch { throw error }
+            do { pn = try applicationSpace.takeNextPacketNumber() } catch {
+                queueUnsentFrames(frames, level: level)
+                throw error
+            }
         }
 
         let ackEliciting = frames.contains { isAckElicitingOut($0) }
@@ -322,7 +382,11 @@ extension QUICConnectionEngine {
                 datagram = try PacketParsingCore.serializeShortHeaderPacket(
                     frames: frames, header: header, packetNumber: pn, protector: protector,
                     maxPacketSize: config.maxDatagramSize)
-            } catch { throw .packetParsing(error) }
+            } catch {
+                withSpace(level) { $0.nextPacketNumber = pn }
+                queueUnsentFrames(frames, level: level)
+                throw .packetParsing(error)
+            }
         } else {
             let packetType: PacketType = (level == .initial) ? .initial : .handshake
             let header = LongHeader(
@@ -337,7 +401,11 @@ extension QUICConnectionEngine {
                 datagram = try PacketParsingCore.serializeLongHeaderPacket(
                     frames: frames, header: header, packetNumber: pn, protector: protector,
                     maxPacketSize: config.maxDatagramSize, padToMinimum: padInitial)
-            } catch { throw .packetParsing(error) }
+            } catch {
+                withSpace(level) { $0.nextPacketNumber = pn }
+                queueUnsentFrames(frames, level: level)
+                throw .packetParsing(error)
+            }
         }
 
         // Anti-amplification gate (RFC 9000 §8.1): a server may not send more than
@@ -345,6 +413,7 @@ extension QUICConnectionEngine {
         guard antiAmplification.canSend(bytes: UInt64(datagram.count)) else {
             // Roll back the packet number we consumed so it is not skipped.
             withSpace(level) { $0.nextPacketNumber = pn }
+            queueUnsentFrames(frames, level: level)
             return nil
         }
         antiAmplification.recordBytesSent(UInt64(datagram.count))
@@ -354,6 +423,13 @@ extension QUICConnectionEngine {
             packetNumber: pn, timeSentNanos: nowNanos, sentBytes: datagram.count,
             inFlight: inFlight, ackEliciting: ackEliciting)
         withSpace(level) { $0.lossDetector.onPacketSent(sent) }
+        let retransmittable = frames.filter(\.carriesRetransmittableInformation)
+        if !retransmittable.isEmpty {
+            sentFrameLedger[EngineSentFrameKey(
+                encryptionLevel: level,
+                packetNumber: pn
+            )] = retransmittable
+        }
         if inFlight {
             congestion.onPacketSent(bytes: datagram.count, nowNanos: nowNanos)
             pacer.consume(bytes: UInt64(datagram.count), nowNanos: nowNanos)
@@ -362,10 +438,81 @@ extension QUICConnectionEngine {
         return datagram
     }
 
+    mutating func acknowledgePacketFrames(
+        _ packet: SentPacketView,
+        level: EncryptionLevel
+    ) {
+        let key = EngineSentFrameKey(
+            encryptionLevel: level,
+            packetNumber: packet.packetNumber
+        )
+        guard let frames = sentFrameLedger.removeValue(forKey: key) else { return }
+        for frame in frames {
+            switch frame {
+            case .stream(let streamFrame):
+                guard var send = streams.sendStreams[streamFrame.streamID] else { continue }
+                send.acknowledgeData(
+                    upTo: streamFrame.offset + UInt64(streamFrame.data.count)
+                )
+                streams.sendStreams[streamFrame.streamID] = send
+            case .resetStream(let resetFrame):
+                guard var send = streams.sendStreams[resetFrame.streamID] else { continue }
+                send.acknowledgeReset()
+                streams.sendStreams[resetFrame.streamID] = send
+            case .resetStreamAt(let resetFrame):
+                guard var send = streams.sendStreams[resetFrame.streamID] else { continue }
+                send.acknowledgeReset()
+                streams.sendStreams[resetFrame.streamID] = send
+            default:
+                break
+            }
+        }
+    }
+
+    mutating func requeueLostPacketFrames(
+        _ packets: [SentPacketView],
+        level: EncryptionLevel
+    ) {
+        for packet in packets {
+            let key = EngineSentFrameKey(
+                encryptionLevel: level,
+                packetNumber: packet.packetNumber
+            )
+            if let frames = sentFrameLedger.removeValue(forKey: key) {
+                pendingFrames[level, default: []].append(contentsOf: frames)
+            }
+        }
+    }
+
+    private mutating func queueUnsentFrames(
+        _ frames: [Frame],
+        level: EncryptionLevel
+    ) {
+        let recoverable = frames.filter(\.carriesUnsentInformation)
+        guard !recoverable.isEmpty else { return }
+        pendingFrames[level, default: []].insert(contentsOf: recoverable, at: 0)
+    }
+
     private func isAckElicitingOut(_ frame: Frame) -> Bool {
         switch frame {
         case .ack, .padding, .connectionClose: return false
         default: return true
         }
+    }
+}
+
+private extension Frame {
+    var carriesRetransmittableInformation: Bool {
+        switch self {
+        case .padding, .ack, .connectionClose, .datagram, .pathResponse:
+            return false
+        default:
+            return true
+        }
+    }
+
+    var carriesUnsentInformation: Bool {
+        if case .connectionClose = self { return false }
+        return true
     }
 }

@@ -40,8 +40,8 @@ let quicFacadeDependencies: [Target.Dependency] = {
         .product(name: "P2PCoreCrypto",    package: "swift-ssl"),
         .product(name: "P2PCoreBytes",     package: "swift-ssl"),
         .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
-        // RFC 7250 raw-public-key SPKI parsing for the Embedded cert strategy
-        // (fail-closed); host path uses swift-certificates via QUICCrypto.
+        // RFC 7250 raw-public-key SPKI parsing for the portable certificate
+        // strategy. Host certificate policy is injected over the same DER seam.
         .product(name: "P2PCoreDER",       package: "swift-p2p-core"),
     ]
     if !portableEnabled {
@@ -142,18 +142,26 @@ let package = Package(
     ],
     dependencies: [
         // Canonical session contracts over the Pure Swift swift-ssl mechanism.
-        .package(url: "https://github.com/1amageek/swift-tls.git", branch: "main"),
-        .package(name: "swift-p2p-core", url: "https://github.com/1amageek/swift-p2p-core.git", branch: "main"),
-        .package(name: "swift-ssl", url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
+        .package(
+            url: "https://github.com/1amageek/swift-tls.git",
+            from: "1.3.3"
+        ),
+        .package(
+            url: "https://github.com/1amageek/swift-p2p-core.git",
+            from: "0.3.2"
+        ),
+        .package(
+            url: "https://github.com/1amageek/swift-ssl.git",
+            from: "0.1.1"
+        ),
         // UDP transport
         .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
 
         // One cryptography implementation repository across Native, WASM, and Embedded.
-        .package(name: "swift-crypto", url: "https://github.com/1amageek/swift-crypto.git", branch: "main"),
-
-        // X.509 Certificates and ASN.1
-        .package(name: "swift-certificates", url: "https://github.com/1amageek/swift-certificates.git", branch: "main"),
-        .package(name: "swift-asn1", url: "https://github.com/1amageek/swift-asn1.git", branch: "main"),
+        .package(
+            url: "https://github.com/1amageek/swift-crypto.git",
+            from: "4.5.3"
+        ),
 
         // Logging
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
@@ -323,8 +331,6 @@ let package = Package(
                 // replacing the deleted QUICFoundationProvider.
                 .product(name: "P2PCrypto", package: "swift-p2p-core"),
                 .product(name: "Crypto", package: "swift-crypto"),
-                .product(name: "X509", package: "swift-certificates"),
-                .product(name: "SwiftASN1", package: "swift-asn1"),
                 .product(name: "TLSWire", package: "swift-ssl"),
                 .product(name: "SSLCore", package: "swift-ssl"),
                 .product(name: "SSLQUIC", package: "swift-ssl"),

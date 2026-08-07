@@ -24,6 +24,21 @@ struct QUICConfigurationTests {
         #expect(config.alpn == ["libp2p"])
     }
 
+    @Test("Endpoint propagates TLS provider creation failure")
+    func tlsProviderCreationFailure() async {
+        var config = QUICConfiguration()
+        config.tlsProviderFactory = { _ in
+            throw TestTLSProviderFactoryError.creationFailed
+        }
+        let endpoint = QUICEndpoint(configuration: config)
+
+        await #expect(throws: TestTLSProviderFactoryError.self) {
+            _ = try await endpoint.connect(
+                to: SocketAddress(ipAddress: "127.0.0.1", port: 443)
+            )
+        }
+    }
+
     @Test("Transport parameters from configuration")
     func transportParameters() throws {
         let config = QUICConfiguration()
@@ -35,4 +50,8 @@ struct QUICConfigurationTests {
         #expect(params.initialMaxStreamsBidi == config.initialMaxStreamsBidi)
         #expect(params.initialSourceConnectionID == scid)
     }
+}
+
+private enum TestTLSProviderFactoryError: Error {
+    case creationFailed
 }

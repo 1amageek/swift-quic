@@ -2,10 +2,8 @@
 
 A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002), designed for the swift-libp2p networking stack. It is **Embedded-first**: the protocol logic lives in value-type, sans-IO core targets whose byte currency is `[UInt8]` / `Span`, with thin Foundation host adapters over them.
 
-> **Release status.** The canonical TLS path is implemented: live QUIC factories use
-> `swift-tls/QUICTLS` backed by `swift-ssl/SSLQUIC`. External peer
-> interoperability, sanitizer coverage, performance gates, and release dependency
-> pinning remain open.
+> **Release status.** Current release: `1.4.0`. Live QUIC factories use
+> `swift-tls/QUICTLS` backed by `swift-ssl/SSLQUIC`.
 
 ## Secure-transport boundary
 
@@ -28,8 +26,8 @@ while handshake semantics are delegated to `swift-tls/QUICTLS`. See the
 
 - **RFC 9000/9001/9002 Compliant**: Full QUIC transport protocol implementation
 - **TLS 1.3 Integration**: QUIC TLS session semantics from `swift-tls`,
-  backed by the Pure Swift `swift-ssl/SSLQUIC` mechanism and certificate policy
-  from the swift-certificates fork
+  backed by the Pure Swift `swift-ssl/SSLQUIC` mechanism and injected certificate
+  policy over DER bytes
 - **Enforced Peer Authentication**: CertificateVerify signature is always verified; a server cannot skip Certificate/CertificateVerify, and Finished is accepted only after authentication completes (no unauthenticated/MITM channel)
 - **0-RTT Support**: Early data transmission with session resumption
 - **Connection Migration**: PATH_CHALLENGE/RESPONSE with address validation
@@ -63,14 +61,12 @@ dependencies: [
 
 swift-quic uses the following libraries:
 
-- [swift-crypto](https://github.com/1amageek/swift-crypto) (`main`) - Cryptographic operations for Native, WASM, and Embedded
-- [swift-ssl](https://github.com/1amageek/swift-ssl) (`main`) - Pure Swift cryptography and TLS/QUIC mechanism owner
-- `swift-tls` (workspace package) - sans-I/O Stream/DTLS/QUIC TLS session contracts
-- [swift-certificates](https://github.com/1amageek/swift-certificates) (`main`) - X.509 certificate handling
-- [swift-asn1](https://github.com/1amageek/swift-asn1) (`main`) - ASN.1 encoding/decoding
+- [swift-crypto](https://github.com/1amageek/swift-crypto) (`4.5.3+`) - Cryptographic operations for Native, WASM, and Embedded
+- [swift-ssl](https://github.com/1amageek/swift-ssl) (`0.1.1+`) - Pure Swift cryptography and TLS/QUIC mechanism owner
+- `swift-tls` (`1.3.3+`) - sans-I/O Stream/DTLS/QUIC TLS session contracts
 - [swift-log](https://github.com/apple/swift-log) (`1.9.0+`) - Logging
 - [swift-docc-plugin](https://github.com/swiftlang/swift-docc-plugin) (`1.4.3+`) - Documentation
-- swift-p2p-core (`main`) - Embedded-clean byte primitives, crypto seam, and the unified `P2PCrypto.DefaultCryptoProvider`
+- swift-p2p-core (`0.3.2+`) - Embedded-clean byte primitives, crypto seam, and the unified `P2PCrypto.DefaultCryptoProvider`
 - swift-nio-udp - UDP transport
 
 ## Migrating to 1.4
@@ -93,8 +89,10 @@ swift-quic uses the following libraries:
 import QUIC
 
 // A TLS 1.3 provider must always be configured (no insecure default).
-// Use .production / .development with your own provider, or .testing in unit tests.
-let config = QUICConfiguration.production { MyTLSProvider() }
+var config = QUICConfiguration()
+config.tlsProviderFactory = { isClient in
+    try MyTLSProvider(isClient: isClient)
+}
 
 // Server: bind a socket, serve, and accept incoming connections
 let serverSocket = NIOQUICSocket(configuration: .unicast(port: 4433))
@@ -501,80 +499,60 @@ integrity key+nonce.
 
 ## Performance
 
-Benchmarks measured on Apple Silicon (arm64-apple-macosx):
+Benchmarks measured on 2026-08-07 on Apple Silicon
+(`arm64-apple-macosx`) with the pinned Swift 6.4 development snapshot:
 
 ### Packet Processing
 
 | Operation | Performance |
 |-----------|-------------|
-| Short header parsing | 4.7M ops/sec |
-| Long header parsing | 1.4M ops/sec |
-| DCID extraction (short) | 6.5M ops/sec |
-| DCID extraction (long) | 21.2M ops/sec |
-| ConnectionRouter lookup | 3.4M ops/sec |
-| Packet type extraction | 5.6M ops/sec |
+| Short header parsing | 1.54M ops/sec |
+| Long header parsing | 746K ops/sec |
+| DCID extraction (short) | 1.05M ops/sec |
+| DCID extraction (long) | 1.11M ops/sec |
+| ConnectionRouter lookup | 527K ops/sec |
+| Packet type extraction | 9.55M ops/sec |
 
 ### Core Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Varint encoding | 3.4M ops/sec |
-| Varint decoding | 5.8M ops/sec |
-| Varint fast path (1-byte) | 12.5M ops/sec |
-| ConnectionID creation | 1.4M ops/sec |
-| ConnectionID equality | 42.3M ops/sec |
-| ConnectionID hash | 16.6M ops/sec |
-| ConnectionID random | 3.1M ops/sec |
-| CID Dictionary lookup | 10.5M ops/sec |
+| Varint encoding | 6.59M ops/sec |
+| Varint decoding | 8.73M ops/sec |
+| Varint fast path (1-byte) | 13.15M ops/sec |
+| ConnectionID creation | 1.06M ops/sec |
+| ConnectionID equality | 10.41M ops/sec |
+| ConnectionID hash | 16.10M ops/sec |
+| ConnectionID random | 1.04M ops/sec |
+| CID Dictionary lookup | 8.41M ops/sec |
 
 ### Frame Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| PING frame encoding | 24.5M ops/sec |
-| PING frame decoding | 22.2M ops/sec |
-| ACK frame encoding | 1.1M ops/sec |
-| ACK frame decoding | 1.9M ops/sec |
-| STREAM frame encoding | 2.1M ops/sec |
-| Frame roundtrip | 1.0M ops/sec |
+| PING frame encoding | 11.46M ops/sec |
+| PING frame decoding | 4.73M ops/sec |
+| ACK frame encoding | 3.54M ops/sec |
+| ACK frame decoding | 2.26M ops/sec |
+| STREAM frame encoding | 2.98M ops/sec |
+| Frame roundtrip | 1.09M ops/sec |
 
 ### Crypto Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Initial key derivation | 23K ops/sec |
-| KeyMaterial derivation | 95.5K ops/sec |
-| AES-GCM Sealer creation | 4.1M ops/sec |
+| Initial key derivation | 17.6K ops/sec |
+| KeyMaterial derivation | 56.2K ops/sec |
+| AES-GCM Sealer creation | 1.38M ops/sec |
 
 ### Packet Operations
 
 | Operation | Performance |
 |-----------|-------------|
-| Packet number encoding | 4.8M ops/sec |
-| Packet number decoding | 5.5M ops/sec |
-| Coalesced packet building | 940K ops/sec |
-| Coalesced packet parsing | 572K ops/sec |
-
-### Recovery Performance
-
-| Operation | Performance |
-|-----------|-------------|
-| Sequential packet recording | 9.7M ops/sec |
-| ACK frame generation | 139K ops/sec |
-| Packet send recording | 3.5M ops/sec |
-| **Loss detection** | **26.0K ops/sec** |
-| **Multi-range ACK (25 ranges)** | **4.8K ops/sec** |
-| Full ACK cycle | 1.9M pkts/sec |
-| Realistic QUIC stream | 219K pkts/sec |
-
-### Memory Efficiency
-
-| Metric | Value |
-|--------|-------|
-| STREAM frame overhead (100B-10KB) | 4 bytes |
-| Coalesced packet overhead | 0 bytes |
-| 10K sequential packets storage | 1 range |
-| AckManager max ranges | 256 |
+| Packet number encoding | 5.10M ops/sec |
+| Packet number decoding | 16.16M ops/sec |
+| Coalesced packet building | 2.04M ops/sec |
+| Coalesced packet parsing | 981K ops/sec |
 
 Run benchmarks:
 
@@ -599,23 +577,19 @@ xcodebuild test \
 
 ### Interoperability Testing
 
-Verified interoperability with external QUIC implementations:
+The repository contains Docker fixtures for Quinn and ngtcp2, but no executable
+Swift interoperability test currently drives them. External interoperability is
+therefore not claimed by this release.
 
-| Implementation | Language | Tests |
-|----------------|----------|-------|
-| Quinn | Rust | Basic handshake, Bidirectional stream, Version negotiation, 0-RTT, Path validation, Retry handling |
-| ngtcp2 | C | Basic handshake, Version negotiation, Stream multiplexing |
+| Implementation | Language | Fixture | Executed gate |
+|----------------|----------|---:|---:|
+| Quinn | Rust | Available | Not implemented |
+| ngtcp2 | C | Available | Not implemented |
 
-Run interop tests (requires Docker):
+Start the fixtures for development with:
 
 ```bash
 cd docker && docker compose up -d
-xcodebuild test \
-  -scheme swift-quic-Package \
-  -destination 'platform=macOS' \
-  -only-testing:QUICTests/QuinnInteropTests \
-  -only-testing:QUICTests/Ngtcp2InteropTests \
-  -maximum-test-execution-time-allowance 60
 ```
 
 ### Unit Tests
@@ -708,9 +682,9 @@ xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
   - [x] ACK range underflow validation
   - [x] Race condition prevention in shutdown
   - [x] Double-start vulnerability fix
-- [x] Phase 10: Interoperability Testing
-  - [x] Quinn (Rust) interop tests
-  - [x] ngtcp2 (C) interop tests
+- [ ] Phase 10: Interoperability Testing
+  - [ ] Quinn (Rust) interop tests
+  - [ ] ngtcp2 (C) interop tests
   - [x] Docker-based test environment
 
 ## References

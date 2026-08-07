@@ -320,6 +320,29 @@ struct StreamManagerTests {
         #expect(frames[0].fin)
     }
 
+    @Test("Finish is idempotent after peer STOP_SENDING closes the send side")
+    func finishAfterStopSendingReset() throws {
+        let manager = StreamManager(
+            isClient: true,
+            peerInitialMaxData: 10_000,
+            peerInitialMaxStreamDataBidiLocal: 1_000,
+            peerInitialMaxStreamsBidi: 10
+        )
+
+        let streamID = try manager.openStream(bidirectional: true)
+        try manager.write(streamID: streamID, data: Data([1, 2, 3]))
+        manager.handleStopSending(StopSendingFrame(
+            streamID: streamID,
+            applicationErrorCode: 42
+        ))
+
+        #expect(manager.generateResetFrames().count == 1)
+        try manager.finish(streamID: streamID)
+
+        manager.acknowledgeReset(streamID: streamID)
+        try manager.finish(streamID: streamID)
+    }
+
     // MARK: - Flow Control Frame Generation Tests
 
     @Test("Generate flow control frames")

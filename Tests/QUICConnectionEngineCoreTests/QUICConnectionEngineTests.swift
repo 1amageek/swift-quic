@@ -37,6 +37,7 @@ struct QUICConnectionEngineTests {
         tp.initialMaxStreamDataUni = 256 * 1024
         tp.initialMaxStreamsBidi = 100
         tp.initialMaxStreamsUni = 100
+        tp.enableResetStreamAt = true
         return QUICConnectionEngineConfiguration<Provider>(
             role: role,
             version: .v1,
@@ -73,6 +74,7 @@ struct QUICConnectionEngineTests {
         peerTP.initialMaxStreamDataUni = 256 * 1024
         peerTP.initialMaxStreamsBidi = 100
         peerTP.initialMaxStreamsUni = 100
+        peerTP.enableResetStreamAt = true
         client.applyPeerTransportParameters(peerTP)
         server.applyPeerTransportParameters(peerTP)
 
@@ -205,6 +207,80 @@ struct QUICConnectionEngineTests {
         for dgram in serverAck {
             _ = try client.receive(datagram: dgram, nowNanos: 4_000)
         }
+    }
+
+    @Test("RESET_STREAM_AT delivers its reliable prefix through the engine path")
+    func resetStreamAtDeliversReliablePrefix() throws {
+        var (client, server, _, _, _) = try makePair()
+        let streamID = try client.openStream(bidirectional: true)
+        try client.writeStream(streamID, data: [1, 2, 3, 4, 5])
+        try client.resetStreamAt(
+            streamID,
+            errorCode: 9,
+            reliableSize: 3
+        )
+
+        let datagrams = try client.flush(nowNanos: 1_000)
+        #expect(!datagrams.isEmpty)
+
+        var received: [UInt8] = []
+        for datagram in datagrams {
+            _ = try server.receive(datagram: datagram, nowNanos: 2_000)
+            if let chunk = server.readStream(streamID) {
+                received.append(contentsOf: chunk)
+            }
+        }
+
+        #expect(received == [1, 2, 3])
+        #expect(server.streamReadFinished(streamID))
+    }
+
+    @Test("a lost STREAM frame is retransmitted after a later packet is acknowledged")
+    func lostStreamFrameIsRetransmitted() throws {
+        var (client, server, _, _, _) = try makePair()
+        let streamID = try client.openStream(bidirectional: true)
+        let payload = Array("retransmit me".utf8)
+        try client.writeStream(streamID, data: payload)
+
+        // Drop packet 0, then let a PTO PING create packet 1.
+        let dropped = try client.flush(nowNanos: 0)
+        #expect(!dropped.isEmpty)
+        let pto = try #require(client.deadlines(nowNanos: 0).lossDetectionNanos)
+        let probeOutput = try client.handleTimeout(nowNanos: pto + 1)
+        #expect(!probeOutput.datagramsToSend.isEmpty)
+
+        // Deliver only the later probe and return its ACK. The ACK makes the
+        // older STREAM packet time-threshold lost and the receive tail flushes
+        // the ledger-restored STREAM frame.
+        var acknowledgements: [[UInt8]] = []
+        for probe in probeOutput.datagramsToSend {
+            let output = try server.receive(datagram: probe, nowNanos: pto + 2)
+            acknowledgements.append(contentsOf: output.datagramsToSend)
+        }
+        acknowledgements.append(contentsOf: try server.flush(nowNanos: pto + 3))
+        #expect(!acknowledgements.isEmpty)
+
+        var retransmissions: [[UInt8]] = []
+        for acknowledgement in acknowledgements {
+            let output = try client.receive(
+                datagram: acknowledgement,
+                nowNanos: pto + 1_000_000_000
+            )
+            retransmissions.append(contentsOf: output.datagramsToSend)
+        }
+        #expect(!retransmissions.isEmpty)
+
+        var received: [UInt8] = []
+        for retransmission in retransmissions {
+            _ = try server.receive(
+                datagram: retransmission,
+                nowNanos: pto + 1_000_000_001
+            )
+            if let chunk = server.readStream(streamID) {
+                received.append(contentsOf: chunk)
+            }
+        }
+        #expect(received == payload)
     }
 
     @Test("ACK delay conversion honors transport parameter exponent")

@@ -112,6 +112,18 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             try writeVarint(resetFrame.applicationErrorCode, to: &writer)
             try writeVarint(resetFrame.finalSize, to: &writer)
 
+        case .resetStreamAt(let resetFrame):
+            guard resetFrame.reliableSize <= resetFrame.finalSize else {
+                throw FrameCodecError.invalidFrameFormat(
+                    "RESET_STREAM_AT reliable size (\(resetFrame.reliableSize)) exceeds final size (\(resetFrame.finalSize))"
+                )
+            }
+            writer.writeByte(0x24)
+            try writeVarint(resetFrame.streamID, to: &writer)
+            try writeVarint(resetFrame.applicationErrorCode, to: &writer)
+            try writeVarint(resetFrame.finalSize, to: &writer)
+            try writeVarint(resetFrame.reliableSize, to: &writer)
+
         case .stopSending(let stopFrame):
             writer.writeByte(0x05)
             try writeVarint(stopFrame.streamID, to: &writer)
@@ -414,6 +426,9 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         case 0x1e:
             return .handshakeDone
 
+        case 0x24:
+            return try decodeResetStreamAtFrame(from: &reader)
+
         case 0x30, 0x31:
             return try decodeDatagramFrame(from: &reader, hasLength: frameType == 0x31)
 
@@ -538,6 +553,24 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             streamID: streamID,
             applicationErrorCode: errorCode,
             finalSize: finalSize
+        ))
+    }
+
+    internal func decodeResetStreamAtFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+        let streamID = try readVarint(from: &reader)
+        let errorCode = try readVarint(from: &reader)
+        let finalSize = try readVarint(from: &reader)
+        let reliableSize = try readVarint(from: &reader)
+        guard reliableSize <= finalSize else {
+            throw FrameCodecError.invalidFrameFormat(
+                "RESET_STREAM_AT reliable size (\(reliableSize)) exceeds final size (\(finalSize))"
+            )
+        }
+        return .resetStreamAt(ResetStreamAtFrame(
+            streamID: streamID,
+            applicationErrorCode: errorCode,
+            finalSize: finalSize,
+            reliableSize: reliableSize
         ))
     }
 

@@ -228,6 +228,25 @@ extension QUICConnectionEngine {
                 output.readableStreams.append(f.streamID)
             }
 
+        case .resetStreamAt(let f):
+            guard config.localTransportParameters.enableResetStreamAt else {
+                throw .protocolViolation("RESET_STREAM_AT received without negotiation")
+            }
+            _ = streams.ensureRemoteStream(f.streamID)
+            if var recv = streams.receiveStreams[f.streamID] {
+                do {
+                    try recv.handleResetStreamAt(
+                        errorCode: f.applicationErrorCode,
+                        finalSize: f.finalSize,
+                        reliableSize: f.reliableSize
+                    )
+                } catch {
+                    throw .stream(error)
+                }
+                streams.receiveStreams[f.streamID] = recv
+                output.readableStreams.append(f.streamID)
+            }
+
         case .stopSending(let f):
             if var send = streams.sendStreams[f.streamID] {
                 send.handleStopSending(errorCode: f.applicationErrorCode)
@@ -310,26 +329,22 @@ extension QUICConnectionEngine {
                 CongestionPacket(sentBytes: $0.sentBytes, timeSentNanos: $0.timeSentNanos, inFlight: $0.inFlight)
             }
             congestion.onPacketsAcknowledged(packets: ackedPackets, nowNanos: nowNanos, rtt: snapshot)
-            for pkt in result.acked { acknowledgePacketFrames(pkt) }
+            for packet in result.acked {
+                acknowledgePacketFrames(packet, level: level)
+            }
         }
         if !result.lost.isEmpty {
             let lostPackets = result.lost.map {
                 CongestionPacket(sentBytes: $0.sentBytes, timeSentNanos: $0.timeSentNanos, inFlight: $0.inFlight)
             }
             congestion.onPacketsLost(packets: lostPackets, nowNanos: nowNanos, rtt: snapshot)
+            requeueLostPacketFrames(result.lost, level: level)
         }
 
         // A successful ACK resets the PTO backoff (RFC 9002 §6.2).
         if !result.acked.isEmpty {
             ptoCount = 0
         }
-    }
-
-    private mutating func acknowledgePacketFrames(_ packet: SentPacketView) {
-        // Without a per-packet frame side-table in this slice, stream-data
-        // acknowledgement is handled lazily by SendStreamCore as more data is
-        // written/acked through generateFrames; nothing to do here for now.
-        _ = packet
     }
 
     private mutating func handleCrypto(

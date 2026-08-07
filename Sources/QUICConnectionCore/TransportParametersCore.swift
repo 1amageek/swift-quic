@@ -68,6 +68,8 @@ public struct TransportParametersCore: Sendable, Hashable {
     public var activeConnectionIDLimit: UInt64
     public var initialSourceConnectionID: ConnectionID?
     public var retrySourceConnectionID: ConnectionID?
+    /// Whether this endpoint supports RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset-09).
+    public var enableResetStreamAt: Bool
     public var maxDatagramFrameSize: UInt64
 
     /// Creates transport parameters with the protocol default values.
@@ -93,6 +95,7 @@ public struct TransportParametersCore: Sendable, Hashable {
         self.activeConnectionIDLimit = 2
         self.initialSourceConnectionID = nil
         self.retrySourceConnectionID = nil
+        self.enableResetStreamAt = false
         self.maxDatagramFrameSize = 0
     }
 }

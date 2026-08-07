@@ -15,6 +15,23 @@ import QUICCore
 
 // MARK: - QUIC Connection Protocol
 
+/// QUIC transport extensions negotiated independently in each direction.
+public struct QUICTransportCapabilities: Sendable, Equatable {
+    /// Maximum complete DATAGRAM frame size accepted by this endpoint.
+    public let maximumDatagramFrameSize: UInt64
+
+    /// Whether this endpoint accepts RESET_STREAM_AT frames.
+    public let supportsPartialDeliveryResets: Bool
+
+    public init(
+        maximumDatagramFrameSize: UInt64,
+        supportsPartialDeliveryResets: Bool
+    ) {
+        self.maximumDatagramFrameSize = maximumDatagramFrameSize
+        self.supportsPartialDeliveryResets = supportsPartialDeliveryResets
+    }
+}
+
 /// A multiplexed QUIC connection
 public protocol QUICConnectionProtocol: Sendable {
     /// The local address
@@ -29,6 +46,12 @@ public protocol QUICConnectionProtocol: Sendable {
 
     /// Whether the connection is established
     var isEstablished: Bool { get }
+
+    /// Extensions advertised by this endpoint.
+    var localTransportCapabilities: QUICTransportCapabilities { get }
+
+    /// Extensions advertised by the peer after the handshake.
+    var peerTransportCapabilities: QUICTransportCapabilities { get }
 
     /// Opens a new bidirectional stream
     func openStream() async throws -> any QUICStreamProtocol
@@ -66,6 +89,26 @@ public protocol QUICConnectionProtocol: Sendable {
     func close(applicationError errorCode: UInt64, reason: String) async
 }
 
+/// Optional unreliable DATAGRAM capability (RFC 9221).
+///
+/// Keeping this separate from `QUICConnectionProtocol` lets stream-only test
+/// doubles and constrained transports express their actual capability without
+/// a silent fallback.
+public protocol QUICDatagramConnectionProtocol: QUICConnectionProtocol {
+    var maxDatagramPayloadSize: Int { get }
+    var incomingDatagrams: AsyncStream<Data> { get }
+
+    func sendDatagram(_ bytes: Data) async throws
+}
+
+/// Optional capability for connections that can enqueue an ack-eliciting PING.
+///
+/// Higher-level transports use this explicit capability to keep NAT mappings and
+/// idle connections alive without manufacturing application data.
+public protocol QUICKeepAliveConnectionProtocol: QUICConnectionProtocol {
+    func sendPing() async throws
+}
+
 // MARK: - QUIC Stream Protocol
 
 /// A single QUIC stream
@@ -97,7 +140,10 @@ public protocol QUICStreamProtocol: Sendable {
 
     /// Resets the stream with an error code
     /// - Parameter errorCode: Application error code
-    func reset(errorCode: UInt64) async
+    func reset(errorCode: UInt64) async throws
+
+    /// Resets the stream while guaranteeing delivery through `reliableSize`.
+    func reset(errorCode: UInt64, reliablyDelivering reliableSize: UInt64) async throws
 
     /// Signals that no more data will be read
     func stopSending(errorCode: UInt64) async throws

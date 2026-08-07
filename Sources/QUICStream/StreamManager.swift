@@ -243,6 +243,43 @@ public final class StreamManager: Sendable {
         }
     }
 
+    /// Generates a RESET_STREAM for an active stream without deleting its
+    /// acknowledgement state prematurely.
+    public func resetStream(
+        id streamID: UInt64,
+        errorCode: UInt64
+    ) throws -> ResetStreamFrame {
+        try state.withLock { state in
+            guard let stream = state.streams[streamID] else {
+                throw StreamManagerError.streamNotFound(streamID)
+            }
+            guard let frame = stream.generateResetStream(errorCode: errorCode) else {
+                throw StreamManagerError.streamError(.invalidState(
+                    current: "reset already sent",
+                    operation: "RESET_STREAM"
+                ))
+            }
+            return frame
+        }
+    }
+
+    /// Requests RESET_STREAM_AT while preserving the reliable prefix.
+    public func resetStreamAt(
+        id streamID: UInt64,
+        errorCode: UInt64,
+        reliableSize: UInt64
+    ) throws {
+        try state.withLock { state in
+            guard let stream = state.streams[streamID] else {
+                throw StreamManagerError.streamNotFound(streamID)
+            }
+            try stream.requestResetStreamAt(
+                errorCode: errorCode,
+                reliableSize: reliableSize
+            )
+        }
+    }
+
     /// Close all streams (for connection close)
     /// - Parameter errorCode: Optional error code for RESET_STREAM frames
     /// - Returns: Array of RESET_STREAM frames to send for active streams
@@ -354,6 +391,39 @@ public final class StreamManager: Sendable {
         }
     }
 
+    /// Processes a RESET_STREAM_AT frame.
+    public func handleResetStreamAt(_ frame: ResetStreamAtFrame) throws {
+        try state.withLock { state in
+            let stream: DataStream
+            if let existing = state.streams[frame.streamID] {
+                stream = existing
+            } else {
+                _ = try getOrCreateStreamInternal(frame.streamID, state: &state)
+                guard let newStream = state.streams[frame.streamID] else { return }
+                stream = newStream
+            }
+
+            try stream.handleResetStreamAt(
+                errorCode: frame.applicationErrorCode,
+                finalSize: frame.finalSize,
+                reliableSize: frame.reliableSize
+            )
+
+            let currentHighest = state.flowController.streamBytesReceived(for: frame.streamID)
+            if frame.finalSize > currentHighest {
+                let newBytes = frame.finalSize - currentHighest
+                guard state.flowController.canReceive(bytes: newBytes) else {
+                    throw StreamManagerError.connectionFlowControlViolation
+                }
+                state.flowController.recordBytesReceived(newBytes)
+                state.flowController.recordStreamBytesReceived(
+                    frame.streamID,
+                    endOffset: frame.finalSize
+                )
+            }
+        }
+    }
+
     /// Process STOP_SENDING frame
     /// - Parameter frame: The received STOP_SENDING frame
     public func handleStopSending(_ frame: StopSendingFrame) {
@@ -453,11 +523,37 @@ public final class StreamManager: Sendable {
                 throw StreamManagerError.streamNotFound(streamID)
             }
 
+            // Graceful close is idempotent at the managed transport boundary.
+            // A peer STOP_SENDING can move the send core to resetSent/resetRecvd
+            // before the application closes its stream wrapper. Sending FIN is
+            // impossible after either terminal path, but close must not turn an
+            // already-closed send side into an application failure.
+            switch stream.state.sendState {
+            case .dataSent, .dataRecvd, .resetSent, .resetRecvd:
+                return
+            case .ready, .send:
+                break
+            }
+
             do {
                 try stream.finish()
             } catch let error as StreamError {
                 throw StreamManagerError.streamError(error)
             }
+        }
+    }
+
+    /// Records acknowledgement of a STREAM byte range endpoint.
+    public func acknowledgeData(streamID: UInt64, upTo offset: UInt64) {
+        state.withLock { state in
+            state.streams[streamID]?.acknowledgeData(upTo: offset)
+        }
+    }
+
+    /// Records acknowledgement of RESET_STREAM or RESET_STREAM_AT.
+    public func acknowledgeReset(streamID: UInt64) {
+        state.withLock { state in
+            state.streams[streamID]?.acknowledgeReset()
         }
     }
 
@@ -569,6 +665,20 @@ public final class StreamManager: Sendable {
                 }
             }
 
+            return frames
+        }
+    }
+
+    /// Generates partial-delivery reset frames whose reliable prefixes have
+    /// entered the stream send path.
+    public func generateResetStreamAtFrames() -> [ResetStreamAtFrame] {
+        state.withLock { state in
+            var frames: [ResetStreamAtFrame] = []
+            for stream in state.streams.values {
+                if let frame = stream.generateResetStreamAt() {
+                    frames.append(frame)
+                }
+            }
             return frames
         }
     }

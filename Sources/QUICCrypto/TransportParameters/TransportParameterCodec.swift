@@ -133,6 +133,7 @@ public struct TransportParameterCodec: Sendable {
         core.activeConnectionIDLimit = params.activeConnectionIDLimit
         core.initialSourceConnectionID = params.initialSourceConnectionID
         core.retrySourceConnectionID = params.retrySourceConnectionID
+        core.enableResetStreamAt = params.enableResetStreamAt
         core.maxDatagramFrameSize = params.maxDatagramFrameSize
         return core
     }
@@ -231,6 +232,7 @@ public struct TransportParameterCodec: Sendable {
         params.activeConnectionIDLimit = core.activeConnectionIDLimit
         params.initialSourceConnectionID = core.initialSourceConnectionID
         params.retrySourceConnectionID = core.retrySourceConnectionID
+        params.enableResetStreamAt = core.enableResetStreamAt
         params.maxDatagramFrameSize = core.maxDatagramFrameSize
         return params
     }

@@ -41,6 +41,10 @@ public enum QUICEngineError: Error, Sendable {
     /// A flow-control or connection-level limit was exceeded.
     case flowControl(String)
 
+    /// A peer sent a frame or transition that violates the negotiated QUIC
+    /// protocol contract but is not a stream-local or transport-parameter error.
+    case protocolViolation(String)
+
     /// A packet-number space ran out of usable numbers (2^62, RFC 9000 §12.3):
     /// the connection MUST be closed rather than wrapping.
     case packetNumberExhausted(EncryptionLevel)

@@ -111,8 +111,15 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
     var pendingDatagrams: [[UInt8]] = []
     /// Peer's max DATAGRAM frame size (0 = datagrams not permitted by peer).
     var peerMaxDatagramFrameSize: UInt64 = 0
+    /// Whether the peer advertised RESET_STREAM_AT support.
+    var peerEnableResetStreamAt = false
     /// Per-level pending PTO probe (PING) flags, set by the loss-detection timer.
     var pendingPing: [EncryptionLevel: Bool] = [:]
+    /// Frames collected from producer state but not yet successfully transmitted,
+    /// plus retransmittable information restored after packet loss.
+    var pendingFrames: [EncryptionLevel: [Frame]] = [:]
+    /// Retransmittable information retained until ACK or loss resolves its packet.
+    var sentFrameLedger: [EngineSentFrameKey: [Frame]] = [:]
     /// Whether a local PATH_CHALLENGE is outstanding (arms the validation timer).
     var pathValidationPending = false
     /// ACK delay exponent this endpoint advertised and uses when encoding ACKs.
@@ -248,4 +255,9 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
         let (nanos, nanosOverflow) = micros.multipliedReportingOverflow(by: 1_000)
         return nanosOverflow ? UInt64.max : nanos
     }
+}
+
+struct EngineSentFrameKey: Sendable, Hashable {
+    let encryptionLevel: EncryptionLevel
+    let packetNumber: UInt64
 }

@@ -12,13 +12,12 @@
 //
 //   * HOST: `randomBytes` over `SystemRandomNumberGenerator`; `validateCertificate`
 //     delegates to the caller-injected X.509 validator (or, when none is given,
-//     fails closed if a chain is presented). X.509 parsing stays in the host
-//     `QUICCrypto`/swift-certificates layer — only DER bytes cross into the engine.
+//     fails closed if a chain is presented). X.509 parsing stays behind the
+//     caller-injected policy — only DER bytes cross into the engine.
 //   * EMBEDDED: `randomBytes` over the same stdlib CSPRNG idiom; `validateCertificate`
 //     resolves the peer's raw public key from the leaf SubjectPublicKeyInfo
 //     (RFC 7250) via `P2PCoreDER`, FAIL-CLOSED — an unparseable leaf (e.g. a full
-//     X.509 certificate Embedded cannot parse) yields a rejection. No
-//     swift-certificates, no X.509 types.
+//     X.509 certificate the RPK strategy cannot parse) yields a rejection.
 //
 // A cross-type error mapping lives in a NAMED function, never a closure literal
 // (Embedded binds `any Error` inside a closure `catch`).
@@ -86,9 +85,9 @@ public enum QUICEngineCapability {
 
 #if !hasFeature(Embedded) && !os(WASI)
 
-/// The host peer-trust strategy. X.509 verification proper lives in the host
-/// `QUICCrypto`/swift-certificates layer (reached through the injected validator);
-/// this only enforces fail-closed behaviour when no validator is supplied.
+/// The host peer-trust strategy. X.509 verification proper belongs to the
+/// injected certificate policy; this only enforces fail-closed behaviour when
+/// no validator is supplied.
 enum HostCertStrategy {
     static func validate(
         chain: [[UInt8]],

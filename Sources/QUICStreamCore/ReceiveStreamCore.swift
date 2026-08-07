@@ -50,6 +50,9 @@ public struct ReceiveStreamCore: Sendable {
     /// Error code if peer sent RESET_STREAM.
     public private(set) var peerResetErrorCode: UInt64?
 
+    /// Prefix length that must be delivered before a RESET_STREAM_AT is surfaced.
+    public private(set) var reliableResetSize: UInt64?
+
     // MARK: - Buffer
 
     /// Receive buffer (incoming data reassembly).
@@ -76,6 +79,7 @@ public struct ReceiveStreamCore: Sendable {
         self.finalSize = nil
         self.resetStreamReceived = false
         self.peerResetErrorCode = nil
+        self.reliableResetSize = nil
         self.recvBuffer = StreamReassemblyBuffer(maxBufferSize: maxBufferSize)
     }
 
@@ -149,6 +153,15 @@ public struct ReceiveStreamCore: Sendable {
         }
         let endOffset = computedEndOffset
 
+        if let knownFinalSize = finalSize {
+            guard endOffset <= knownFinalSize else {
+                throw StreamError.finalSizeMismatch(
+                    expected: knownFinalSize,
+                    received: endOffset
+                )
+            }
+        }
+
         if frame.fin, let knownFinalSize = finalSize {
             guard endOffset == knownFinalSize else {
                 throw StreamError.finalSizeMismatch(
@@ -207,7 +220,21 @@ public struct ReceiveStreamCore: Sendable {
             return nil
         }
 
-        let data = recvBuffer.readAllContiguous()
+        let data: [UInt8]?
+        if let reliableResetSize {
+            let remaining = reliableResetSize > recvBuffer.readOffset
+                ? reliableResetSize - recvBuffer.readOffset
+                : 0
+            data = recvBuffer.readContiguous(
+                maximumCount: Int(min(remaining, UInt64(Int.max)))
+            )
+            if recvBuffer.readOffset >= reliableResetSize {
+                recvBuffer.discardUnread()
+                recvState = .resetRead
+            }
+        } else {
+            data = recvBuffer.readAllContiguous()
+        }
 
         // Update state if all data has been read.
         if recvBuffer.isComplete && finReceived {
@@ -222,7 +249,15 @@ public struct ReceiveStreamCore: Sendable {
     /// Peek at available contiguous data without consuming.
     /// - Returns: Data if available, nil otherwise.
     public func peek() -> [UInt8]? {
-        recvBuffer.peekContiguous()
+        guard let reliableResetSize else {
+            return recvBuffer.peekContiguous()
+        }
+        let remaining = reliableResetSize > recvBuffer.readOffset
+            ? reliableResetSize - recvBuffer.readOffset
+            : 0
+        return recvBuffer.peekContiguous(
+            maximumCount: Int(min(remaining, UInt64(Int.max)))
+        )
     }
 
     // MARK: - Flow control
@@ -263,6 +298,7 @@ public struct ReceiveStreamCore: Sendable {
 
         resetStreamReceived = true
         peerResetErrorCode = errorCode
+        reliableResetSize = nil
         self.finalSize = finalSize
 
         // Clear receive buffer.
@@ -270,6 +306,45 @@ public struct ReceiveStreamCore: Sendable {
 
         // Transition receive state.
         recvState = .resetRecvd
+    }
+
+    /// Handles a RESET_STREAM_AT while retaining the reliably-delivered prefix.
+    public mutating func handleResetStreamAt(
+        errorCode: UInt64,
+        finalSize: UInt64,
+        reliableSize: UInt64
+    ) throws(StreamError) {
+        guard reliableSize <= finalSize else {
+            throw StreamError.finalSizeMismatch(expected: finalSize, received: reliableSize)
+        }
+        guard finalSize <= recvMaxData else {
+            throw StreamError.flowControlViolation(limit: recvMaxData, requested: finalSize)
+        }
+        if let knownFinalSize = self.finalSize, knownFinalSize != finalSize {
+            throw StreamError.finalSizeMismatch(expected: knownFinalSize, received: finalSize)
+        }
+        if resetStreamReceived, reliableResetSize == nil {
+            return
+        }
+        if let existingReliableSize = reliableResetSize,
+           reliableSize > existingReliableSize {
+            return
+        }
+
+        resetStreamReceived = true
+        peerResetErrorCode = errorCode
+        self.finalSize = finalSize
+        reliableResetSize = reliableSize
+
+        if reliableSize == 0 {
+            recvBuffer.discardUnread()
+            recvState = .resetRecvd
+        } else if recvBuffer.readOffset >= reliableSize {
+            recvBuffer.discardUnread()
+            recvState = .resetRead
+        } else {
+            recvState = .sizeKnown
+        }
     }
 
     /// Generate STOP_SENDING frame.

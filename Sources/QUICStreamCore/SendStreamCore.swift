@@ -66,6 +66,12 @@ public struct SendStreamCore: Sendable {
     /// Error code if we sent RESET_STREAM.
     public private(set) var resetStreamErrorCode: UInt64?
 
+    /// Pending partial-delivery reset metadata.
+    private var partialResetErrorCode: UInt64?
+    private var partialResetReliableSize: UInt64?
+    private var partialResetFinalSize: UInt64?
+    private var partialResetFrameSent: Bool
+
     /// Creates a send-stream core.
     /// - Parameters:
     ///   - id: Stream identifier.
@@ -90,6 +96,10 @@ public struct SendStreamCore: Sendable {
         self.stopSendingErrorCodeValue = nil
         self.resetStreamSent = false
         self.resetStreamErrorCode = nil
+        self.partialResetErrorCode = nil
+        self.partialResetReliableSize = nil
+        self.partialResetFinalSize = nil
+        self.partialResetFrameSent = false
     }
 
     // MARK: - Derived state
@@ -129,7 +139,9 @@ public struct SendStreamCore: Sendable {
     /// Whether there's data to send (or a FIN still to flush).
     public var hasDataToSend: Bool {
         let pending = sendBuffer.count - sendBufferConsumed
-        return pending > 0 || (finQueued && !finSent)
+        return pending > 0
+            || (finQueued && !finSent)
+            || (partialResetFinalSize != nil && !partialResetFrameSent)
     }
 
     /// Whether this stream needs to generate a RESET_STREAM (due to STOP_SENDING).
@@ -165,6 +177,13 @@ public struct SendStreamCore: Sendable {
             )
         }
 
+        guard partialResetFinalSize == nil else {
+            throw StreamError.invalidState(
+                current: stateDescription(sendState),
+                operation: "write after RESET_STREAM_AT"
+            )
+        }
+
         if stopSendingReceived {
             throw StreamError.streamReset(errorCode: stopSendingErrorCodeValue ?? 0)
         }
@@ -188,6 +207,13 @@ public struct SendStreamCore: Sendable {
             throw StreamError.invalidState(
                 current: stateDescription(sendState),
                 operation: "finish"
+            )
+        }
+
+        guard partialResetFinalSize == nil else {
+            throw StreamError.invalidState(
+                current: stateDescription(sendState),
+                operation: "finish after RESET_STREAM_AT"
             )
         }
 
@@ -317,6 +343,10 @@ public struct SendStreamCore: Sendable {
 
         resetStreamSent = true
         resetStreamErrorCode = errorCode
+        partialResetErrorCode = nil
+        partialResetReliableSize = nil
+        partialResetFinalSize = nil
+        partialResetFrameSent = false
 
         // Clear send buffer (may have been cleared by handleStopSending; safe to repeat).
         sendBuffer.removeAll()
@@ -329,6 +359,77 @@ public struct SendStreamCore: Sendable {
             streamID: id,
             applicationErrorCode: errorCode,
             finalSize: sendOffset
+        )
+    }
+
+    /// Requests a partial-delivery reset while retaining unsent bytes in the
+    /// reliable prefix. The RESET_STREAM_AT frame becomes available only after
+    /// those prefix bytes have been emitted as STREAM frames.
+    public mutating func requestResetStreamAt(
+        errorCode: UInt64,
+        reliableSize: UInt64
+    ) throws(StreamError) {
+        guard !resetStreamSent else {
+            throw StreamError.invalidState(
+                current: stateDescription(sendState),
+                operation: "RESET_STREAM_AT after RESET_STREAM"
+            )
+        }
+
+        if let existingReliableSize = partialResetReliableSize,
+           reliableSize > existingReliableSize {
+            return
+        }
+
+        let pendingCount = UInt64(sendBuffer.count - sendBufferConsumed)
+        let (totalWritten, overflow) = sendBufferOffset.addingReportingOverflow(pendingCount)
+        guard !overflow, totalWritten <= Self.maxFinalOffset else {
+            throw StreamError.finalSizeMismatch(
+                expected: Self.maxFinalOffset,
+                received: UInt64.max
+            )
+        }
+        guard reliableSize <= totalWritten else {
+            throw StreamError.finalSizeMismatch(
+                expected: totalWritten,
+                received: reliableSize
+            )
+        }
+
+        let retainedPendingCount = reliableSize > sendBufferOffset
+            ? Int(reliableSize - sendBufferOffset)
+            : 0
+        let pending = sendBuffer[sendBufferConsumed...]
+        sendBuffer = Array(pending.prefix(retainedPendingCount))
+        sendBufferConsumed = 0
+        finQueued = false
+
+        partialResetErrorCode = errorCode
+        partialResetReliableSize = reliableSize
+        partialResetFinalSize = partialResetFinalSize ?? totalWritten
+        partialResetFrameSent = false
+    }
+
+    /// Emits the pending RESET_STREAM_AT after its reliable prefix has entered
+    /// the QUIC send path.
+    public mutating func generateResetStreamAt() -> ResetStreamAtFrame? {
+        guard !partialResetFrameSent,
+              let errorCode = partialResetErrorCode,
+              let reliableSize = partialResetReliableSize,
+              let finalSize = partialResetFinalSize,
+              sendOffset >= reliableSize else {
+            return nil
+        }
+
+        partialResetFrameSent = true
+        resetStreamSent = true
+        resetStreamErrorCode = errorCode
+        sendState = .resetSent
+        return ResetStreamAtFrame(
+            streamID: id,
+            applicationErrorCode: errorCode,
+            finalSize: finalSize,
+            reliableSize: reliableSize
         )
     }
 

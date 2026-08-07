@@ -61,7 +61,7 @@ struct RFC9000FrameValidator: FrameLevelValidator {
         // STREAM frames: Allowed at 0-RTT and 1-RTT only
         case .stream, .maxData, .maxStreamData, .maxStreams,
              .dataBlocked, .streamDataBlocked, .streamsBlocked,
-             .resetStream, .stopSending:
+             .resetStream, .resetStreamAt, .stopSending:
             if level == .initial || level == .handshake {
                 throw ProtocolViolation.frameNotAllowed(frame.frameType, level)
             }

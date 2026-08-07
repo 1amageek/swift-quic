@@ -38,6 +38,7 @@ public enum FrameType: UInt64, Sendable {
     case connectionClose = 0x1c
     case connectionCloseApp = 0x1d
     case handshakeDone = 0x1e
+    case resetStreamAt = 0x24
     case datagram = 0x30
     case datagramWithLength = 0x31
 
@@ -87,6 +88,9 @@ public enum Frame: Sendable, Hashable {
 
     /// RESET_STREAM frame (type 0x04) - abruptly terminates a stream
     case resetStream(ResetStreamFrame)
+
+    /// RESET_STREAM_AT frame (type 0x24) - resets after reliably delivering a prefix.
+    case resetStreamAt(ResetStreamAtFrame)
 
     /// STOP_SENDING frame (type 0x05) - requests peer stop sending on stream
     case stopSending(StopSendingFrame)
@@ -146,6 +150,7 @@ public enum Frame: Sendable, Hashable {
         case .ping: return .ping
         case .ack(let f): return f.ecnCounts != nil ? .ackECN : .ack
         case .resetStream: return .resetStream
+        case .resetStreamAt: return .resetStreamAt
         case .stopSending: return .stopSending
         case .crypto: return .crypto
         case .newToken: return .newToken

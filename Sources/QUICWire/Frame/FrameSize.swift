@@ -180,6 +180,20 @@ public enum FrameSize {
           + Varint.encodedLength(for: finalSize)
     }
 
+    /// Calculates the encoded size of a RESET_STREAM_AT frame.
+    @inlinable
+    public static func resetStreamAtFrame(
+        streamID: UInt64,
+        errorCode: UInt64,
+        finalSize: UInt64,
+        reliableSize: UInt64
+    ) -> Int {
+        1 + Varint.encodedLength(for: streamID)
+          + Varint.encodedLength(for: errorCode)
+          + Varint.encodedLength(for: finalSize)
+          + Varint.encodedLength(for: reliableSize)
+    }
+
     /// Calculates the encoded size of a STOP_SENDING frame
     @inlinable
     public static func stopSendingFrame(streamID: UInt64, errorCode: UInt64) -> Int {
@@ -226,6 +240,14 @@ public enum FrameSize {
                 streamID: f.streamID,
                 errorCode: f.applicationErrorCode,
                 finalSize: f.finalSize
+            )
+
+        case .resetStreamAt(let f):
+            return resetStreamAtFrame(
+                streamID: f.streamID,
+                errorCode: f.applicationErrorCode,
+                finalSize: f.finalSize,
+                reliableSize: f.reliableSize
             )
 
         case .stopSending(let f):

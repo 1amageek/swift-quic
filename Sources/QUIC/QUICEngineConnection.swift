@@ -326,6 +326,33 @@ public final class QUICEngineConnection<
         await flushNow()
     }
 
+    /// Resets a stream's send side and flushes the RESET_STREAM frame.
+    public func resetStream(
+        _ id: UInt64,
+        errorCode: UInt64
+    ) async throws(QUICEngineError) {
+        try run { (engine) throws(QUICEngineError) in
+            try engine.resetStream(id, errorCode: errorCode)
+        }
+        await flushNow()
+    }
+
+    /// Resets a stream after reliably delivering its prefix and flushes.
+    public func resetStreamAt(
+        _ id: UInt64,
+        errorCode: UInt64,
+        reliableSize: UInt64
+    ) async throws(QUICEngineError) {
+        try run { (engine) throws(QUICEngineError) in
+            try engine.resetStreamAt(
+                id,
+                errorCode: errorCode,
+                reliableSize: reliableSize
+            )
+        }
+        await flushNow()
+    }
+
     /// Queues an unreliable DATAGRAM payload (RFC 9221) and flushes.
     public func sendDatagram(_ payload: [UInt8]) async throws(QUICEngineError) {
         try run { (e) throws(QUICEngineError) in try e.sendDatagram(payload) }

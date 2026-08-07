@@ -147,6 +147,9 @@ public final class ManagedConnection: Sendable {
     /// `max_datagram_frame_size` transport parameter when the handshake completes.
     private let peerMaxDatagramFrameSize: Mutex<UInt64>
 
+    /// Whether the peer advertised RESET_STREAM_AT support.
+    private let peerSupportsPartialDeliveryResets: Mutex<Bool>
+
     /// Original connection ID (for Initial key derivation)
     /// This is the DCID from the first client Initial packet
     private let originalConnectionID: ConnectionID
@@ -230,6 +233,7 @@ public final class ManagedConnection: Sendable {
         self.incomingDatagramState = Mutex(IncomingDatagramState())
         // Seed with our local advertised value; replaced by the peer's value at handshake.
         self.peerMaxDatagramFrameSize = Mutex(0)
+        self.peerSupportsPartialDeliveryResets = Mutex(false)
         self.onNewConnectionID = Mutex(nil)  // Set later via setNewConnectionIDCallback
         var initialState = ManagedConnectionState(
             role: role,
@@ -875,7 +879,7 @@ public final class ManagedConnection: Sendable {
             inFlight: inFlight,
             sentBytes: sentBytes
         )
-        handler.recordSentPacket(sentPacket)
+        handler.recordSentPacket(sentPacket, frames: frames)
     }
 
     /// Updates the pacer rate from the current congestion window and smoothed RTT.
@@ -1027,11 +1031,9 @@ public final class ManagedConnection: Sendable {
         case .none:
             return []
 
-        case .retransmit(_, let level):
-            // SentPacket doesn't contain frame data, so we send a PING as probe
-            // The actual retransmission is handled by the stream manager when
-            // data hasn't been ACKed
-            handler.queueFrame(.ping, level: level)
+        case .retransmit:
+            // The handler has already restored the lost retransmittable information
+            // from its packet ledger. Packetize those original frames immediately.
             return try generateOutboundPackets()
 
         case .probe:
@@ -1082,6 +1084,9 @@ public final class ManagedConnection: Sendable {
                 // RFC 9221: record the peer's advertised DATAGRAM support so sendDatagram
                 // can enforce it. 0 / absent means the peer does not support DATAGRAM frames.
                 peerMaxDatagramFrameSize.withLock { $0 = params.maxDatagramFrameSize }
+                peerSupportsPartialDeliveryResets.withLock {
+                    $0 = params.enableResetStreamAt
+                }
 
                 // RFC 9000 §14: bound DPLPMTUD by the peer's max_udp_payload_size. The peer
                 // will not accept UDP payloads larger than this, so it caps the probe ceiling.
@@ -1449,6 +1454,20 @@ extension ManagedConnection: QUICConnectionProtocol {
         state.withLock { $0.handshakeState == .established }
     }
 
+    public var localTransportCapabilities: QUICTransportCapabilities {
+        QUICTransportCapabilities(
+            maximumDatagramFrameSize: transportParameters.maxDatagramFrameSize,
+            supportsPartialDeliveryResets: transportParameters.enableResetStreamAt
+        )
+    }
+
+    public var peerTransportCapabilities: QUICTransportCapabilities {
+        QUICTransportCapabilities(
+            maximumDatagramFrameSize: peerMaxDatagramFrameSize.withLock { $0 },
+            supportsPartialDeliveryResets: peerSupportsPartialDeliveryResets.withLock { $0 }
+        )
+    }
+
     public func openStream() async throws -> any QUICStreamProtocol {
         let streamID = try handler.openStream(bidirectional: true)
         return ManagedStream(
@@ -1698,14 +1717,34 @@ extension ManagedConnection {
     }
 
     /// Resets a stream
-    func resetStream(_ streamID: UInt64, errorCode: UInt64) {
-        handler.closeStream(streamID)
+    func resetStream(_ streamID: UInt64, errorCode: UInt64) throws {
+        try handler.resetStream(streamID, errorCode: errorCode)
+        signalNeedsSend()
+    }
+
+    /// Resets a stream after reliably delivering its prefix.
+    func resetStreamAt(
+        _ streamID: UInt64,
+        errorCode: UInt64,
+        reliableSize: UInt64
+    ) throws {
+        guard peerSupportsPartialDeliveryResets.withLock({ $0 }) else {
+            throw ManagedConnectionError.invalidState(
+                "Peer did not advertise RESET_STREAM_AT"
+            )
+        }
+        try handler.resetStreamAt(
+            streamID,
+            errorCode: errorCode,
+            reliableSize: reliableSize
+        )
+        signalNeedsSend()
     }
 
     /// Stops sending on a stream
     func stopSending(_ streamID: UInt64, errorCode: UInt64) {
-        // Handler will generate STOP_SENDING frame
-        handler.closeStream(streamID)
+        handler.stopSending(streamID, errorCode: errorCode)
+        signalNeedsSend()
     }
 }
 
@@ -2064,7 +2103,7 @@ public enum QUICDatagramError: Error, Sendable, Equatable {
 
 // MARK: - Datagram Public API (RFC 9221)
 
-extension ManagedConnection {
+extension ManagedConnection: QUICDatagramConnectionProtocol {
     /// The maximum payload, in bytes, that can currently be sent in a single datagram.
     ///
     /// This accounts for the DATAGRAM frame overhead (type byte + length field) against the
@@ -2169,6 +2208,22 @@ extension ManagedConnection {
                 state.pendingDatagrams.append(datagram)
             }
         }
+    }
+}
+
+// MARK: - Keep-Alive Public API
+
+extension ManagedConnection: QUICKeepAliveConnectionProtocol {
+    /// Enqueues an ack-eliciting 1-RTT PING and wakes the endpoint send loop.
+    public func sendPing() async throws {
+        let handshakeState = state.withLock { $0.handshakeState }
+        guard handshakeState == .established else {
+            throw ManagedConnectionError.invalidState(
+                "A keep-alive PING requires an established connection"
+            )
+        }
+        handler.queueFrame(.ping, level: .application)
+        signalNeedsSend()
     }
 }
 

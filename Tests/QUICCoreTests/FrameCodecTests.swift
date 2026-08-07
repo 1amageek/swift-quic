@@ -246,6 +246,48 @@ struct FrameCodecTests {
         }
     }
 
+    @Test("Encode and decode RESET_STREAM_AT frame")
+    func resetStreamAtFrame() throws {
+        let frame = Frame.resetStreamAt(ResetStreamAtFrame(
+            streamID: 12,
+            applicationErrorCode: 0x52,
+            finalSize: 4_096,
+            reliableSize: 1_024
+        ))
+        let encoded = try codec.encode(frame)
+
+        #expect(encoded[0] == 0x24)
+
+        var reader = DataReader(encoded)
+        let decoded = try codec.decode(from: &reader)
+        guard case .resetStreamAt(let reset) = decoded else {
+            Issue.record("Expected RESET_STREAM_AT frame")
+            return
+        }
+        #expect(reset.streamID == 12)
+        #expect(reset.applicationErrorCode == 0x52)
+        #expect(reset.finalSize == 4_096)
+        #expect(reset.reliableSize == 1_024)
+    }
+
+    @Test("RESET_STREAM_AT rejects a reliable size beyond the final size")
+    func resetStreamAtRejectsInvalidReliableSize() throws {
+        let invalid = Frame.resetStreamAt(ResetStreamAtFrame(
+            streamID: 0,
+            applicationErrorCode: 0,
+            finalSize: 3,
+            reliableSize: 4
+        ))
+        #expect(throws: FrameCodecError.self) {
+            _ = try codec.encode(invalid)
+        }
+
+        var reader = DataReader(Data([0x24, 0x00, 0x00, 0x03, 0x04]))
+        #expect(throws: FrameCodecError.self) {
+            _ = try codec.decode(from: &reader)
+        }
+    }
+
     // MARK: - STOP_SENDING Frame
 
     @Test("Encode and decode STOP_SENDING frame")

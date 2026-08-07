@@ -36,6 +36,8 @@ extension FrameType {
             return "ack"
         case .resetStream:
             return "reset_stream"
+        case .resetStreamAt:
+            return "reset_stream_at"
         case .stopSending:
             return "stop_sending"
         case .crypto:
@@ -88,6 +90,8 @@ extension Frame {
             return "ack"
         case .resetStream:
             return "reset_stream"
+        case .resetStreamAt:
+            return "reset_stream_at"
         case .stopSending:
             return "stop_sending"
         case .crypto:

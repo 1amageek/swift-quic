@@ -71,6 +71,15 @@ public final class QUICConnectionHandler: Sendable {
     /// Pending outbound packets
     private let outboundQueue: Mutex<[OutboundPacket]> = Mutex([])
 
+    /// Retransmittable frame ownership, keyed by packet number space and packet number.
+    ///
+    /// STREAM and CRYPTO producers advance their source buffers when a frame enters the
+    /// packetization path. This ledger therefore owns the only retransmission copy until
+    /// the packet is acknowledged or declared lost. ACK/PADDING/DATAGRAM and connection
+    /// close frames are intentionally excluded because they do not carry retransmittable
+    /// information (RFC 9002 Section 13.3).
+    private let sentFrameLedger: Mutex<[SentFrameKey: [Frame]]> = Mutex([:])
+
     /// Whether handshake is complete
     private let handshakeComplete: Mutex<Bool> = Mutex(false)
 
@@ -323,6 +332,18 @@ public final class QUICConnectionHandler: Sendable {
             case .resetStream(let resetFrame):
                 try streamManager.handleResetStream(resetFrame)
 
+            case .resetStreamAt(let resetFrame):
+                guard localTransportParams.enableResetStreamAt else {
+                    throw QUICError.frameNotAllowed(
+                        frameType: UInt64(frame.frameType.rawValue),
+                        packetType: "\(level)"
+                    )
+                }
+                try streamManager.handleResetStreamAt(resetFrame)
+                if let data = streamManager.read(streamID: resetFrame.streamID) {
+                    result.streamData.append((resetFrame.streamID, data))
+                }
+
             case .stopSending(let stopFrame):
                 streamManager.handleStopSending(stopFrame)
 
@@ -443,6 +464,9 @@ public final class QUICConnectionHandler: Sendable {
             level: level,
             receiveTime: now
         )
+
+        acknowledgeFrames(in: result.ackedPackets)
+        requeueFrames(in: result.lostPackets)
 
         // RFC 9000 §14.4: separate DPLPMTUD probe packets from ordinary packets. Probes
         // are reported to the PMTU machine but excluded from congestion control — their
@@ -701,6 +725,13 @@ public final class QUICConnectionHandler: Sendable {
                 queueFrame(.stream(streamFrame), level: .application)
             }
 
+            for resetFrame in streamManager.generateResetFrames() {
+                queueFrame(.resetStream(resetFrame), level: .application)
+            }
+            for resetFrame in streamManager.generateResetStreamAtFrames() {
+                queueFrame(.resetStreamAt(resetFrame), level: .application)
+            }
+
             // Generate flow control frames
             let flowFrames = streamManager.generateFlowControlFrames()
             for flowFrame in flowFrames {
@@ -734,7 +765,18 @@ public final class QUICConnectionHandler: Sendable {
 
     /// Records a sent packet for loss detection and congestion control
     /// - Parameter packet: The sent packet
-    public func recordSentPacket(_ packet: SentPacket) {
+    public func recordSentPacket(_ packet: SentPacket, frames: [Frame] = []) {
+        let retransmittableFrames = frames.filter(\.carriesRetransmittableInformation)
+        if !retransmittableFrames.isEmpty {
+            let key = SentFrameKey(
+                encryptionLevel: packet.encryptionLevel,
+                packetNumber: packet.packetNumber
+            )
+            sentFrameLedger.withLock { ledger in
+                ledger[key] = retransmittableFrames
+            }
+        }
+
         pnSpaceManager.onPacketSent(packet)
 
         // Notify congestion controller
@@ -770,6 +812,7 @@ public final class QUICConnectionHandler: Sendable {
                     // A probe loss is not a congestion signal, so it is reported only here
                     // (not to the congestion controller).
                     reportPMTUProbeLosses(lostPackets)
+                    requeueFrames(in: lostPackets)
                     return .retransmit(lostPackets, level: level)
                 }
             }
@@ -783,6 +826,92 @@ public final class QUICConnectionHandler: Sendable {
         }
 
         return .none
+    }
+
+    /// Restores frames that failed before packet transmission.
+    ///
+    /// The caller uses this only before `recordSentPacket`, so these frames have no
+    /// packet-ledger entry yet. Preserving their original order keeps CRYPTO and STREAM
+    /// offsets deterministic while allowing the next packetization pass to retry them.
+    public func requeueUnsentFrames(_ frames: [Frame], level: EncryptionLevel) {
+        let packets = frames
+            .filter(\.carriesRetransmittableInformation)
+            .map { OutboundPacket(frames: [$0], level: level) }
+        guard !packets.isEmpty else { return }
+        outboundQueue.withLock { queue in
+            queue.insert(contentsOf: packets, at: 0)
+        }
+    }
+
+    private func acknowledgeFrames(in packets: [SentPacket]) {
+        let acknowledgedFrames = takeFrames(for: packets)
+        for frame in acknowledgedFrames {
+            switch frame {
+            case .stream(let streamFrame):
+                let endOffset = streamFrame.offset + UInt64(streamFrame.data.count)
+                streamManager.acknowledgeData(
+                    streamID: streamFrame.streamID,
+                    upTo: endOffset
+                )
+            case .resetStream(let resetFrame):
+                streamManager.acknowledgeReset(streamID: resetFrame.streamID)
+            case .resetStreamAt(let resetFrame):
+                streamManager.acknowledgeReset(streamID: resetFrame.streamID)
+            default:
+                break
+            }
+        }
+    }
+
+    private func requeueFrames(in packets: [SentPacket]) {
+        let framesByLevel = takeFramesGroupedByLevel(for: packets)
+        guard !framesByLevel.isEmpty else { return }
+        outboundQueue.withLock { queue in
+            var restored: [OutboundPacket] = []
+            restored.reserveCapacity(framesByLevel.values.reduce(0) { $0 + $1.count })
+            for level in EncryptionLevel.allCases {
+                guard let frames = framesByLevel[level] else { continue }
+                restored.append(contentsOf: frames.map {
+                    OutboundPacket(frames: [$0], level: level)
+                })
+            }
+            queue.insert(contentsOf: restored, at: 0)
+        }
+    }
+
+    private func takeFrames(for packets: [SentPacket]) -> [Frame] {
+        sentFrameLedger.withLock { ledger in
+            var frames: [Frame] = []
+            for packet in packets {
+                let key = SentFrameKey(
+                    encryptionLevel: packet.encryptionLevel,
+                    packetNumber: packet.packetNumber
+                )
+                if let ownedFrames = ledger.removeValue(forKey: key) {
+                    frames.append(contentsOf: ownedFrames)
+                }
+            }
+            return frames
+        }
+    }
+
+    private func takeFramesGroupedByLevel(
+        for packets: [SentPacket]
+    ) -> [EncryptionLevel: [Frame]] {
+        sentFrameLedger.withLock { ledger in
+            var framesByLevel: [EncryptionLevel: [Frame]] = [:]
+            for packet in packets {
+                let key = SentFrameKey(
+                    encryptionLevel: packet.encryptionLevel,
+                    packetNumber: packet.packetNumber
+                )
+                if let ownedFrames = ledger.removeValue(forKey: key) {
+                    framesByLevel[packet.encryptionLevel, default: []]
+                        .append(contentsOf: ownedFrames)
+                }
+            }
+            return framesByLevel
+        }
     }
 
     /// Reports any tracked PMTU probe packets in the given lost set to the PMTU machine.
@@ -922,6 +1051,37 @@ public final class QUICConnectionHandler: Sendable {
     /// - Parameter streamID: Stream to close
     public func closeStream(_ streamID: UInt64) {
         streamManager.closeStream(id: streamID)
+    }
+
+    /// Queues RESET_STREAM for an active stream.
+    public func resetStream(_ streamID: UInt64, errorCode: UInt64) throws {
+        let frame = try streamManager.resetStream(id: streamID, errorCode: errorCode)
+        queueFrame(.resetStream(frame), level: .application)
+    }
+
+    /// Requests RESET_STREAM_AT for an active stream. The frame is generated
+    /// after its reliable prefix has entered the stream send path.
+    public func resetStreamAt(
+        _ streamID: UInt64,
+        errorCode: UInt64,
+        reliableSize: UInt64
+    ) throws {
+        try streamManager.resetStreamAt(
+            id: streamID,
+            errorCode: errorCode,
+            reliableSize: reliableSize
+        )
+    }
+
+    /// Queues STOP_SENDING without deleting the receive stream state.
+    public func stopSending(_ streamID: UInt64, errorCode: UInt64) {
+        queueFrame(
+            .stopSending(StopSendingFrame(
+                streamID: streamID,
+                applicationErrorCode: errorCode
+            )),
+            level: .application
+        )
     }
 
     /// Checks if a stream has data to read
@@ -1191,6 +1351,22 @@ public struct OutboundPacket: Sendable {
         self.frames = frames
         self.level = level
         self.createdAt = .now
+    }
+}
+
+private struct SentFrameKey: Sendable, Hashable {
+    let encryptionLevel: EncryptionLevel
+    let packetNumber: UInt64
+}
+
+private extension Frame {
+    var carriesRetransmittableInformation: Bool {
+        switch self {
+        case .padding, .ack, .connectionClose, .datagram, .pathResponse:
+            return false
+        default:
+            return true
+        }
     }
 }
 

@@ -152,6 +152,29 @@ public struct ResetStreamFrame: Sendable, Hashable {
     }
 }
 
+/// RESET_STREAM_AT frame (draft-ietf-quic-reliable-stream-reset-09).
+///
+/// `reliableSize` bytes from the start of the stream remain subject to normal
+/// retransmission even though the stream is reset. It cannot exceed `finalSize`.
+public struct ResetStreamAtFrame: Sendable, Hashable {
+    public let streamID: UInt64
+    public let applicationErrorCode: UInt64
+    public let finalSize: UInt64
+    public let reliableSize: UInt64
+
+    public init(
+        streamID: UInt64,
+        applicationErrorCode: UInt64,
+        finalSize: UInt64,
+        reliableSize: UInt64
+    ) {
+        self.streamID = streamID
+        self.applicationErrorCode = applicationErrorCode
+        self.finalSize = finalSize
+        self.reliableSize = reliableSize
+    }
+}
+
 // MARK: - STOP_SENDING Frame
 
 /// STOP_SENDING frame (RFC 9000 Section 19.5)

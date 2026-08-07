@@ -14,7 +14,21 @@ import Synchronization
 
 // MARK: - Managed Stream
 
-/// A managed QUIC stream implementing QUICStreamProtocol
+/// A managed QUIC stream implementing QUICStreamProtocol.
+///
+/// Concurrency invariants:
+/// - `state` is the sole mutable stream state and every access uses the same
+///   `Mutex` on every target where this host-only type exists.
+/// - The parent owns its streams, so the back-reference is weak to prevent a
+///   retain cycle. It is assigned only during initialization; runtime weak
+///   zeroing is the only subsequent mutation.
+/// - Each operation promotes the weak reference to a strong local before use,
+///   keeping the parent alive for the complete operation.
+/// - No I/O, suspension, or external callback occurs while `state` is locked.
+///
+/// Swift cannot prove the weak-reference contract, so Sendable conformance is
+/// checked manually at this boundary. The weak reference and Mutex never exist
+/// in the Embedded/WASI engine-only build.
 public final class ManagedStream: @unchecked Sendable {
     // MARK: - Properties
 
@@ -25,7 +39,7 @@ public final class ManagedStream: @unchecked Sendable {
     public let isUnidirectional: Bool
 
     /// Weak reference to parent connection
-    private weak var connection: ManagedConnection?
+    private nonisolated(unsafe) weak var connection: ManagedConnection?
 
     /// Internal state
     private let state: Mutex<ManagedStreamState>
@@ -60,25 +74,14 @@ public final class ManagedStream: @unchecked Sendable {
 
 extension ManagedStream: QUICStreamProtocol {
     public func read() async throws -> Data {
-        guard let conn = connection else {
-            throw ManagedStreamError.connectionLost
-        }
-
-        guard !state.withLock({ $0.readClosed }) else {
-            throw ManagedStreamError.streamClosed
-        }
-
-        return try await conn.readFromStream(id)
+        try await readMaximum(nil)
     }
 
     public func read(maxBytes: Int) async throws -> Data {
-        let data = try await read()
-
-        // Truncate if needed
-        if data.count > maxBytes {
-            return data.prefix(maxBytes)
+        guard maxBytes > 0 else {
+            throw ManagedStreamError.invalidReadSize(maxBytes)
         }
-        return data
+        return try await readMaximum(maxBytes)
     }
 
     public func write(_ data: Data) async throws {
@@ -86,7 +89,7 @@ extension ManagedStream: QUICStreamProtocol {
             throw ManagedStreamError.connectionLost
         }
 
-        guard !state.withLock({ $0.writeClosed }) else {
+        guard !state.withLock({ $0.writeClosed || $0.writeTerminationInProgress }) else {
             throw ManagedStreamError.streamClosed
         }
 
@@ -98,25 +101,51 @@ extension ManagedStream: QUICStreamProtocol {
             throw ManagedStreamError.connectionLost
         }
 
-        // Idempotent: only finish stream once
-        let alreadyClosed = state.withLock { s in
-            let was = s.writeClosed
-            s.writeClosed = true
-            return was
+        guard try beginWriteTermination() else { return }
+        do {
+            try conn.finishStream(id)
+            completeWriteTermination()
+        } catch {
+            cancelWriteTermination()
+            throw error
         }
-
-        guard !alreadyClosed else { return }
-        try conn.finishStream(id)
     }
 
-    public func reset(errorCode: UInt64) async {
-        guard let conn = connection else { return }
-
-        state.withLock { state in
-            state.writeClosed = true
-            state.readClosed = true
+    public func reset(errorCode: UInt64) async throws {
+        guard let conn = connection else {
+            throw ManagedStreamError.connectionLost
         }
-        conn.resetStream(id, errorCode: errorCode)
+
+        guard try beginWriteTermination() else { return }
+        do {
+            try conn.resetStream(id, errorCode: errorCode)
+            completeWriteTermination()
+        } catch {
+            cancelWriteTermination()
+            throw error
+        }
+    }
+
+    public func reset(
+        errorCode: UInt64,
+        reliablyDelivering reliableSize: UInt64
+    ) async throws {
+        guard let conn = connection else {
+            throw ManagedStreamError.connectionLost
+        }
+
+        guard try beginWriteTermination() else { return }
+        do {
+            try conn.resetStreamAt(
+                id,
+                errorCode: errorCode,
+                reliableSize: reliableSize
+            )
+            completeWriteTermination()
+        } catch {
+            cancelWriteTermination()
+            throw error
+        }
     }
 
     public func stopSending(errorCode: UInt64) async throws {
@@ -124,8 +153,81 @@ extension ManagedStream: QUICStreamProtocol {
             throw ManagedStreamError.connectionLost
         }
 
-        state.withLock { $0.readClosed = true }
         conn.stopSending(id, errorCode: errorCode)
+        state.withLock { $0.readClosed = true }
+    }
+
+    private func beginWriteTermination() throws -> Bool {
+        try state.withLock { state in
+            if state.writeClosed {
+                return false
+            }
+            guard !state.writeTerminationInProgress else {
+                throw ManagedStreamError.concurrentWriteTermination
+            }
+            state.writeTerminationInProgress = true
+            return true
+        }
+    }
+
+    private func completeWriteTermination() {
+        state.withLock { state in
+            state.writeTerminationInProgress = false
+            state.writeClosed = true
+        }
+    }
+
+    private func cancelWriteTermination() {
+        state.withLock { $0.writeTerminationInProgress = false }
+    }
+
+    private func readMaximum(_ maximum: Int?) async throws -> Data {
+        guard let conn = connection else {
+            throw ManagedStreamError.connectionLost
+        }
+
+        let buffered: Data? = try state.withLock { state in
+            guard !state.readClosed else {
+                throw ManagedStreamError.streamClosed
+            }
+            guard !state.isReading else {
+                throw ManagedStreamError.concurrentRead
+            }
+            if !state.pendingRead.isEmpty {
+                return Self.takePrefix(maximum, from: &state.pendingRead)
+            }
+            state.isReading = true
+            return nil
+        }
+        if let buffered {
+            return buffered
+        }
+
+        do {
+            let received = try await conn.readFromStream(id)
+            return state.withLock { state in
+                state.isReading = false
+                state.pendingRead = received
+                return Self.takePrefix(maximum, from: &state.pendingRead)
+            }
+        } catch {
+            state.withLock { $0.isReading = false }
+            throw error
+        }
+    }
+
+    private static func takePrefix(
+        _ maximum: Int?,
+        from buffer: inout Data
+    ) -> Data {
+        guard let maximum, buffer.count > maximum else {
+            let result = buffer
+            buffer.removeAll(keepingCapacity: true)
+            return result
+        }
+        let result = Data(buffer.prefix(maximum))
+        buffer.removeFirst(maximum)
+        return result
     }
 }
 
@@ -134,6 +236,9 @@ extension ManagedStream: QUICStreamProtocol {
 private struct ManagedStreamState: Sendable {
     var readClosed: Bool = false
     var writeClosed: Bool = false
+    var writeTerminationInProgress: Bool = false
+    var isReading: Bool = false
+    var pendingRead = Data()
 }
 
 // MARK: - Errors
@@ -151,6 +256,15 @@ public enum ManagedStreamError: Error, Sendable {
 
     /// Read failed
     case readFailed(String)
+
+    /// A read was requested while another read was suspended.
+    case concurrentRead
+
+    /// A FIN or reset operation is already committing the write-side state.
+    case concurrentWriteTermination
+
+    /// The maximum read size must be positive.
+    case invalidReadSize(Int)
 }
 
 #endif

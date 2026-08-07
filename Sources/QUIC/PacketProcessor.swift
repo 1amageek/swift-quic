@@ -32,6 +32,19 @@ package final class PacketProcessor: Sendable {
     /// Crypto contexts per encryption level
     private let contexts: Mutex<[EncryptionLevel: CryptoContext]>
 
+    /// Directional TLS traffic secrets accumulated per encryption level.
+    ///
+    /// TLS exports read and write secrets as independent events. This state is
+    /// serialized separately from packet use so each event can install the
+    /// newly available direction without discarding the opposite direction.
+    private let trafficSecrets: Mutex<[EncryptionLevel: DirectionalTrafficSecrets]>
+
+    private struct DirectionalTrafficSecrets: Sendable {
+        var client: SymmetricKey?
+        var server: SymmetricKey?
+        let cipherSuite: QUICCipherSuite
+    }
+
     /// Packet encoder
     private let encoder = PacketEncoder()
 
@@ -78,6 +91,7 @@ package final class PacketProcessor: Sendable {
         // Clamp to valid range (RFC 9000 Section 17.2: 0-20 bytes)
         let validLength = max(0, min(dcidLength, Self.maxDCIDLength))
         self.contexts = Mutex([:])
+        self.trafficSecrets = Mutex([:])
         self._dcidLength = Atomic(validLength)
         self.largestReceivedPN = Mutex([:])
         self.keyPhaseState = Mutex(nil)
@@ -148,25 +162,49 @@ package final class PacketProcessor: Sendable {
             return
         }
 
-        // Standard bidirectional keys
-        guard let clientSecret = info.clientSecret,
-              let serverSecret = info.serverSecret else {
-            throw PacketCodecError.invalidPacketFormat("Both client and server secrets required")
+        guard info.clientSecret != nil || info.serverSecret != nil else {
+            throw PacketCodecError.invalidPacketFormat("At least one traffic secret is required")
         }
 
-        // Derive key material from traffic secrets using negotiated cipher suite
-        let clientKeys = try KeyMaterial.derive(from: clientSecret, cipherSuite: cipherSuite)
-        let serverKeys = try KeyMaterial.derive(from: serverSecret, cipherSuite: cipherSuite)
+        let accumulated = try trafficSecrets.withLock { secrets in
+            if let current = secrets[info.level],
+               !Self.sameCipherSuite(current.cipherSuite, cipherSuite) {
+                throw PacketCodecError.invalidPacketFormat(
+                    "Cipher suite changed within an encryption level"
+                )
+            }
+            var current = secrets[info.level]
+                ?? DirectionalTrafficSecrets(
+                    client: nil,
+                    server: nil,
+                    cipherSuite: cipherSuite
+                )
+            if let clientSecret = info.clientSecret {
+                current.client = clientSecret
+            }
+            if let serverSecret = info.serverSecret {
+                current.server = serverSecret
+            }
+            secrets[info.level] = current
+            return current
+        }
 
-        // Client reads server keys, writes client keys (and vice versa)
-        let readKeys = isClient ? serverKeys : clientKeys
-        let writeKeys = isClient ? clientKeys : serverKeys
+        // QUIC can receive each TLS traffic direction independently. Preserve
+        // the already-installed half while installing the newly exported half.
+        let existing = context(for: info.level)
+        var opener = existing?.opener
+        var sealer = existing?.sealer
+        let readSecret = isClient ? info.serverSecret : info.clientSecret
+        let writeSecret = isClient ? info.clientSecret : info.serverSecret
+        if let readSecret {
+            let readKeys = try KeyMaterial.derive(from: readSecret, cipherSuite: cipherSuite)
+            (opener, _) = try readKeys.createCrypto()
+        }
+        if let writeSecret {
+            let writeKeys = try KeyMaterial.derive(from: writeSecret, cipherSuite: cipherSuite)
+            (_, sealer) = try writeKeys.createCrypto()
+        }
 
-        // Create opener (for decryption) and sealer (for encryption) using factory method
-        let (opener, _) = try readKeys.createCrypto()
-        let (_, sealer) = try writeKeys.createCrypto()
-
-        // Install the crypto context
         let context = CryptoContext(opener: opener, sealer: sealer)
         installContext(context, for: info.level)
 
@@ -174,7 +212,12 @@ package final class PacketProcessor: Sendable {
         // connection can rotate keys. The key-phase manager is seeded with a KeySchedule that
         // carries the application secrets (required for "quic ku" derivation) and the negotiated
         // cipher suite, so updates derive keys for the correct AEAD rather than a hardcoded one.
-        if info.level == .application {
+        if info.level == .application,
+           keyPhaseState.withLock({ $0 == nil }),
+           let clientSecret = accumulated.client,
+           let serverSecret = accumulated.server,
+           let opener,
+           let sealer {
             try installApplicationKeyPhase(
                 clientSecret: clientSecret,
                 serverSecret: serverSecret,
@@ -183,6 +226,19 @@ package final class PacketProcessor: Sendable {
                 sealer: sealer,
                 isClient: isClient
             )
+        }
+    }
+
+    private static func sameCipherSuite(
+        _ lhs: QUICCipherSuite,
+        _ rhs: QUICCipherSuite
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (.aes128GcmSha256, .aes128GcmSha256),
+             (.chacha20Poly1305Sha256, .chacha20Poly1305Sha256):
+            return true
+        default:
+            return false
         }
     }
 
@@ -285,6 +341,7 @@ package final class PacketProcessor: Sendable {
     /// - Parameter level: The encryption level to discard
     public func discardKeys(for level: EncryptionLevel) {
         discardContext(for: level)
+        _ = trafficSecrets.withLock { $0.removeValue(forKey: level) }
     }
 
     /// Checks if keys are installed for a level

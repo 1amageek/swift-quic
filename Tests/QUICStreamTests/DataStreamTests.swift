@@ -410,6 +410,62 @@ struct DataStreamTests {
         #expect(!stream.hasDataToRead)  // Buffer cleared
     }
 
+    @Test("RESET_STREAM_AT delivers only the reliable prefix")
+    func resetStreamAtDeliversReliablePrefix() throws {
+        let stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+        try stream.receive(StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data("abcdefgh".utf8),
+            fin: false
+        ))
+
+        try stream.handleResetStreamAt(errorCode: 42, finalSize: 8, reliableSize: 3)
+
+        #expect(stream.peek() == Data("abc".utf8))
+        #expect(stream.read() == Data("abc".utf8))
+        #expect(stream.read() == nil)
+        #expect(!stream.hasDataToRead)
+        #expect(stream.state.recvState == .resetRead)
+    }
+
+    @Test("RESET_STREAM_AT accepts a reduced reliable size and ignores a reordered increase")
+    func resetStreamAtReordering() throws {
+        let stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+        try stream.receive(StreamFrame(
+            streamID: 0,
+            offset: 0,
+            data: Data("foo".utf8),
+            fin: false
+        ))
+        #expect(stream.read() == Data("foo".utf8))
+        try stream.receive(StreamFrame(
+            streamID: 0,
+            offset: 3,
+            data: Data("bar".utf8),
+            fin: false
+        ))
+
+        try stream.handleResetStreamAt(errorCode: 42, finalSize: 10, reliableSize: 6)
+        try stream.handleResetStreamAt(errorCode: 42, finalSize: 10, reliableSize: 8)
+        #expect(stream.peek() == Data("bar".utf8))
+
+        try stream.handleResetStreamAt(errorCode: 42, finalSize: 10, reliableSize: 3)
+        #expect(stream.read() == nil)
+        #expect(!stream.hasDataToRead)
+        #expect(stream.state.recvState == .resetRead)
+    }
+
     @Test("Generate RESET_STREAM")
     func generateResetStream() throws {
         let stream = DataStream(
@@ -429,6 +485,51 @@ struct DataStreamTests {
         #expect(resetFrame!.applicationErrorCode == 42)
         #expect(resetFrame!.finalSize == 5)
         #expect(stream.state.sendState == .resetSent)
+    }
+
+    @Test("RESET_STREAM_AT sends the reliable prefix and discards its tail")
+    func generateResetStreamAt() throws {
+        let stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 1000,
+            initialRecvMaxData: 1000
+        )
+        try stream.write(Data("abcdefgh".utf8))
+        try stream.requestResetStreamAt(errorCode: 42, reliableSize: 3)
+
+        let streamFrames = stream.generateFrames(maxBytes: 1000)
+        #expect(streamFrames.count == 1)
+        #expect(streamFrames[0].data == Data("abc".utf8))
+        #expect(stream.generateFrames(maxBytes: 1000).isEmpty)
+
+        let reset = try #require(stream.generateResetStreamAt())
+        #expect(reset.finalSize == 8)
+        #expect(reset.reliableSize == 3)
+        #expect(reset.applicationErrorCode == 42)
+        #expect(stream.generateResetStreamAt() == nil)
+        #expect(stream.state.sendState == .resetSent)
+    }
+
+    @Test("RESET_STREAM_AT waits for flow control before emitting the reset")
+    func resetStreamAtWaitsForReliablePrefix() throws {
+        let stream = DataStream(
+            id: 0,
+            isClient: true,
+            initialSendMaxData: 2,
+            initialRecvMaxData: 1000
+        )
+        try stream.write(Data("abc".utf8))
+        try stream.requestResetStreamAt(errorCode: 7, reliableSize: 3)
+
+        let firstFrames = stream.generateFrames(maxBytes: 1000)
+        #expect(firstFrames.map(\.data).reduce(Data(), +) == Data("ab".utf8))
+        #expect(stream.generateResetStreamAt() == nil)
+
+        stream.updateSendMaxData(3)
+        let finalFrames = stream.generateFrames(maxBytes: 1000)
+        #expect(finalFrames.map(\.data).reduce(Data(), +) == Data("c".utf8))
+        #expect(stream.generateResetStreamAt()?.reliableSize == 3)
     }
 
     @Test("Generate STOP_SENDING")

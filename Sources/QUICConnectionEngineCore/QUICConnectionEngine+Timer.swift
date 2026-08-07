@@ -111,6 +111,7 @@ extension QUICConnectionEngine {
                     CongestionPacket(sentBytes: $0.sentBytes, timeSentNanos: $0.timeSentNanos, inFlight: $0.inFlight)
                 }
                 congestion.onPacketsLost(packets: lostPackets, nowNanos: nowNanos, rtt: snapshot)
+                requeueLostPacketFrames(lossResult.lost, level: level)
             }
         }
 

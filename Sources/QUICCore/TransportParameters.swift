@@ -57,6 +57,9 @@ public struct TransportParameters: Sendable, Hashable {
     /// Retry source connection ID (server only, after Retry)
     public var retrySourceConnectionID: ConnectionID?
 
+    /// Whether RESET_STREAM_AT partial-delivery resets are supported.
+    public var enableResetStreamAt: Bool
+
     /// Maximum DATAGRAM frame size this endpoint is willing to receive (RFC 9221).
     ///
     /// This is the maximum size of an entire DATAGRAM frame, including the frame type and
@@ -82,6 +85,7 @@ public struct TransportParameters: Sendable, Hashable {
         self.activeConnectionIDLimit = 2
         self.initialSourceConnectionID = nil
         self.retrySourceConnectionID = nil
+        self.enableResetStreamAt = false
         self.maxDatagramFrameSize = 0  // RFC 9221: 0 = DATAGRAM frames not supported
     }
 }

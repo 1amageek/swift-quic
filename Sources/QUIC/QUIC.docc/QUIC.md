@@ -25,11 +25,12 @@ QUIC is a multiplexed transport protocol built on UDP that provides:
 ### Client Connection
 
 ```swift
-let config = QUICConfiguration.production {
-    MyTLSProvider()
+var config = QUICConfiguration()
+config.tlsProviderFactory = { isClient in
+    try MyTLSProvider(isClient: isClient)
 }
 let endpoint = QUICEndpoint(configuration: config)
-let connection = try await endpoint.connect(to: serverAddress)
+let connection = try await endpoint.dial(address: serverAddress)
 let stream = try await connection.openStream()
 try await stream.write(data)
 let response = try await stream.read()
@@ -38,8 +39,9 @@ let response = try await stream.read()
 ### Server Listener
 
 ```swift
-let config = QUICConfiguration.production {
-    MyTLSProvider()
+var config = QUICConfiguration()
+config.tlsProviderFactory = { isClient in
+    try MyTLSProvider(isClient: isClient)
 }
 let endpoint = try await QUICEndpoint.listen(
     address: bindAddress,
@@ -60,7 +62,7 @@ for await connection in endpoint.incomingConnections {
 
 - ``QUICEndpoint``
 - ``QUICConfiguration``
-- ``QUICSecurityMode``
+- ``TLSProviderFactory``
 
 ### Connections
 

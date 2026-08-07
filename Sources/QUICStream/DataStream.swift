@@ -283,12 +283,50 @@ public final class DataStream: Sendable {
         }
     }
 
+    /// Handles RESET_STREAM_AT and retains data up to the reliable offset.
+    public func handleResetStreamAt(
+        errorCode: UInt64,
+        finalSize: UInt64,
+        reliableSize: UInt64
+    ) throws {
+        try _internal.withLock { `internal` in
+            try `internal`.recv.handleResetStreamAt(
+                errorCode: errorCode,
+                finalSize: finalSize,
+                reliableSize: reliableSize
+            )
+        }
+    }
+
     /// Generate RESET_STREAM frame if needed.
     /// - Parameter errorCode: Application error code.
     /// - Returns: RESET_STREAM frame to send, or nil.
     public func generateResetStream(errorCode: UInt64) -> ResetStreamFrame? {
         _internal.withLock { `internal` in
             `internal`.send.generateResetStream(errorCode: errorCode)
+        }
+    }
+
+    /// Requests a partial-delivery reset for this stream.
+    public func requestResetStreamAt(
+        errorCode: UInt64,
+        reliableSize: UInt64
+    ) throws(StreamError) {
+        let result: Result<Void, StreamError> = _internal.withLock { `internal` in
+            Result { () throws(StreamError) in
+                try `internal`.send.requestResetStreamAt(
+                    errorCode: errorCode,
+                    reliableSize: reliableSize
+                )
+            }
+        }
+        return try result.get()
+    }
+
+    /// Generates the pending RESET_STREAM_AT once its reliable prefix was sent.
+    public func generateResetStreamAt() -> ResetStreamAtFrame? {
+        _internal.withLock { `internal` in
+            `internal`.send.generateResetStreamAt()
         }
     }
 

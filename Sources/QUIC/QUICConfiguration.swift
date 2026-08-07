@@ -13,53 +13,15 @@ import QUICCore
 import QUICCrypto
 import QUICRecovery
 
-// MARK: - Security Mode
-
-/// QUIC security mode for TLS provider configuration
-///
-/// This enum enforces explicit security configuration, preventing
-/// accidental use of insecure defaults in production environments.
-///
-/// ## Usage
-///
-/// ```swift
-/// // Production: TLS required
-/// let config = QUICConfiguration.production {
-///     MyTLSProvider()
-/// }
-///
-/// // Development: TLS with self-signed certificates
-/// let devConfig = QUICConfiguration.development {
-///     MyTLSProvider(allowSelfSigned: true)
-/// }
-///
-/// // Testing only: Mock TLS (explicit opt-in)
-/// let testConfig = QUICConfiguration.testing()
-/// ```
-public enum QUICSecurityMode: Sendable {
-    /// Production environment: TLS required with proper certificate validation
-    case production(tlsProviderFactory: @Sendable () -> any TLS13Provider)
-
-    /// Development environment: TLS required but self-signed certificates allowed
-    case development(tlsProviderFactory: @Sendable () -> any TLS13Provider)
-
-    /// Testing environment: Uses MockTLSProvider
-    /// - Warning: Never use in production. This mode disables encryption.
-    case testing
-}
-
 // MARK: - Security Errors
 
 /// QUIC security-related errors
 public enum QUICSecurityError: Error, Sendable {
-    /// TLS provider is not configured. Set `securityMode` before connecting.
+    /// TLS provider is not configured. Set `tlsProviderFactory` before connecting.
     case tlsProviderNotConfigured
 
     /// Certificate validation failed
     case certificateValidationFailed(reason: String)
-
-    /// Security mode is not appropriate for the operation
-    case inappropriateSecurityMode(String)
 }
 
 // MARK: - TLS Provider Factory
@@ -77,7 +39,7 @@ public enum QUICSecurityError: Error, Sendable {
 ///     MyCustomTLSProvider(isClient: isClient)
 /// }
 /// ```
-public typealias TLSProviderFactory = @Sendable (_ isClient: Bool) -> any TLS13Provider
+public typealias TLSProviderFactory = @Sendable (_ isClient: Bool) throws -> any TLS13Provider
 
 // MARK: - QUIC Configuration
 
@@ -163,6 +125,11 @@ public struct QUICConfiguration: Sendable {
     /// the peer advertises support.
     public var maxDatagramFrameSize: UInt64
 
+    // MARK: - Partial-Delivery Stream Reset
+
+    /// Advertises support for RESET_STREAM_AT.
+    public var enableResetStreamAt: Bool
+
     // MARK: - Connection ID
 
     /// Preferred connection ID length (default: 8)
@@ -189,36 +156,14 @@ public struct QUICConfiguration: Sendable {
     /// Whether to verify peer certificates (default: true)
     public var verifyPeer: Bool
 
-    /// Custom TLS provider factory (legacy).
+    /// TLS provider factory for each new connection.
     ///
     /// When set, this factory is used to create TLS providers for new connections
-    /// instead of the default MockTLSProvider. This enables custom TLS
     /// implementations like libp2p's certificate-based peer authentication.
-    ///
-    /// - Note: Prefer using `securityMode` for new code. This property is
-    ///   maintained for backward compatibility.
     ///
     /// - Parameter isClient: `true` for client connections, `false` for server connections
     /// - Returns: A TLS 1.3 provider instance
     public var tlsProviderFactory: TLSProviderFactory?
-
-    // MARK: - Security Mode
-
-    /// Security mode for TLS configuration.
-    ///
-    /// This property enforces explicit security configuration to prevent
-    /// accidental deployment with insecure defaults.
-    ///
-    /// - Important: If neither `securityMode` nor `tlsProviderFactory` is set,
-    ///   connection attempts will fail with `QUICSecurityError.tlsProviderNotConfigured`.
-    ///
-    /// ## Example
-    ///
-    /// ```swift
-    /// var config = QUICConfiguration()
-    /// config.securityMode = .production { MyTLSProvider() }
-    /// ```
-    public var securityMode: QUICSecurityMode?
 
     // MARK: - Initialization
 
@@ -239,6 +184,7 @@ public struct QUICConfiguration: Sendable {
         self.pmtuDiscoveryEnabled = true
         self.pmtuMaxProbeSize = 1500
         self.maxDatagramFrameSize = 0
+        self.enableResetStreamAt = false
         self.connectionIDLength = 8
         self.version = .v1
         self.alpn = ["h3"]
@@ -246,7 +192,6 @@ public struct QUICConfiguration: Sendable {
         self.privateKeyPath = nil
         self.verifyPeer = true
         self.tlsProviderFactory = nil
-        self.securityMode = nil
     }
 
     /// Creates a configuration for libp2p
@@ -270,76 +215,6 @@ public struct QUICConfiguration: Sendable {
         return config
     }
 
-    // MARK: - Security Mode Factory Methods
-
-    /// Creates a production configuration with required TLS.
-    ///
-    /// Use this for production deployments where security is critical.
-    /// The TLS provider factory must produce a properly configured
-    /// TLS provider with valid certificates.
-    ///
-    /// - Parameter tlsProviderFactory: Factory that creates TLS providers
-    /// - Returns: A configuration with production security mode
-    ///
-    /// ## Example
-    ///
-    /// ```swift
-    /// let config = QUICConfiguration.production {
-    ///     TLS13Provider(certificatePath: "/path/to/cert.pem")
-    /// }
-    /// ```
-    public static func production(
-        tlsProviderFactory: @escaping @Sendable () -> any TLS13Provider
-    ) -> QUICConfiguration {
-        var config = QUICConfiguration()
-        config.securityMode = .production(tlsProviderFactory: tlsProviderFactory)
-        return config
-    }
-
-    /// Creates a development configuration with TLS but relaxed validation.
-    ///
-    /// Use this for development and testing environments where
-    /// self-signed certificates are acceptable.
-    ///
-    /// - Parameter tlsProviderFactory: Factory that creates TLS providers
-    /// - Returns: A configuration with development security mode
-    ///
-    /// ## Example
-    ///
-    /// ```swift
-    /// let config = QUICConfiguration.development {
-    ///     TLS13Provider(allowSelfSigned: true)
-    /// }
-    /// ```
-    public static func development(
-        tlsProviderFactory: @escaping @Sendable () -> any TLS13Provider
-    ) -> QUICConfiguration {
-        var config = QUICConfiguration()
-        config.securityMode = .development(tlsProviderFactory: tlsProviderFactory)
-        return config
-    }
-
-    /// Creates a testing configuration with MockTLSProvider.
-    ///
-    /// - Warning: **Never use in production.** This mode disables TLS encryption
-    ///   and uses a mock provider that does not provide any security.
-    ///
-    /// - Returns: A configuration with testing security mode
-    ///
-    /// ## Example
-    ///
-    /// ```swift
-    /// // Only in unit tests
-    /// let config = QUICConfiguration.testing()
-    /// ```
-    ///
-    /// - Note: This method is only available in DEBUG builds.
-    @available(*, message: "Testing mode disables TLS encryption. Never use in production.")
-    public static func testing() -> QUICConfiguration {
-        var config = QUICConfiguration()
-        config.securityMode = .testing
-        return config
-    }
 }
 
 // MARK: - Transport Parameters Extension
@@ -362,6 +237,7 @@ extension TransportParameters {
         self.initialSourceConnectionID = sourceConnectionID
         // RFC 9221: advertise our DATAGRAM support (0 = unsupported, the default).
         self.maxDatagramFrameSize = config.maxDatagramFrameSize
+        self.enableResetStreamAt = config.enableResetStreamAt
     }
 }
 

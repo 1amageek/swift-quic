@@ -96,6 +96,23 @@ public actor QUICEndpoint {
     /// Stop signal for the I/O loop
     private var shouldStop: Bool = false
 
+    /// Most recent packet-processing failure observed by the live I/O loop.
+    ///
+    /// QUIC requires unauthenticated or undecryptable packets to be dropped, so
+    /// the receive loop cannot fail the connection immediately. Retaining the
+    /// latest typed failure description lets a handshake timeout report the
+    /// actual processing boundary instead of erasing it behind a generic timeout.
+    private var lastPacketProcessingError: String?
+
+    /// The most recent packet-processing failure observed by the live I/O loop.
+    ///
+    /// A server cannot attach an unauthenticated packet failure to a connection,
+    /// but listeners and validation harnesses still need the concrete reason when
+    /// a peer times out before a connection can be yielded.
+    public var mostRecentPacketProcessingErrorDescription: String? {
+        lastPacketProcessingError
+    }
+
     /// Logger for endpoint events
     private let logger = Logger(label: "quic.endpoint")
 
@@ -131,37 +148,20 @@ public actor QUICEndpoint {
 
     /// Creates a TLS provider based on the security mode configuration.
     ///
-    /// This method enforces the security mode hierarchy:
-    /// 1. If `securityMode` is set, use it
-    /// 2. Otherwise, if `tlsProviderFactory` is set (legacy), use it
-    /// 3. Otherwise, throw `QUICSecurityError.tlsProviderNotConfigured`
+    /// The factory is the only TLS-provider injection point. Its creation
+    /// failure is propagated before a connection is installed.
     ///
     /// - Parameter isClient: Whether this is for a client connection
     /// - Returns: A configured TLS provider
     /// - Throws: `QUICSecurityError.tlsProviderNotConfigured` if no TLS provider is configured
     private func createTLSProvider(isClient: Bool) throws -> any TLS13Provider {
-        // Priority 1: Check securityMode (new API)
-        if let securityMode = configuration.securityMode {
-            switch securityMode {
-            case .production(let factory):
-                return factory()
-            case .development(let factory):
-                return factory()
-            case .testing:
-                throw QUICSecurityError.inappropriateSecurityMode(
-                    "Testing mode has no built-in TLS provider; inject a deterministic TLS13Provider in the test configuration."
-                )
-            }
-        }
-
-        // Priority 2: Check legacy tlsProviderFactory
         if let factory = configuration.tlsProviderFactory {
-            return factory(isClient)
+            return try factory(isClient)
         }
 
         // No TLS provider configured - fail safely
         logger.error(
-            "TLS provider not configured. Set securityMode or tlsProviderFactory before connecting.",
+            "TLS provider not configured. Set tlsProviderFactory before connecting.",
             metadata: ["isClient": "\(isClient)"]
         )
         throw QUICSecurityError.tlsProviderNotConfigured
@@ -180,28 +180,13 @@ public actor QUICEndpoint {
         sessionTicket: Data?,
         maxEarlyDataSize: UInt32?
     ) throws -> any TLS13Provider {
-        // Priority 1: Check securityMode (new API)
-        if let securityMode = configuration.securityMode {
-            switch securityMode {
-            case .production(let factory):
-                return factory()
-            case .development(let factory):
-                return factory()
-            case .testing:
-                throw QUICSecurityError.inappropriateSecurityMode(
-                    "Testing mode has no built-in TLS provider; inject a deterministic TLS13Provider in the test configuration."
-                )
-            }
-        }
-
-        // Priority 2: Check legacy tlsProviderFactory
         if let factory = configuration.tlsProviderFactory {
-            return factory(isClient)
+            return try factory(isClient)
         }
 
         // No TLS provider configured - fail safely
         logger.error(
-            "TLS provider not configured. Set securityMode or tlsProviderFactory before connecting.",
+            "TLS provider not configured. Set tlsProviderFactory before connecting.",
             metadata: ["isClient": "\(isClient)"]
         )
         throw QUICSecurityError.tlsProviderNotConfigured
@@ -343,6 +328,7 @@ public actor QUICEndpoint {
         guard !isServer else {
             throw QUICEndpointError.serverCannotConnect
         }
+        lastPacketProcessingError = nil
 
         // Create socket with a random local port
         let socket = NIOQUICSocket(configuration: .unicast(port: 0))
@@ -374,6 +360,11 @@ public actor QUICEndpoint {
                 do {
                     try await socket.shutdown()
                 } catch {
+                }
+                if let lastPacketProcessingError {
+                    throw QUICEndpointError.handshakeFailed(
+                        reason: lastPacketProcessingError
+                    )
                 }
                 throw QUICEndpointError.handshakeTimeout
             }
@@ -1096,6 +1087,7 @@ public actor QUICEndpoint {
                     try await socket.send(response, to: packet.remoteAddress)
                 }
             } catch {
+                lastPacketProcessingError = String(describing: error)
                 // Log error for debugging
                 logger.warning(
                     "Failed to process incoming packet",
@@ -1267,6 +1259,9 @@ public enum QUICEndpointError: Error, Sendable {
 
     /// Handshake timed out
     case handshakeTimeout
+
+    /// The handshake could not complete after packet processing failed.
+    case handshakeFailed(reason: String)
 }
 
 #endif

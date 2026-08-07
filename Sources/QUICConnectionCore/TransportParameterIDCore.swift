@@ -59,6 +59,19 @@ public enum TransportParameterIDCore: UInt64, Sendable, CaseIterable {
     /// Retry source connection ID (0x10)
     case retrySourceConnectionID = 0x10
 
+    /// RESET_STREAM_AT support (0x1d, draft-ietf-quic-reliable-stream-reset-09).
+    ///
+    /// The parameter has an empty value. Its presence enables partial-delivery
+    /// stream resets for both endpoints.
+    case resetStreamAt = 0x1d
+
+    /// Provisional RESET_STREAM_AT identifier from draft-07.
+    ///
+    /// quic-go 0.60 advertises this identifier. The codec normalizes both
+    /// identifiers into the same capability while the public API remains
+    /// independent of draft-specific wire values.
+    case resetStreamAtDraft07 = 0x17f7586d2cb571
+
     /// Max datagram frame size (0x20, RFC 9221)
     ///
     /// Advertises the maximum size of a DATAGRAM frame (including the frame type and
@@ -104,6 +117,7 @@ public enum TransportParameterIDCore: UInt64, Sendable, CaseIterable {
         case .maxAckDelay: return 25
         case .activeConnectionIDLimit: return 2
         case .maxDatagramFrameSize: return 0
+        case .resetStreamAt, .resetStreamAtDraft07: return nil
         default: return nil
         }
     }

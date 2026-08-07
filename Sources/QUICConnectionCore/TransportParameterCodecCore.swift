@@ -149,6 +149,15 @@ public enum TransportParameterCodecCore {
             encodeParameter(&writer, id: .retrySourceConnectionID, data: rscid.bytes)
         }
 
+        // reset_stream_at (draft-ietf-quic-reliable-stream-reset-09) and the
+        // draft-07 provisional identifier used by quic-go 0.60. Advertising
+        // both preserves the canonical capability while enabling current Go
+        // peers to negotiate partial-delivery reset in both directions.
+        if params.enableResetStreamAt {
+            encodeParameter(&writer, id: .resetStreamAt, data: [])
+            encodeParameter(&writer, id: .resetStreamAtDraft07, data: [])
+        }
+
         // max_datagram_frame_size (RFC 9221, only advertise when non-zero).
         // RFC 9221 §3: absence and 0 are equivalent, so we only emit when non-zero.
         if params.maxDatagramFrameSize > 0 {
@@ -384,6 +393,15 @@ public enum TransportParameterCodecCore {
 
         case .retrySourceConnectionID:
             params.retrySourceConnectionID = try connectionID(value)
+
+        case .resetStreamAt, .resetStreamAtDraft07:
+            guard value.isEmpty else {
+                throw .invalidValue(
+                    parameter: "reset_stream_at",
+                    reason: "Must be empty (zero-length)"
+                )
+            }
+            params.enableResetStreamAt = true
 
         case .maxDatagramFrameSize:
             params.maxDatagramFrameSize = try decodeVarint(value)
