@@ -47,11 +47,12 @@ jobs:
           set -euo pipefail
           python3 -c \
             'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
-            1200 xcodebuild test \
+            120 xcodebuild test \
+              -toolchain "$TOOLCHAINS" \
               -scheme swift-quic-Package \
               -destination 'platform=macOS' \
               -parallel-testing-enabled NO \
-              "LD_RUNPATH_SEARCH_PATHS=$HOME/Library/Developer/Toolchains/${SWIFT_SNAPSHOT}.xctoolchain/usr/lib/swift/macosx/testing"
+              'LD_RUNPATH_SEARCH_PATHS=$(inherited) /Users/runner/Library/Developer/Toolchains/swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a.xctoolchain/usr/lib/swift/macosx/testing'
 
   wasm:
     name: Standard and Embedded WebAssembly
