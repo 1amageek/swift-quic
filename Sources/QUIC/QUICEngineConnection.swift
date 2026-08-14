@@ -282,13 +282,21 @@ public final class QUICEngineConnection<
             drain(output, includeHandshakeData: handshakeHandler == nil)
 
             if let handshakeHandler {
-                for chunk in output.handshakeData {
+                var handshakeChunks = output.handshakeData
+                var handshakeIndex = 0
+                while handshakeIndex < handshakeChunks.count {
+                    let chunk = handshakeChunks[handshakeIndex]
+                    handshakeIndex += 1
                     do throws(QUICConnectionDriverError) {
                         try await handshakeHandler(chunk)
                     } catch let error {
                         markConnectionClosed()
                         return .failed(error)
                     }
+                    // Installing keys may synchronously replay a packet that was
+                    // received earlier and surface the next TLS message. Drain it
+                    // into this same ordered handshake turn before flushing.
+                    handshakeChunks.append(contentsOf: takeHandshakeData())
                 }
             }
 
@@ -667,9 +675,10 @@ public final class QUICEngineConnection<
         writeSecret: [UInt8]?,
         suite: QUICProtectionSuite
     ) throws(QUICEngineError) {
-        try run { (e) throws(QUICEngineError) in
+        let output = try run { (e) throws(QUICEngineError) in
             try e.installKeys(level: level, readSecret: readSecret, writeSecret: writeSecret, suite: suite)
         }
+        drain(output)
     }
 
     /// Applies the peer's validated transport parameters.
@@ -697,6 +706,7 @@ public final class QUICEngineConnection<
         _ tlsOutput: consuming QUICTLSStepOutput
     ) throws(QUICConnectionDriverError) {
         var tlsOutput = consume tlsOutput
+        var replayedOutputs: [QUICEngineOutput] = []
         try engine.withLock { engine throws(QUICConnectionDriverError) in
             do {
                 while let effect = try tlsOutput.nextEffect() {
@@ -742,19 +752,19 @@ public final class QUICEngineConnection<
                         let suite = try Self.protectionSuite(event.cipherSuite)
                         switch event.direction {
                         case .read:
-                            try engine.installKeys(
+                            replayedOutputs.append(try engine.installKeys(
                                 level: level,
                                 readSecret: secret,
                                 writeSecret: nil,
                                 suite: suite
-                            )
+                            ))
                         case .write:
-                            try engine.installKeys(
+                            replayedOutputs.append(try engine.installKeys(
                                 level: level,
                                 readSecret: nil,
                                 writeSecret: secret,
                                 suite: suite
-                            )
+                            ))
                         }
                     }
                 }
@@ -767,6 +777,9 @@ public final class QUICEngineConnection<
             } catch {
                 throw .engine(.invalidState("unclassified TLS output failure"))
             }
+        }
+        for output in replayedOutputs where !output.isEmpty {
+            drain(output)
         }
         signalTimer()
         signalActivity()

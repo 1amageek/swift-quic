@@ -3,6 +3,7 @@
 // coalesced packets), route each frame to the cores, update state, and collect
 // the facade-facing events. No I/O, no clock except the injected `nowNanos`.
 
+import NetworkingCore
 import QUICWire
 import QUICPacketProtectionCore
 import QUICConnectionCore
@@ -68,7 +69,7 @@ extension QUICConnectionEngine {
 
     // MARK: - Single packet
 
-    private mutating func processPacket(
+    mutating func processPacket(
         _ bytes: Span<UInt8>,
         isLongHeader: Bool,
         nowNanos: UInt64,
@@ -117,9 +118,20 @@ extension QUICConnectionEngine {
         case .retry, .versionNegotiation: return nil
         }
 
-        // No keys for this level yet → drop (RFC 9001 §5.7 buffering is the
-        // facade's concern; the engine simply cannot decrypt yet).
-        guard keys.hasReadKeys(for: level) else { return nil }
+        guard !space(for: level).isDiscarded else { return nil }
+
+        // RFC 9001 section 5.7 requires packets that arrive before their keys to
+        // be retained for later processing. The scoped input borrow is copied
+        // once into a count- and byte-bounded connection-owned buffer.
+        guard keys.hasReadKeys(for: level) else {
+            undecryptablePackets.append(
+                bytes,
+                level: level,
+                isLongHeader: true,
+                receivedAtNanos: nowNanos
+            )
+            return nil
+        }
 
         let protector: SuiteProtector
         do { protector = try keys.readProtector(for: level) } catch { return nil }
@@ -174,7 +186,15 @@ extension QUICConnectionEngine {
         into output: inout QUICEngineOutput
     ) throws(QUICEngineError) -> Bool? {
         let level = EncryptionLevel.application
-        guard keys.hasReadKeys(for: level) else { return nil }
+        guard keys.hasReadKeys(for: level) else {
+            undecryptablePackets.append(
+                bytes,
+                level: level,
+                isLongHeader: false,
+                receivedAtNanos: nowNanos
+            )
+            return nil
+        }
 
         let hpProtector: SuiteProtector
         do { hpProtector = try keys.applicationReadHeaderProtectionProtector() }
@@ -331,6 +351,35 @@ extension QUICConnectionEngine {
         initialToken = token
         processedRetry = true
         return true
+    }
+
+    /// Reprocesses packets for one encryption level immediately after TLS
+    /// installs matching read keys. Output intentionally excludes a final flush;
+    /// the facade flushes once after it applies the complete ordered TLS batch.
+    mutating func replayUndecryptablePackets(
+        for level: EncryptionLevel
+    ) throws(QUICEngineError) -> QUICEngineOutput {
+        var output = QUICEngineOutput()
+        let buffered = undecryptablePackets.take(level: level)
+        var latestProcessedAt: UInt64?
+
+        for packet in buffered {
+            if let processed = try processPacket(
+                packet.bytes.span,
+                isLongHeader: packet.isLongHeader,
+                nowNanos: packet.receivedAtNanos,
+                into: &output
+            ), processed {
+                latestProcessedAt = max(
+                    latestProcessedAt ?? packet.receivedAtNanos,
+                    packet.receivedAtNanos
+                )
+            }
+        }
+        if let latestProcessedAt {
+            idleTimeout.recordActivity(nowNanos: latestProcessedAt)
+        }
+        return output
     }
 
     // MARK: - Frame routing

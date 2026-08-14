@@ -150,13 +150,19 @@ extension QUICConnectionEngine {
     /// Installs handshake/application keys derived by the facade's TLS seam. This
     /// is the boundary where the (async) handshake hands negotiated traffic
     /// secrets back to the (sync) engine.
+    ///
+    /// - Returns: Events produced by replaying packets that arrived before the
+    ///   corresponding read keys. The caller must drain this output before
+    ///   waiting for another datagram.
     public mutating func installKeys(
         level: EncryptionLevel,
         readSecret: [UInt8]?,
         writeSecret: [UInt8]?,
         suite: QUICProtectionSuite
-    ) throws(QUICEngineError) {
+    ) throws(QUICEngineError) -> QUICEngineOutput {
         try keys.install(level: level, readSecret: readSecret, writeSecret: writeSecret, suite: suite, isClient: isClient)
+        guard readSecret != nil else { return QUICEngineOutput() }
+        return try replayUndecryptablePackets(for: level)
     }
 
     /// Issues a caller-generated connection ID and reset token to the peer.
@@ -280,6 +286,7 @@ extension QUICConnectionEngine {
             markHandshakeConfirmed()
         }
         keys.discard(level: .initial)
+        undecryptablePackets.discard(level: .initial)
         initialSpace.isDiscarded = true
     }
 
@@ -290,6 +297,7 @@ extension QUICConnectionEngine {
         guard status != .closed else { return }
         handshakeConfirmed = true
         keys.discard(level: .handshake)
+        undecryptablePackets.discard(level: .handshake)
         handshakeSpace.isDiscarded = true
     }
 
@@ -324,6 +332,7 @@ extension QUICConnectionEngine {
     public mutating func markClosed() {
         status = .closed
         pendingClose = .absent
+        undecryptablePackets.removeAll()
     }
 
     // MARK: - Flush

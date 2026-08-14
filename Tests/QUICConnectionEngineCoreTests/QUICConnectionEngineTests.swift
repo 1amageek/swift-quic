@@ -47,7 +47,8 @@ struct QUICConnectionEngineTests {
     /// 1-RTT-shaped Initial packets in these unit tests without a TLS handshake.
     private func makePair(
         idleNanos: UInt64 = 30_000_000_000,
-        aeadUsageLimits: QUICAEADUsageLimits = QUICAEADUsageLimits()
+        aeadUsageLimits: QUICAEADUsageLimits = QUICAEADUsageLimits(),
+        installApplicationKeys: Bool = true
     ) throws -> (client: Engine, server: Engine, dcid: ConnectionID, clientSCID: ConnectionID, serverSCID: ConnectionID) {
         let dcid = try #require(ConnectionID.random(length: 8))
         let clientSCID = try #require(ConnectionID.random(length: 8))
@@ -88,8 +89,10 @@ struct QUICConnectionEngineTests {
         // is the server's READ secret and vice versa (RFC 9001 §5.1).
         let clientToServer = [UInt8](repeating: 0xC0, count: 32)
         let serverToClient = [UInt8](repeating: 0x05, count: 32)
-        try client.installKeys(level: .application, readSecret: serverToClient, writeSecret: clientToServer, suite: .aes128GCM)
-        try server.installKeys(level: .application, readSecret: clientToServer, writeSecret: serverToClient, suite: .aes128GCM)
+        if installApplicationKeys {
+            _ = try client.installKeys(level: .application, readSecret: serverToClient, writeSecret: clientToServer, suite: .aes128GCM)
+            _ = try server.installKeys(level: .application, readSecret: clientToServer, writeSecret: serverToClient, suite: .aes128GCM)
+        }
         // Discard Initial keys + validate the path so anti-amplification doesn't
         // block 1-RTT sends (post-handshake state).
         client.markHandshakeComplete()
@@ -400,6 +403,53 @@ struct QUICConnectionEngineTests {
         #expect(received == payload)
     }
 
+    @Test("client accepts a server Initial with a shorter source connection ID")
+    func serverInitialWithShorterSourceConnectionID() throws {
+        let originalDestination = try #require(ConnectionID.random(length: 8))
+        let clientSource = try #require(ConnectionID.random(length: 8))
+        let serverSource = try #require(ConnectionID.random(length: 4))
+        var client = try Engine(
+            configuration: makeConfig(
+                role: .client,
+                dcid: originalDestination,
+                scid: clientSource
+            ),
+            nowNanos: 0
+        )
+        var serverConfiguration = makeConfig(
+            role: .server,
+            dcid: clientSource,
+            scid: serverSource
+        )
+        serverConfiguration.originalDestinationConnectionID = originalDestination
+        var server = try Engine(
+            configuration: serverConfiguration,
+            nowNanos: 0
+        )
+
+        client.queueHandshake([0x01, 0x00, 0x00, 0x01, 0xAA], level: .initial)
+        for packet in try client.flush(nowNanos: 1_000) {
+            _ = try server.receive(datagram: packet, nowNanos: 2_000)
+        }
+
+        server.queueHandshake([0x02, 0x00, 0x00, 0x01, 0xBB], level: .initial)
+        let serverPackets = try server.flush(nowNanos: 3_000)
+        #expect(!serverPackets.isEmpty)
+
+        var receivedHandshake: [HandshakeChunk] = []
+        for packet in serverPackets {
+            let output = try client.receive(datagram: packet, nowNanos: 4_000)
+            receivedHandshake.append(contentsOf: output.handshakeData)
+        }
+        #expect(client.currentDestinationConnectionID == serverSource)
+        #expect(receivedHandshake == [
+            HandshakeChunk(
+                level: .initial,
+                data: [0x02, 0x00, 0x00, 0x01, 0xBB]
+            ),
+        ])
+    }
+
     @Test("server ACKs an ack-eliciting packet; client processes the ACK")
     func ackGenerationAndProcessing() throws {
         var (client, server, _, _, _) = try makePair()
@@ -606,7 +656,7 @@ struct QUICConnectionEngineTests {
         // Install application keys (32-byte traffic secrets), then update.
         let readSecret = [UInt8](repeating: 0x01, count: 32)
         let writeSecret = [UInt8](repeating: 0x02, count: 32)
-        try engine.installKeys(level: .application, readSecret: readSecret, writeSecret: writeSecret, suite: .aes128GCM)
+        _ = try engine.installKeys(level: .application, readSecret: readSecret, writeSecret: writeSecret, suite: .aes128GCM)
         engine.markHandshakeComplete()
         #expect(engine.currentKeyPhase == 0)
         let newPhase = try engine.performKeyUpdate()
@@ -677,13 +727,13 @@ struct QUICConnectionEngineTests {
         let readSecret = [UInt8](repeating: 0x01, count: 32)
         let writeSecret = [UInt8](repeating: 0x02, count: 32)
 
-        try engine.installKeys(
+        _ = try engine.installKeys(
             level: .application,
             readSecret: readSecret,
             writeSecret: nil,
             suite: .aes128GCM
         )
-        try engine.installKeys(
+        _ = try engine.installKeys(
             level: .application,
             readSecret: nil,
             writeSecret: writeSecret,
@@ -693,6 +743,79 @@ struct QUICConnectionEngineTests {
         engine.markHandshakeComplete()
 
         #expect(try engine.performKeyUpdate() == 1)
+    }
+
+    @Test("packet received before application read keys is replayed after key installation")
+    func undecryptablePacketReplaysAfterKeyInstallation() throws {
+        var (client, server, _, _, _) = try makePair(
+            installApplicationKeys: false
+        )
+        let clientToServer = [UInt8](repeating: 0xC0, count: 32)
+        let serverToClient = [UInt8](repeating: 0x05, count: 32)
+        _ = try client.installKeys(
+            level: .application,
+            readSecret: serverToClient,
+            writeSecret: clientToServer,
+            suite: .aes128GCM
+        )
+
+        let streamID = try client.openStream(bidirectional: true)
+        let payload: [UInt8] = [0x01, 0x02, 0x03, 0x04]
+        try client.writeStream(streamID, data: payload)
+        let packets = try client.flush(nowNanos: 1_000)
+        #expect(packets.count == 1)
+
+        let beforeKeys = try server.receive(
+            datagram: try #require(packets.first),
+            nowNanos: 2_000
+        )
+        #expect(beforeKeys.isEmpty)
+        #expect(server.bufferedUndecryptablePacketCount == 1)
+        #expect(server.readStream(streamID) == nil)
+
+        let replay = try server.installKeys(
+            level: .application,
+            readSecret: clientToServer,
+            writeSecret: nil,
+            suite: .aes128GCM
+        )
+        #expect(server.bufferedUndecryptablePacketCount == 0)
+        #expect(replay.newStreams == [streamID])
+        #expect(replay.readableStreams == [streamID])
+        #expect(server.readStream(streamID) == payload)
+    }
+
+    @Test("undecryptable packet ownership is bounded by count and bytes")
+    func undecryptablePacketBufferIsBounded() {
+        var buffer = UndecryptablePacketBuffer()
+        let byte = [UInt8](repeating: 0xAA, count: 1)
+
+        for timestamp in 0..<40 {
+            buffer.append(
+                byte.span,
+                level: .handshake,
+                isLongHeader: true,
+                receivedAtNanos: UInt64(timestamp)
+            )
+        }
+        #expect(buffer.count == 32)
+        #expect(buffer.take(level: .handshake).count == 32)
+        #expect(buffer.count == 0)
+
+        let maximumPacket = [UInt8](repeating: 0xBB, count: 64 * 1024)
+        buffer.append(
+            maximumPacket.span,
+            level: .application,
+            isLongHeader: false,
+            receivedAtNanos: 100
+        )
+        buffer.append(
+            byte.span,
+            level: .application,
+            isLongHeader: false,
+            receivedAtNanos: 101
+        )
+        #expect(buffer.count == 1)
     }
 
     @Test("peer key update commits after AEAD and retains reordered previous keys")

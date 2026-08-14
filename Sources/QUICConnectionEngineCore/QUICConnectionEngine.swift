@@ -69,6 +69,9 @@ public struct QUICConnectionEngine: Sendable {
     // MARK: - Keys / protection
 
     var keys: QUICKeyState
+    /// Protected packets retained until TLS installs their read keys. This value
+    /// is part of the caller-locked engine on every target; no pointer escapes.
+    var undecryptablePackets = UndecryptablePacketBuffer()
 
     // MARK: - Packet-number spaces (RFC 9000 §12.3)
 
@@ -223,6 +226,9 @@ public struct QUICConnectionEngine: Sendable {
 
     /// The current destination connection ID (post-migration aware).
     public var currentDestinationConnectionID: ConnectionID { destinationConnectionID }
+
+    /// Internal observability for bounded-buffer correctness tests.
+    var bufferedUndecryptablePacketCount: Int { undecryptablePackets.count }
 
     // MARK: - Internal helpers (space access)
     func space(for level: EncryptionLevel) -> PacketNumberSpace {

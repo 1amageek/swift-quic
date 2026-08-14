@@ -31,9 +31,12 @@ QUIC public driver (Mutex, datagram I/O, timer, TLS)
 
 ## Failure contract
 
-- Malformed input, missing keys, flow-control violations, final-size
-  violations, transport-parameter violations, and packet-number exhaustion
-  throw `QUICEngineError`.
+- Malformed input, flow-control violations, final-size violations,
+  transport-parameter violations, and packet-number exhaustion throw
+  `QUICEngineError`.
+- Protected packets received before their encryption-level read keys are copied
+  once into a bounded connection-owned buffer (32 packets / 64 KiB) and replayed
+  immediately when TLS installs those keys. Packets beyond the bound are dropped.
 - A per-packet authentication failure is dropped where RFC 9001 permits it; it
   does not terminate an otherwise valid connection.
 - Idle expiry is reported in timer output. The driver owns transport shutdown.

@@ -294,8 +294,8 @@ struct QUICEngineConnectionTests {
 
         let clientToServer = [UInt8](repeating: 0xC0, count: 32)
         let serverToClient = [UInt8](repeating: 0x05, count: 32)
-        try client.installKeys(level: .application, readSecret: serverToClient, writeSecret: clientToServer, suite: .aes128GCM)
-        try server.installKeys(level: .application, readSecret: clientToServer, writeSecret: serverToClient, suite: .aes128GCM)
+        _ = try client.installKeys(level: .application, readSecret: serverToClient, writeSecret: clientToServer, suite: .aes128GCM)
+        _ = try server.installKeys(level: .application, readSecret: clientToServer, writeSecret: serverToClient, suite: .aes128GCM)
         client.markHandshakeComplete()
         server.markHandshakeComplete()
         return (client, server)
