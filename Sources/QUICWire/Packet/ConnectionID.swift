@@ -3,10 +3,9 @@
 /// Connection IDs are used to identify connections at endpoints.
 /// They can be 0-20 bytes in length.
 ///
-/// Embedded-clean: no Foundation, no `any`. The raw bytes are `[UInt8]`; the
-/// Foundation adapter restores the historical `Data` view / `Data` init.
+/// Embedded-clean: no Foundation, no `any`. Raw bytes are owned as `[UInt8]`.
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// A QUIC Connection ID
 public struct ConnectionID: Hashable, Sendable {
@@ -172,18 +171,18 @@ extension ConnectionID {
     }
 
     /// Encodes the connection ID (length byte + data), appending to the writer.
-    public func encode(to writer: inout ByteWriter) {
+    public func encode(to writer: inout QUICWireWriter) {
         writer.writeByte(UInt8(bytes.count))
         writer.writeBytes(bytes)
     }
 
     /// Encodes only the bytes (without length prefix), appending to the writer.
-    public func encodeBytes(to writer: inout ByteWriter) {
+    public func encodeBytes(to writer: inout QUICWireWriter) {
         writer.writeBytes(bytes)
     }
 
     /// Decodes a connection ID (reads length byte + data), advancing the reader.
-    public static func decode(from reader: inout ByteReader) throws(DecodeError) -> ConnectionID {
+    public static func decode(from reader: inout QUICWireReader) throws(DecodeError) -> ConnectionID {
         let length: UInt8
         do {
             length = try reader.readUInt8()
@@ -205,7 +204,7 @@ extension ConnectionID {
 
     /// Decodes connection ID bytes (without length prefix) given a known length,
     /// advancing the reader.
-    public static func decodeBytes(from reader: inout ByteReader, length: Int) throws(DecodeError) -> ConnectionID {
+    public static func decodeBytes(from reader: inout QUICWireReader, length: Int) throws(DecodeError) -> ConnectionID {
         guard length <= maxLength else {
             throw DecodeError.invalidLength(length)
         }

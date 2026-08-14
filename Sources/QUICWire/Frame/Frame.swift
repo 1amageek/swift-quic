@@ -6,8 +6,7 @@
 /// Embedded-clean: no Foundation, no `any`. The direct byte payloads
 /// (`.newToken`, `.pathChallenge`, `.pathResponse`) are `[UInt8]`; the
 /// struct-carried payloads (`.crypto`, `.stream`, `.datagram`, ...) store their
-/// bytes as `[UInt8]` in the frame structs. The Foundation adapter restores the
-/// historical `Data`-accepting construction surface.
+/// bytes as `[UInt8]` in the frame structs.
 
 // MARK: - Frame Type
 

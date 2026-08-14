@@ -3,12 +3,11 @@
 /// Multiple QUIC packets can be coalesced into one UDP datagram. Splitting a
 /// received datagram into its constituent packets is pure parsing: it inspects
 /// header fields and the long-header Length field to find each packet boundary,
-/// with no crypto, no I/O, and no mutable state. `CoalescedDatagramCore` moves
-/// that logic onto `[UInt8]`/`ByteReader`; the host adapter
-/// `CoalescedPacketParser` keeps its `Data`-slice output and delegates the
-/// boundary computation here.
+/// with no crypto, no I/O, and no mutable state. `CoalescedDatagramCore`
+/// returns ranges into the caller-owned datagram so packet parsing can borrow
+/// the original storage without materializing packet-sized slices.
 ///
-/// The 1.3.0 security bounds are preserved exactly: the long-header packet
+/// The security bounds are enforced directly: the long-header packet
 /// length is bounded by `SafeConversions`/`ProtocolLimits` (token and Length
 /// fields), boundaries are checked against the datagram extent, and a short
 /// header always terminates the datagram (RFC 9000 §12.2 — a short-header packet
@@ -17,7 +16,7 @@
 /// Embedded-clean: no Foundation, no `any`, no crypto, no `Mutex`; typed throws
 /// (``CoalescedDatagramError``); no silent fallback.
 
-import P2PCoreBytes
+import NetworkingCore
 import QUICWire
 
 /// Error thrown while splitting a coalesced datagram.
@@ -58,11 +57,14 @@ public enum CoalescedDatagramCore {
     ///   - dcidLength: Expected DCID length for the (final) short-header packet.
     /// - Returns: The packet ranges in datagram order.
     public static func split(
-        datagram: [UInt8],
+        datagram: Span<UInt8>,
         dcidLength: Int
     ) throws(CoalescedDatagramError) -> [CoalescedPacketRange] {
         guard !datagram.isEmpty else {
             throw .emptyDatagram
+        }
+        guard dcidLength >= 0, dcidLength <= ConnectionID.maxLength else {
+            throw .invalidPacketHeader
         }
 
         var ranges: [CoalescedPacketRange] = []
@@ -80,9 +82,14 @@ public enum CoalescedDatagramCore {
             } else {
                 // Short-header packet consumes the rest of the datagram and MUST be last.
                 packetLength = end - offset
+                // At minimum the packet contains the first byte, the known-length
+                // destination CID, and one protected packet-number byte.
+                guard packetLength >= 1 + dcidLength + 1 else {
+                    throw .insufficientData
+                }
             }
 
-            guard offset + packetLength <= end else {
+            guard packetLength <= end - offset else {
                 throw .packetLengthExceedsDatagram
             }
 
@@ -106,11 +113,13 @@ public enum CoalescedDatagramCore {
     /// Computes the on-wire length of a single long-header packet starting at
     /// `startOffset`, enforcing the 1.3.0 token/Length bounds.
     private static func longHeaderPacketLength(
-        datagram: [UInt8],
+        datagram: Span<UInt8>,
         startOffset: Int
     ) throws(CoalescedDatagramError) -> Int {
-        // A sub-reader over the packet slice so offsets are relative to its start.
-        var reader = ByteReader(Array(datagram[startOffset...]))
+        // Borrow the packet suffix directly; no array materialization on receive.
+        var reader = QUICWireReader(
+            datagram.extracting(startOffset..<datagram.count)
+        )
         let sliceCount = datagram.count - startOffset
 
         let firstByte: UInt8
@@ -141,9 +150,14 @@ public enum CoalescedDatagramCore {
             throw error
         }
 
-        let packetType = (firstByte >> 4) & 0x03
+        let quicVersion = QUICVersion(rawValue: version)
+        guard let packetType = quicVersion.longPacketType(
+            forTypeBits: (firstByte >> 4) & 0x03
+        ) else {
+            throw .invalidPacketHeader
+        }
         switch packetType {
-        case 0x00:  // Initial
+        case .initial:
             // Token length + token, then Length field.
             let tokenLength: UInt64
             do { tokenLength = try reader.readVarint() } catch { throw .insufficientData }
@@ -160,17 +174,17 @@ public enum CoalescedDatagramCore {
             do { try reader.skip(safeTokenLength) } catch { throw .insufficientData }
             return try longHeaderTotalLength(&reader, context: "Initial packet length field")
 
-        case 0x01:  // 0-RTT
+        case .zeroRTT:
             return try longHeaderTotalLength(&reader, context: "0-RTT packet length field")
 
-        case 0x02:  // Handshake
+        case .handshake:
             return try longHeaderTotalLength(&reader, context: "Handshake packet length field")
 
-        case 0x03:  // Retry
+        case .retry:
             // Retry has no Length field; it consumes the rest of the datagram.
             return sliceCount
 
-        default:
+        case .versionNegotiation:
             throw .invalidPacketHeader
         }
     }
@@ -178,7 +192,7 @@ public enum CoalescedDatagramCore {
     /// Reads the long-header Length varint and returns `headerBytesRead + length`,
     /// bounding the Length field per the 1.3.0 limits.
     private static func longHeaderTotalLength(
-        _ reader: inout ByteReader,
+        _ reader: inout QUICWireReader,
         context: String
     ) throws(CoalescedDatagramError) -> Int {
         let length: UInt64
@@ -201,9 +215,12 @@ public enum CoalescedDatagramCore {
     }
 
     /// Skips a length-prefixed connection ID (1 length byte + that many bytes).
-    private static func skipConnectionID(_ reader: inout ByteReader) throws(CoalescedDatagramError) {
+    private static func skipConnectionID(_ reader: inout QUICWireReader) throws(CoalescedDatagramError) {
         let length: UInt8
         do { length = try reader.readUInt8() } catch { throw .insufficientData }
+        guard Int(length) <= ConnectionID.maxLength else {
+            throw .invalidPacketHeader
+        }
         do { try reader.skip(Int(length)) } catch { throw .insufficientData }
     }
 }

@@ -12,9 +12,9 @@
 /// ```
 ///
 /// Embedded-clean: no Foundation, no `any`. The byte container is `[UInt8]`;
-/// reading/writing flows through `P2PCoreBytes` `ByteReader`/`ByteWriter`.
+/// reading/writing flows through the QUIC-owned borrowed reader and writer.
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// QUIC variable-length integer
 public struct Varint: Hashable, Sendable {
@@ -24,17 +24,22 @@ public struct Varint: Hashable, Sendable {
     /// Maximum value representable by a QUIC varint (2^62 - 1)
     public static let maxValue: UInt64 = (1 << 62) - 1
 
-    /// Creates a Varint from a UInt64 value
-    /// - Parameter value: The value (must be <= 2^62 - 1)
-    /// - Precondition: value must be representable in 62 bits
-    public init(_ value: UInt64) {
-        precondition(value <= Self.maxValue, "Varint value exceeds maximum (2^62 - 1)")
+    /// Creates a Varint from a UInt64 value.
+    public init(_ value: UInt64) throws(QUICWireError) {
+        guard value <= Self.maxValue else { throw .invalidVarint }
         self.value = value
     }
 
     /// Creates a Varint from any BinaryInteger
-    public init<T: BinaryInteger>(_ value: T) {
-        self.init(UInt64(value))
+    public init<T: BinaryInteger>(_ value: T) throws(QUICWireError) {
+        guard let converted = UInt64(exactly: value), converted <= Self.maxValue else {
+            throw .invalidVarint
+        }
+        self.value = converted
+    }
+
+    private init(unchecked value: UInt64) {
+        self.value = value
     }
 
     /// The minimum number of bytes needed to encode this value
@@ -48,21 +53,14 @@ public struct Varint: Hashable, Sendable {
 extension Varint {
     /// Encodes the varint to a new byte array.
     public func encodeBytes() -> [UInt8] {
-        var writer = ByteWriter(reservingCapacity: encodedLength)
-        // A Varint is constructed only with values <= maxValue, so the QUIC
-        // varint write cannot overflow. The init precondition guarantees this.
-        do {
-            try writer.writeVarint(value)
-        } catch {
-            // Unreachable for a valid Varint (value <= 2^62 - 1, enforced at init).
-            fatalError("Varint encode exceeded the QUIC varint range: \(value)")
-        }
+        var writer = QUICWireWriter(reservingCapacity: encodedLength)
+        writer.writeVarint(self)
         return writer.finishArray()
     }
 
     /// Encodes the varint, appending to the given writer.
-    public func encode(to writer: inout ByteWriter) throws(QUICWireError) {
-        try writer.qWriteVarint(value)
+    public func encode(to writer: inout QUICWireWriter) throws(QUICWireError) {
+        try writer.writeVarint(value)
     }
 }
 
@@ -120,7 +118,7 @@ extension Varint {
                 | UInt64(bytes[7])
         }
 
-        return (Varint(value), length)
+        return (Varint(unchecked: value), length)
     }
 
     /// Returns the encoded length for the first varint in the bytes without fully decoding.
@@ -134,14 +132,6 @@ extension Varint {
         case 0b11: return 8
         default: return nil
         }
-    }
-}
-
-// MARK: - ExpressibleByIntegerLiteral
-
-extension Varint: ExpressibleByIntegerLiteral {
-    public init(integerLiteral value: UInt64) {
-        self.init(value)
     }
 }
 

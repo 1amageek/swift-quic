@@ -1,9 +1,8 @@
 /// Stream data reassembly buffer (RFC 9000 Section 2.2) as a value type.
 ///
 /// Ordered buffer for reassembling out-of-order stream data with FIN tracking. This
-/// is the byte-identical reassembly logic of the host `DataBuffer`, expressed as a
-/// `struct` operating on `[UInt8]` payloads. The host `DataBuffer` wraps it and
-/// bridges `Data` to/from `[UInt8]`, so observable behavior is unchanged.
+/// The caller-owned `struct` operates on owned `[UInt8]` segments and has no I/O or
+/// platform bridge responsibilities.
 ///
 /// This buffer handles:
 /// - Out-of-order data insertion

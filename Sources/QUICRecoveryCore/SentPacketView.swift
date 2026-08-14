@@ -1,10 +1,7 @@
 /// The per-packet information the value-type loss detector tracks.
 ///
-/// The host `SentPacket` carries a `ContinuousClock.Instant` and an
-/// `EncryptionLevel`; this view carries only what RFC 9002 §6 loss detection needs,
-/// with the send time as injected monotonic nanoseconds. The host adapter projects
-/// each `SentPacket` into this view (and back, by carrying the host `SentPacket`
-/// alongside the core).
+/// This view carries only what RFC 9002 Section 6 loss detection needs, with
+/// the send time supplied as injected monotonic nanoseconds.
 ///
 /// Embedded-clean: no Foundation, no `ContinuousClock`, no `EncryptionLevel`.
 public struct SentPacketView: Sendable, Equatable {
@@ -43,10 +40,10 @@ public struct SentPacketView: Sendable, Equatable {
 
 /// A single acknowledged packet-number range, expressed as an inclusive interval.
 ///
-/// The host adapter decodes the wire `AckFrame`'s gap/rangeLength encoding into these
-/// concrete `[start, end]` intervals (sorted by start descending, non-overlapping)
-/// before handing them to the loss-detector core, so the core never sees the
-/// attacker-controllable gap encoding directly.
+/// The connection engine decodes the wire `AckFrame` gap/range-length encoding
+/// into concrete `[start, end]` intervals (sorted by start descending and
+/// non-overlapping) before calling loss detection, so this core never sees the
+/// attacker-controlled gap encoding directly.
 public struct AckInterval: Sendable, Equatable {
 
     /// Smallest acknowledged packet number in this range (inclusive).

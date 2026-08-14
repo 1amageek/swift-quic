@@ -57,10 +57,12 @@ struct PacketNumberSpace: Sendable {
 
     /// Returns the next packet number and advances the counter, refusing to wrap
     /// past 2^62 - 1 (RFC 9000 §12.3 — exhaustion MUST close the connection).
-    mutating func takeNextPacketNumber() throws(QUICEngineError) -> UInt64 {
+    mutating func takeNextPacketNumber(
+        at level: EncryptionLevel
+    ) throws(QUICEngineError) -> UInt64 {
         let pn = nextPacketNumber
-        guard pn < (1 << 62) else { throw .packetNumberExhausted(.initial) }
-        nextPacketNumber = pn &+ 1
+        guard pn < (1 << 62) else { throw .packetNumberExhausted(level) }
+        nextPacketNumber = pn + 1
         return pn
     }
 

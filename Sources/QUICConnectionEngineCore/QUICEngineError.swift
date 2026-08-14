@@ -49,6 +49,10 @@ public enum QUICEngineError: Error, Sendable {
     /// the connection MUST be closed rather than wrapping.
     case packetNumberExhausted(EncryptionLevel)
 
+    /// Packet encryption or failed authentication reached the selected AEAD's
+    /// RFC 9001 section 6.6 usage limit.
+    case aeadLimitReached
+
     /// The cryptographic keys for the requested encryption level are not
     /// installed (no silent drop — the caller learns the level is unkeyed).
     case keysUnavailable(EncryptionLevel)
@@ -68,4 +72,9 @@ public enum QUICEngineError: Error, Sendable {
 
     /// The datagram was too large for the negotiated / discovered path MTU.
     case datagramTooLarge(size: Int, maximum: Int)
+
+    /// A valid Version Negotiation packet requires the caller to abandon this
+    /// connection attempt. RFC 9000 does not define in-place version switching;
+    /// the caller may start a new attempt using one of the advertised versions.
+    case versionNegotiationRequired(supportedVersions: [UInt32])
 }

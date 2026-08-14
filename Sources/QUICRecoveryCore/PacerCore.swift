@@ -1,12 +1,8 @@
 /// Embedded-clean token-bucket pacer (RFC 9002 §7.7) as a value type.
 ///
-/// This is the byte-identical math of the host `Pacer`, expressed as a `struct` with
-/// `mutating` methods. Time is injected as a monotonic `UInt64` nanosecond value;
-/// the pacer never reads a clock. The host adapter holds a `Mutex<PacerCore>`, reads
-/// its `ContinuousClock`, converts to nanoseconds, and calls these methods under the
-/// lock — observable behavior (including the 1.3.0 overflow fix) is unchanged.
-///
-/// Delays are returned as nanosecond counts; the adapter converts back to `Duration`.
+/// The pacer is a `struct` with `mutating` methods. Time is injected as a
+/// monotonic `UInt64` nanosecond value; the pacer never reads a clock. Delays are
+/// returned as monotonic nanosecond counts for the public driver to schedule.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`.
 public struct PacerCore: Sendable {
@@ -82,9 +78,8 @@ public struct PacerCore: Sendable {
         case insufficient(tokensNeeded: UInt64)
     }
 
-    /// Replenishes tokens, then attempts to consume `bytes`. The delay-to-`Duration`
-    /// conversion is left to the adapter so the public API stays byte-identical to
-    /// the host (which builds `Duration.seconds(...)` with sub-nanosecond precision).
+    /// Replenishes tokens, then attempts to consume `bytes`. Conversion of the
+    /// returned token deficit into a clock-specific delay belongs to the caller.
     public mutating func schedule(bytes: UInt64, nowNanos: UInt64) -> ScheduleResult {
         // A zero (or unset) rate means "no pacing" — never divide by zero in the adapter.
         guard isEnabled, rate > 0 else { return .disabled }

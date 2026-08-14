@@ -42,6 +42,7 @@ extension QUICConnectionEngine {
         if let next = congestion.nextSendNanosOrImmediate, next > nowNanos {
             result.pacingNanos = next
         }
+        result.keyDiscardNanos = previousReadKeysDiscardDeadlineNanos
 
         return result
     }
@@ -65,20 +66,29 @@ extension QUICConnectionEngine {
             return result
         }
 
-        // 2) Loss detection (RFC 9002 §6.1/§6.2): detect time-threshold losses,
+        // 2) Retire reordered-packet read keys no later than three PTOs after
+        // committing the successor generation (RFC 9001 section 6.5).
+        if let deadline = previousReadKeysDiscardDeadlineNanos,
+           deadline <= nowNanos {
+            keys.discardPreviousReadGeneration()
+            previousReadKeysDiscardDeadlineNanos = nil
+            result.firedTimers.append(.keyDiscard)
+        }
+
+        // 3) Loss detection (RFC 9002 §6.1/§6.2): detect time-threshold losses,
         // feed congestion control, and on PTO send a probe.
         var output = QUICEngineOutput()
         let lossFired = try handleLossDetection(nowNanos: nowNanos)
         if lossFired { result.firedTimers.append(.lossDetection) }
 
-        // 3) Path-validation timeouts.
+        // 4) Path-validation timeouts.
         let expiredPaths = pathValidation.checkTimeouts(nowNanos: nowNanos)
         if !expiredPaths.isEmpty {
             result.pathValidationFailed = true
             result.firedTimers.append(.pathValidation)
         }
 
-        // 4) An owed ACK whose delay has elapsed becomes immediately sendable.
+        // 5) An owed ACK whose delay has elapsed becomes immediately sendable.
         if computeAckDeadline().map({ $0 <= nowNanos }) == true {
             result.firedTimers.append(.ackDelay)
         }

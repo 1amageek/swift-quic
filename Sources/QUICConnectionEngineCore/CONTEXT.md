@@ -1,109 +1,58 @@
-# QUICConnectionEngineCore — CONTEXT
-Scope/role: the cored, Embedded-clean QUIC connection orchestrator (`QUICConnectionEngine<C, T>`); the substrate the host `QUIC` facade will drive once Slice B rewires it. Drives the other six cores.
-Last reviewed: 2026-06-25
+# QUICConnectionEngineCore context
 
-Invariants and design intent the source does not state structurally. Read this
-before changing the engine seam or its timer surface. This is the QUIC analogue of
-swift-tls's `DTLS*Engine<C>`: it owns the per-connection orchestration that the
-host `ManagedConnection` currently performs under `Mutex`, but as a pure value
-type with no lock and no I/O. The byte currency is `[UInt8]` / `Bytes`.
+`QUICConnectionEngineCore` owns the per-connection, sans-I/O QUIC state
+machine. It drives the packet, recovery, stream, flow-control, idle-timeout, and
+path-validation cores without owning a socket, clock, TLS session, or lock.
 
-## Contracts (the load-bearing rules)
+## Boundary
 
-- **Value type, caller-locked, sans-IO.** `QUICConnectionEngine<C, T>` is a
-  `struct` with `mutating` methods. It holds NO lock and performs NO socket I/O.
-  The host facade is "the caller that locks": it holds the engine behind a
-  `FacadeLock` and serialises every mutation. Do NOT add a lock inside the engine,
-  and do NOT make it a reference type.
-- **I/O is inverted to the facade.** Inbound is `receive(datagram:from:nowNanos:)
-  -> QUICEngineOutput`; outbound bytes are produced as `datagramsToSend` in the
-  output / timer output. The facade owns the `DatagramTransport` (UDP) and
-  `AsyncTimer`. The engine consumes and produces bytes only.
-- **Clock-free timers (mirror DTLS).** No `ContinuousClock` / `Task.sleep` /
-  `Date`. Time enters ONLY as an injected `nowNanos: UInt64`. `deadlines(nowNanos:)`
-  reports the absolute deadline set (loss/PTO, ACK delay, idle, path validation,
-  pacing); the facade parks its `AsyncTimer` against the earliest. On wake the
-  facade calls `handleTimeout(nowNanos:)`, which drives every elapsed timer and
-  returns what to send plus the recomputed deadlines. This is the analogue of
-  DTLS's `DTLSFlightController` + `handleTimeout()`.
-- **It drives the cores; it does NOT reimplement them.** Packet-number spaces over
-  `PacketNumberSpace` numbering; `LossDetectorCore` + `RTTEstimatorCore` +
-  `CubicCore` + `PacerCore` + `AntiAmplificationCore` for recovery;
-  `SendStreamCore` / `ReceiveStreamCore` / `FlowControllerCore` (via
-  `QUICStreamSet`) for streams; `IdleTimeoutCore`; `PathValidationCore`; and
-  `PacketParsingCore` over `SuiteProtector<C>`. Fixes to protocol behaviour belong
-  in the relevant core, not duplicated here.
-- **`T: MonotonicClock` is a phantom parameter.** The engine never touches `T`; it
-  documents the facade's clock dependency and keeps the type shape aligned with
-  the future `Facade<C, T>`.
-- **Crypto/cert capability is injected, X.509 stays out.** `randomBytes` (CSPRNG)
-  and `validateCertificate` (peer trust) are `@Sendable` typed-throws closures on
-  `QUICConnectionEngineConfiguration<C>`. Only DER bytes cross the boundary — no
-  X.509 types enter the engine. The facade fills them (host bridge vs Embedded RPK
-  strategy).
+```text
+QUIC public driver (Mutex, datagram I/O, timer, TLS)
+                         |
+                         v
+            QUICConnectionEngine
+                         |
+       +-----------------+-----------------+
+       |                 |                 |
+   packet core       recovery core      stream core
+```
 
-## Invariants (must hold; tests guard them)
+- The engine is a value type. The public driver is the caller that locks.
+- `nowNanos` is supplied to state transitions; the engine never sleeps and does
+  not read a platform clock.
+- Incoming datagrams use a scoped `Span` borrow. The borrow is synchronous and
+  does not escape.
+- Outbound packets are final `[UInt8]` owners returned to the driver.
+- TLS authentication and capability resolution are owned by `swift-tls`; this
+  engine only consumes handshake bytes, transport parameters, traffic secrets,
+  and the authenticated completion transition.
+- Packet protection is the closed `SuiteProtector` composition from
+  `QUICPacketProtectionCore`; no alternative crypto backend is selected here.
 
-- **Decryption failure on a single packet is NON-fatal — drop, never throw.** A
-  packet that fails to decrypt with the current keys is dropped per RFC 9001 §5.5;
-  throwing would let an attacker kill the connection by injecting one bad packet.
-  This is the one place the engine deliberately does not surface a typed error.
-- **Authentication and protocol violations DO throw (no silent fallback).** A
-  failed CertificateVerify possession check, a thrown injected
-  `validateCertificate` (fail-closed peer trust), a flow-control / final-size /
-  stream-limit violation, packet-number-space exhaustion (2^62, RFC 9000 §12.3),
-  or a malformed transport parameter all surface as a typed `QUICEngineError`. The
-  caller (facade) decides whether to close. `validateCertificate` runs AFTER the
-  in-core possession check and is fail-closed: a throw aborts the connection, so a
-  peer identity never surfaces unverified.
-- **Idle timeout is terminal, not self-closing.** On idle expiry `handleTimeout`
-  sets `idleExpired` and returns; the facade tears the connection down. The engine
-  does not silently self-close.
-- **PTO sends an ack-eliciting probe** (RFC 9002 §6.2.4): on PTO the engine bumps
-  `ptoCount` (bounded backoff `2^min(ptoCount, 20)`, saturating) and queues a PING
-  so flush emits an ack-eliciting packet.
-- **Key state honours RFC 9001.** Initial keys are AES-128-GCM derived from the
-  original destination CID; handshake/application keys install from traffic
-  secrets with the negotiated `QUICProtectionSuite`; 1-RTT key update derives the
-  next generation for both directions and flips the key phase
-  (`QUICKeyState.initiateKeyUpdate`). A request for a missing level's protector
-  throws `keysUnavailable` rather than dropping silently.
+## Failure contract
 
-## Embedded constraints (do not regress)
+- Malformed input, missing keys, flow-control violations, final-size
+  violations, transport-parameter violations, and packet-number exhaustion
+  throw `QUICEngineError`.
+- A per-packet authentication failure is dropped where RFC 9001 permits it; it
+  does not terminate an otherwise valid connection.
+- Idle expiry is reported in timer output. The driver owns transport shutdown.
+- Missing capabilities never produce placeholder output or success.
 
-- No Foundation, no `any` existentials, no `Mutex`, no `ContinuousClock`, no
-  direct crypto library. Generics over `C: CryptoProvider`; cipher-suite dispatch
-  is the closed `SuiteProtector<C>` enum.
-- Single typed error `QUICEngineError` (every fallible entrypoint is
-  `throws(QUICEngineError)`); the facade maps it to its public error inside the
-  lock, mirroring `DTLSEngineError → TLSError`. A cross-type `catch` (e.g. folding
-  a core error) must live in a NAMED function, never a closure literal.
+## Protocol invariants
 
-## Dependencies & seams
+- Initial secrets are derived from the original destination connection ID.
+- Encryption levels and packet-number spaces remain distinct.
+- ACK ranges are bounded by locally known sent packets.
+- PTO queues an acknowledgement-eliciting probe and uses bounded backoff.
+- Anti-amplification is enforced until the server path is validated.
+- Key update advances both secret generation and key phase atomically within
+  one caller-locked transition.
+- A short-header packet terminates a coalesced datagram.
 
-- Injected closures: `randomBytes` (CSPRNG) and `validateCertificate` (fail-closed
-  peer trust returning an optional opaque peer identifier).
-- `C: CryptoProvider` for all key derivation / AEAD / header protection;
-  specialised by the facade at `C = QUICCryptoProvider`.
+## Portable contract
 
-## Status: driven by the seam facade (Slice B rails landed)
-
-This core compiles green Embedded (`P2P_CORE_EMBEDDED=1 swift build --target
-QUICConnectionEngineCore -c release`). It is now driven by the host facade's
-seam-based driver `QUICEngineConnection` (`Sources/QUIC/QUICEngineConnection.swift`):
-a `final class & Sendable` holding `FacadeLock<QUICConnectionEngine>` over the
-`DatagramTransport` + `AsyncTimer` seams, exercised end-to-end by
-`QUICEngineConnectionTests`. The driver is additive — the public `QUIC` facade
-keeps its proven Native host spine so its Foundation/NIO API stays intact. Under
-normal WASI and Embedded WASM, the host spine and host-only dependencies are
-excluded and this engine-driven `[UInt8]` surface is the live `QUIC` product path.
-
-Fix landed in this slice: `collectStreamFrames` no longer emits a spurious
-RESET_STREAM for an idle send stream (a stream with no pending data this tick) —
-RESET_STREAM is sent only on an outstanding STOP_SENDING (RFC 9000 §3.5/§19.4).
-Previously every flush reset healthy idle streams.
-
-## Build
-
-- Host: `swift build` / `swift test --filter QUICConnectionEngineCoreTests`.
-- Embedded: `P2P_CORE_EMBEDDED=1 swift build --target QUICConnectionEngineCore -c release`.
+Native, WASM, and Embedded compile the same engine source. The core has no
+Foundation, NIO, socket I/O, clock access, or shared mutable state. Portable
+validation uses the matching Swift 6.4 toolchain and SDK, with
+`SWIFT_NETWORKING_EMBEDDED=1` enabling Embedded mode.

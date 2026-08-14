@@ -8,7 +8,6 @@ import QUICPacketProtectionCore
 import QUICConnectionCore
 import QUICRecoveryCore
 import QUICStreamCore
-import P2PCoreCrypto
 
 extension QUICConnectionEngine {
     // MARK: - Stream application API
@@ -51,7 +50,9 @@ extension QUICConnectionEngine {
             throw .invalidState("stream \(id) reset already sent")
         }
         streams.sendStreams[id] = send
-        pendingFrames[.application, default: []].append(.resetStream(frame))
+        var frames = pendingFrames[.application] ?? []
+        frames.append(.resetStream(frame))
+        pendingFrames[.application] = frames
     }
 
     /// Resets a stream after reliably delivering its prefix through `reliableSize`.
@@ -75,6 +76,27 @@ extension QUICConnectionEngine {
             throw .stream(error)
         }
         streams.sendStreams[id] = send
+    }
+
+    /// Requests that the peer stop its send side for a receive-capable stream.
+    public mutating func stopSending(
+        _ id: UInt64,
+        errorCode: UInt64
+    ) throws(QUICEngineError) {
+        guard status != .closed else { throw .connectionClosed }
+        guard streams.receiveStreams[id] != nil else {
+            throw .invalidState("stop receiving unknown or send-only stream \(id)")
+        }
+        var frames = pendingFrames[.application] ?? []
+        frames.append(
+            .stopSending(
+                StopSendingFrame(
+                    streamID: id,
+                    applicationErrorCode: errorCode
+                )
+            )
+        )
+        pendingFrames[.application] = frames
     }
 
     /// Drains contiguous received bytes from a stream's receive buffer.
@@ -106,8 +128,23 @@ extension QUICConnectionEngine {
 
     /// Queues outbound CRYPTO bytes at an encryption level (the facade's TLS seam
     /// produces these). They are framed by the next flush.
-    public mutating func queueHandshake(_ data: [UInt8], level: EncryptionLevel) {
-        cryptoSendQueue[level, default: []].append(contentsOf: data)
+    public mutating func queueHandshake(_ data: Span<UInt8>, level: EncryptionLevel) {
+        var queue = cryptoSendQueue.take(level) ?? []
+        queue.reserveCapacity(queue.count + data.count)
+        data.bytes.withUnsafeBytes { source in
+            queue.append(contentsOf: source)
+        }
+        cryptoSendQueue[level] = queue
+    }
+
+    /// Convenience boundary for callers that already own contiguous array
+    /// storage. The array is borrowed; the engine performs only the ownership
+    /// copy required to retain bytes until packetization.
+    public mutating func queueHandshake(
+        _ data: borrowing [UInt8],
+        level: EncryptionLevel
+    ) {
+        queueHandshake(data.span, level: level)
     }
 
     /// Installs handshake/application keys derived by the facade's TLS seam. This
@@ -122,12 +159,99 @@ extension QUICConnectionEngine {
         try keys.install(level: level, readSecret: readSecret, writeSecret: writeSecret, suite: suite, isClient: isClient)
     }
 
+    /// Issues a caller-generated connection ID and reset token to the peer.
+    ///
+    /// Entropy and endpoint demultiplexing remain host responsibilities. The
+    /// engine validates ordering, fixed CID length, uniqueness, and the peer's
+    /// advertised active-ID limit before queueing the wire frame.
+    public mutating func issueLocalConnectionID(
+        sequenceNumber: UInt64,
+        connectionID: ConnectionID,
+        statelessResetToken: [UInt8],
+        retirePriorTo: UInt64 = 0
+    ) throws(QUICEngineError) {
+        guard status != .closed else { throw .connectionClosed }
+        guard connectionID.length == sourceConnectionID.length else {
+            throw .invalidState("locally issued connection IDs must have one fixed length")
+        }
+        guard statelessResetToken.count == ProtocolLimits.statelessResetTokenLength else {
+            throw .invalidState("a stateless reset token must contain exactly 16 bytes")
+        }
+        guard retirePriorTo <= sequenceNumber else {
+            throw .invalidState("retirePriorTo must not exceed the issued sequence number")
+        }
+        let futureActiveCount = localConnectionIDs.records.reduce(into: 0) { count, record in
+            if !record.isRetired && record.sequenceNumber >= retirePriorTo {
+                count += 1
+            }
+        } + 1
+        guard UInt64(futureActiveCount) <= peerActiveConnectionIDLimit else {
+            throw .invalidState("issuing this connection ID exceeds the peer's active_connection_id_limit")
+        }
+        try localConnectionIDs.issue(
+            sequenceNumber: sequenceNumber,
+            connectionID: connectionID,
+            statelessResetToken: statelessResetToken
+        )
+        let frame: NewConnectionIDFrame
+        do {
+            frame = try NewConnectionIDFrame(
+                sequenceNumber: sequenceNumber,
+                retirePriorTo: retirePriorTo,
+                connectionID: connectionID,
+                statelessResetToken: statelessResetToken
+            )
+        } catch {
+            throw .invalidState("invalid local NEW_CONNECTION_ID values")
+        }
+        var pending = pendingFrames[.application] ?? []
+        pending.append(.newConnectionID(frame))
+        pendingFrames[.application] = pending
+    }
+
     /// Applies the peer's validated transport parameters (RFC 9000 §18.2),
     /// wiring the peer's stream-count, connection-level, and per-stream send
     /// limits into the flow controller + stream set. The facade calls this once
     /// the TLS seam surfaces the peer's parameters (typically with
     /// ``markHandshakeComplete()``).
-    public mutating func applyPeerTransportParameters(_ tp: TransportParametersCore) {
+    public mutating func validateAndApplyPeerTransportParameters(
+        _ tp: TransportParametersCore
+    ) throws(QUICEngineError) {
+        let expectedPeerInitialSource = destinationConnectionID
+        guard let peerInitialSource = tp.initialSourceConnectionID else {
+            throw .transportParameter("initial_source_connection_id is required")
+        }
+        guard peerInitialSource == expectedPeerInitialSource else {
+            throw .transportParameter("initial_source_connection_id does not match the peer Initial SCID")
+        }
+
+        if isClient {
+            guard let originalDestination = tp.originalDestinationConnectionID else {
+                throw .transportParameter("original_destination_connection_id is required from a server")
+            }
+            guard originalDestination == config.originalDestinationConnectionID else {
+                throw .transportParameter("original_destination_connection_id does not match the first client Initial")
+            }
+            if let retrySourceConnectionID {
+                guard tp.retrySourceConnectionID == retrySourceConnectionID else {
+                    throw .transportParameter("retry_source_connection_id does not match the processed Retry")
+                }
+            } else if tp.retrySourceConnectionID != nil {
+                throw .transportParameter("retry_source_connection_id was sent without a processed Retry")
+            }
+        } else {
+            guard tp.originalDestinationConnectionID == nil,
+                  tp.retrySourceConnectionID == nil,
+                  tp.statelessResetToken == nil,
+                  tp.preferredAddress == nil else {
+                throw .transportParameter("a client sent server-only transport parameters")
+            }
+        }
+
+        applyPeerTransportParameters(tp)
+    }
+
+    package mutating func applyPeerTransportParameters(_ tp: TransportParametersCore) {
         streams.flowController.updateRemoteStreamLimit(tp.initialMaxStreamsBidi, bidirectional: true)
         streams.flowController.updateRemoteStreamLimit(tp.initialMaxStreamsUni, bidirectional: false)
         streams.flowController.updateConnectionSendLimit(tp.initialMaxData)
@@ -138,6 +262,11 @@ extension QUICConnectionEngine {
         peerEnableResetStreamAt = tp.enableResetStreamAt
         peerAckDelayExponent = Self.boundedAckDelayExponent(tp.ackDelayExponent)
         peerMaxAckDelayNanos = Self.millisecondsToNanos(tp.maxAckDelay)
+        peerActiveConnectionIDLimit = max(2, tp.activeConnectionIDLimit)
+        if let token = tp.statelessResetToken,
+           token.count == ProtocolLimits.statelessResetTokenLength {
+            peerConnectionIDs.setInitialStatelessResetToken(token)
+        }
     }
 
     /// Marks the handshake complete (called by the facade once the TLS seam
@@ -148,18 +277,30 @@ extension QUICConnectionEngine {
         status = .established
         if !isClient {
             handshakeDonePending = true
-            handshakeConfirmed = true
+            markHandshakeConfirmed()
         }
         keys.discard(level: .initial)
         initialSpace.isDiscarded = true
     }
 
-    /// Initiates a 1-RTT key update (RFC 9001 §6.1): derives the next generation
-    /// of application read/write keys, installs them, flips the key phase, and
-    /// returns the new phase bit. Subsequent short-header packets are sealed under
-    /// the new phase. Throws if application keys are not yet installed.
+    /// Marks the handshake confirmed from TLS or HANDSHAKE_DONE and retires
+    /// Handshake keys. This is intentionally distinct from handshake completion:
+    /// a client completes before the server confirms receipt of its Finished.
+    public mutating func markHandshakeConfirmed() {
+        guard status != .closed else { return }
+        handshakeConfirmed = true
+        keys.discard(level: .handshake)
+        handshakeSpace.isDiscarded = true
+    }
+
+    /// Initiates a 1-RTT key update after handshake confirmation. The write
+    /// generation advances immediately; receive keys are committed only after
+    /// authenticating the peer's response under the corresponding phase.
     public mutating func performKeyUpdate() throws(QUICEngineError) -> UInt8 {
-        try keys.initiateKeyUpdate()
+        guard handshakeConfirmed else {
+            throw .invalidState("key update requires handshake confirmation")
+        }
+        return try keys.initiateKeyUpdate()
     }
 
     /// Queues an unreliable DATAGRAM payload (RFC 9221).
@@ -171,8 +312,8 @@ extension QUICConnectionEngine {
     /// Initiates a graceful close, producing a CONNECTION_CLOSE on the next flush.
     public mutating func close(errorCode: UInt64, reason: [UInt8], isApplicationError: Bool) {
         guard status != .closed else { return }
-        pendingClose = ConnectionCloseInfo(
-            errorCode: errorCode, isApplicationError: isApplicationError, frameType: nil, reasonPhrase: reason)
+        pendingClose = .present(ConnectionCloseInfo(
+            errorCode: errorCode, isApplicationError: isApplicationError, frameType: nil, reasonPhrase: reason))
         status = .closing
     }
 
@@ -182,7 +323,7 @@ extension QUICConnectionEngine {
     /// receive error already makes the connection unusable.
     public mutating func markClosed() {
         status = .closed
-        pendingClose = nil
+        pendingClose = .absent
     }
 
     // MARK: - Flush
@@ -201,7 +342,7 @@ extension QUICConnectionEngine {
         if status == .closed { return }
 
         // CONNECTION_CLOSE short-circuits everything else.
-        if let close = pendingClose {
+        if case .present(let close) = pendingClose {
             let level = currentSendLevel
             let frame = Frame.connectionClose(ConnectionCloseFrame(
                 errorCode: close.errorCode,
@@ -216,7 +357,7 @@ extension QUICConnectionEngine {
             ) else { return }
             output.datagramsToSend.append(dgram)
             status = .closed
-            pendingClose = nil
+            pendingClose = .absent
             return
         }
 
@@ -237,7 +378,7 @@ extension QUICConnectionEngine {
     // MARK: - Frame collection
 
     private mutating func collectFrames(for level: EncryptionLevel, nowNanos: UInt64) throws(QUICEngineError) -> [Frame] {
-        var frames = pendingFrames.removeValue(forKey: level) ?? []
+        var frames = pendingFrames.take(level) ?? []
 
         // 0) PTO probe (RFC 9002 §6.2.4): an ack-eliciting PING.
         if pendingPing[level] == true {
@@ -340,7 +481,7 @@ extension QUICConnectionEngine {
         nowNanos: UInt64,
         padInitial: Bool
     ) throws(QUICEngineError) -> [UInt8]? {
-        let protector: SuiteProtector<C>
+        var protector: SuiteProtector
         do {
             protector = try keys.writeProtector(for: level)
         } catch {
@@ -348,20 +489,37 @@ extension QUICConnectionEngine {
             throw error
         }
 
+        let confidentialityLimit = config.aeadUsageLimits.confidentialityLimit(for: protector.suite)
+        if keys.writePacketCount(for: level) >= confidentialityLimit {
+            guard level == .application, handshakeConfirmed else {
+                status = .closed
+                queueUnsentFrames(frames, level: level)
+                throw .aeadLimitReached
+            }
+            do {
+                _ = try keys.initiateKeyUpdate()
+                protector = try keys.writeProtector(for: level)
+            } catch {
+                status = .closed
+                queueUnsentFrames(frames, level: level)
+                throw .aeadLimitReached
+            }
+        }
+
         let pn: UInt64
         switch level {
         case .initial:
-            do { pn = try initialSpace.takeNextPacketNumber() } catch {
+            do { pn = try initialSpace.takeNextPacketNumber(at: level) } catch {
                 queueUnsentFrames(frames, level: level)
                 throw error
             }
         case .handshake:
-            do { pn = try handshakeSpace.takeNextPacketNumber() } catch {
+            do { pn = try handshakeSpace.takeNextPacketNumber(at: level) } catch {
                 queueUnsentFrames(frames, level: level)
                 throw error
             }
         case .zeroRTT, .application:
-            do { pn = try applicationSpace.takeNextPacketNumber() } catch {
+            do { pn = try applicationSpace.takeNextPacketNumber(at: level) } catch {
                 queueUnsentFrames(frames, level: level)
                 throw error
             }
@@ -370,39 +528,63 @@ extension QUICConnectionEngine {
         let ackEliciting = frames.contains { isAckElicitingOut($0) }
         let inFlight = ackEliciting || frames.contains { if case .padding = $0 { return true } else { return false } }
 
+        // Count before serialization. This conservatively charges failed codec
+        // attempts and guarantees a successful AEAD seal is never missed.
+        keys.recordSealAttempt(for: level)
         let datagram: [UInt8]
         if level == .application {
-            let header = ShortHeader(
-                destinationConnectionID: destinationConnectionID,
-                packetNumber: pn,
-                packetNumberLength: 4,
-                spinBit: false,
-                keyPhase: keys.currentKeyPhase == 1)
+            let headerProtectionProtector: SuiteProtector
+            do {
+                headerProtectionProtector = try keys.applicationWriteHeaderProtectionProtector()
+            } catch {
+                withSpace(level) { $0.nextPacketNumber = pn }
+                queueUnsentFrames(frames, level: level)
+                throw error
+            }
+            let header: ShortHeader
+            do {
+                header = try ShortHeader(
+                    destinationConnectionID: destinationConnectionID,
+                    packetNumber: pn,
+                    packetNumberLength: 4,
+                    spinBit: false,
+                    keyPhase: keys.currentWriteKeyPhase == 1
+                )
+            } catch {
+                queueUnsentFrames(frames, level: level)
+                throw .invalidState("invalid local short-header construction")
+            }
             do {
                 datagram = try PacketParsingCore.serializeShortHeaderPacket(
                     frames: frames, header: header, packetNumber: pn, protector: protector,
+                    headerProtectionProtector: headerProtectionProtector,
                     maxPacketSize: config.maxDatagramSize)
             } catch {
-                withSpace(level) { $0.nextPacketNumber = pn }
                 queueUnsentFrames(frames, level: level)
                 throw .packetParsing(error)
             }
         } else {
             let packetType: PacketType = (level == .initial) ? .initial : .handshake
-            let header = LongHeader(
-                packetType: packetType,
-                version: version,
-                destinationConnectionID: destinationConnectionID,
-                sourceConnectionID: sourceConnectionID,
-                token: nil,
-                packetNumber: pn,
-                packetNumberLength: 4)
+            let header: LongHeader
+            do {
+                header = try LongHeader(
+                    packetType: packetType,
+                    version: version,
+                    destinationConnectionID: destinationConnectionID,
+                    sourceConnectionID: sourceConnectionID,
+                    token: level == .initial && !initialToken.isEmpty ? initialToken : nil,
+                    packetNumber: pn,
+                    packetNumberLength: 4
+                )
+            } catch {
+                queueUnsentFrames(frames, level: level)
+                throw .invalidState("invalid local long-header construction")
+            }
             do {
                 datagram = try PacketParsingCore.serializeLongHeaderPacket(
                     frames: frames, header: header, packetNumber: pn, protector: protector,
                     maxPacketSize: config.maxDatagramSize, padToMinimum: padInitial)
             } catch {
-                withSpace(level) { $0.nextPacketNumber = pn }
                 queueUnsentFrames(frames, level: level)
                 throw .packetParsing(error)
             }
@@ -411,8 +593,9 @@ extension QUICConnectionEngine {
         // Anti-amplification gate (RFC 9000 §8.1): a server may not send more than
         // 3x what it has received until the path is validated.
         guard antiAmplification.canSend(bytes: UInt64(datagram.count)) else {
-            // Roll back the packet number we consumed so it is not skipped.
-            withSpace(level) { $0.nextPacketNumber = pn }
+            // The packet was already sealed. Its packet number must never be
+            // reused with the same key, even though anti-amplification prevents
+            // transmission; a gap in the packet-number space is valid.
             queueUnsentFrames(frames, level: level)
             return nil
         }
@@ -423,12 +606,16 @@ extension QUICConnectionEngine {
             packetNumber: pn, timeSentNanos: nowNanos, sentBytes: datagram.count,
             inFlight: inFlight, ackEliciting: ackEliciting)
         withSpace(level) { $0.lossDetector.onPacketSent(sent) }
-        let retransmittable = frames.filter(\.carriesRetransmittableInformation)
+        if level == .application {
+            keys.recordApplicationPacketSent(pn)
+        }
+        let retransmittable = frames.filter {
+            $0.carriesRetransmittableInformation
+        }
         if !retransmittable.isEmpty {
-            sentFrameLedger[EngineSentFrameKey(
-                encryptionLevel: level,
-                packetNumber: pn
-            )] = retransmittable
+            var ledger = sentFrameLedger[level] ?? UInt64ValueMap<[Frame]>()
+            ledger[pn] = retransmittable
+            sentFrameLedger[level] = ledger
         }
         if inFlight {
             congestion.onPacketSent(bytes: datagram.count, nowNanos: nowNanos)
@@ -442,11 +629,9 @@ extension QUICConnectionEngine {
         _ packet: SentPacketView,
         level: EncryptionLevel
     ) {
-        let key = EngineSentFrameKey(
-            encryptionLevel: level,
-            packetNumber: packet.packetNumber
-        )
-        guard let frames = sentFrameLedger.removeValue(forKey: key) else { return }
+        var ledger = sentFrameLedger[level] ?? UInt64ValueMap<[Frame]>()
+        guard let frames = ledger.removeValue(forKey: packet.packetNumber) else { return }
+        sentFrameLedger[level] = ledger
         for frame in frames {
             switch frame {
             case .stream(let streamFrame):
@@ -474,13 +659,13 @@ extension QUICConnectionEngine {
         level: EncryptionLevel
     ) {
         for packet in packets {
-            let key = EngineSentFrameKey(
-                encryptionLevel: level,
-                packetNumber: packet.packetNumber
-            )
-            if let frames = sentFrameLedger.removeValue(forKey: key) {
-                pendingFrames[level, default: []].append(contentsOf: frames)
+            var ledger = sentFrameLedger[level] ?? UInt64ValueMap<[Frame]>()
+            if let frames = ledger.removeValue(forKey: packet.packetNumber) {
+                var pending = pendingFrames[level] ?? []
+                pending.append(contentsOf: frames)
+                pendingFrames[level] = pending
             }
+            sentFrameLedger[level] = ledger
         }
     }
 
@@ -488,9 +673,11 @@ extension QUICConnectionEngine {
         _ frames: [Frame],
         level: EncryptionLevel
     ) {
-        let recoverable = frames.filter(\.carriesUnsentInformation)
+        let recoverable = frames.filter { $0.carriesUnsentInformation }
         guard !recoverable.isEmpty else { return }
-        pendingFrames[level, default: []].insert(contentsOf: recoverable, at: 0)
+        var pending = pendingFrames[level] ?? []
+        pending.insert(contentsOf: recoverable, at: 0)
+        pendingFrames[level] = pending
     }
 
     private func isAckElicitingOut(_ frame: Frame) -> Bool {

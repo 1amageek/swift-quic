@@ -1,14 +1,10 @@
 /// Embedded-clean RTT estimator (RFC 9002 §5) as a value type.
 ///
-/// This is the byte-identical EWMA math of the host `RTTEstimator`, expressed as a
-/// `struct` operating purely on monotonic `UInt64` nanosecond values. The host
-/// `RTTEstimator` keeps `Duration`-typed public fields and a `RTTEstimatorCore`; it
-/// converts `Duration` to/from nanoseconds and delegates the math here, so observable
-/// behavior is unchanged.
+/// A caller-owned `struct` implementing the RFC EWMA over monotonic `UInt64`
+/// nanosecond values. Clock reads and timer scheduling remain outside this core.
 ///
 /// All durations are stored as nanoseconds. The arithmetic is integer
-/// (`Int64`/`UInt64`-nanosecond) throughout, matching the prior host implementation,
-/// so the smoothed-RTT / variance / min-RTT updates are numerically identical.
+/// (`Int64`/`UInt64`-nanosecond) throughout.
 ///
 /// Embedded-clean: no Foundation, no `Duration`, no `ContinuousClock`, no `any`,
 /// no `Mutex`.

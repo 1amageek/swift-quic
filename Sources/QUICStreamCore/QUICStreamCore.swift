@@ -27,9 +27,6 @@
 // ContinuousClock/Date, and NO Foundation. Byte payloads are `[UInt8]`. The caller
 // owns synchronization and any clock.
 //
-// NOT in this target (host-only, see the QUICStream adapter): the caller-locked
-// `DataStream` (the `final class` that wraps `SendStreamCore` + `ReceiveStreamCore`
-// under one `Mutex`, bridges `Data` ⇄ `[UInt8]`, and synthesizes the unified
-// `StreamState`), the `DataBuffer` / `FlowController` `Data`-facing wrappers, the
-// `StreamManager` (`Mutex`-held stream multiplexer), the `StreamScheduler`, and any
-// async delivery (`AsyncStream` / continuations) which stays adapter-side.
+// Connection-wide stream ownership and asynchronous activity notification live
+// in `QUICConnectionEngineCore` and the public `QUIC` driver. This target owns
+// only deterministic stream and flow-control transitions.

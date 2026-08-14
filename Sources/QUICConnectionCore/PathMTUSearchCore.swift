@@ -3,13 +3,9 @@
 /// `PathMTUSearchCore` is the pure value-type state machine for active path-MTU
 /// discovery: it performs only in-memory bookkeeping and integer arithmetic for
 /// the search algorithm and never touches I/O, time, crypto, or `Data`. The host
-/// adapter (`PathMTUDiscovery`) holds one of these behind a `Mutex` and forwards
-/// each call; coring the value type keeps the concurrency primitive adapter-side
-/// (per the project rules) while making the algorithm Embedded-buildable.
-///
-/// Behaviour is byte-identical to the former in-class implementation: the same
-/// optimistic-binary-search probe target, the same MAX_PROBES convergence, and the
-/// same base-size black-hole detection.
+/// caller owns serialization and actual probe I/O. The core implements an
+/// optimistic binary search, MAX_PROBES retry policy, and base-size black-hole
+/// detection without platform dependencies.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`,
 /// no crypto; typed throws are unnecessary as every operation is total.
@@ -163,6 +159,9 @@ public struct PathMTUSearchCore: Sendable {
     /// Records that a probe of the given size was sent in the given packet.
     public mutating func recordProbeSent(size: Int, packetNumber: UInt64) {
         guard phase == .base || phase == .searching else { return }
+        if size != probeTarget {
+            probeCount = 0
+        }
         phase = .searching
         probeTarget = size
         outstandingProbe = PMTUProbe(size: size, packetNumber: packetNumber)
@@ -211,11 +210,13 @@ public struct PathMTUSearchCore: Sendable {
         // A probe above the base failing simply means that size is not supported.
         if probe.size > Self.basePLPMTU {
             if probeCount >= Self.maxProbes {
-                phase = .searchComplete
-                probeCount = 0
-            } else {
                 maxPLPMTU = max(currentPLPMTU, probe.size - 1)
                 phase = maxPLPMTU > currentPLPMTU ? .searching : .searchComplete
+                probeCount = 0
+            } else {
+                // Retry the same target up to MAX_PROBES before reducing the
+                // search ceiling. A single lost probe is not proof of a PMTU bound.
+                phase = .searching
             }
         } else {
             // Black-hole detection: base-size probes are not getting through.

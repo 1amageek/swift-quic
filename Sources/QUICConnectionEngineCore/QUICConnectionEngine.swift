@@ -11,33 +11,26 @@
 //     caller-driven retransmission/idle/ACK entrypoint (the QUIC analogue of
 //     DTLS's `DTLSFlightController` + `handleTimeout()`); the engine reports the
 //     next deadline set and the facade parks its `AsyncTimer` against it.
-//   * NO `any` — generics over `C: CryptoProvider`; cipher-suite dispatch is the
-//     closed `SuiteProtector<C>` enum; crypto/cert is injected via typed-throws
-//     closures (X.509 never enters the engine).
+//   * NO `any` — cipher-suite dispatch is the closed `SuiteProtector` enum.
 //
-// It DRIVES the existing cores (it does not reimplement them): the three
-// packet-number spaces over `ConnectionStateCore` numbering, `LossDetectorCore`
+// It DRIVES the existing cores (it does not reimplement them): three owned
+// packet-number spaces, `LossDetectorCore`
 // + `RTTEstimatorCore` + `CubicCore` + `PacerCore` + `AntiAmplificationCore`,
 // `SendStreamCore`/`ReceiveStreamCore`/`FlowControllerCore`, `IdleTimeoutCore`,
-// `PathValidationCore`, and `PacketParsingCore` over `SuiteProtector<C>`.
+// `PathValidationCore`, and `PacketParsingCore` over `SuiteProtector`.
 
 import QUICWire
 import QUICPacketProtectionCore
 import QUICConnectionCore
 import QUICRecoveryCore
 import QUICStreamCore
-import P2PCoreCrypto
 
 /// A value-type, caller-locked, sans-IO, clock-free QUIC connection engine.
 ///
-/// `C` is the crypto provider seam; `T` is the monotonic clock the host facade
-/// uses to source `nowNanos` (the engine never touches `T` — it is a phantom
-/// parameter that documents the facade's clock dependency and keeps the public
-/// type shape aligned with `Facade<C, T>`).
-public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendable {
+public struct QUICConnectionEngine: Sendable {
     // MARK: - Immutable configuration
 
-    let config: QUICConnectionEngineConfiguration<C>
+    let config: QUICConnectionEngineConfiguration
     let isClient: Bool
 
     // MARK: - Connection identity & lifecycle
@@ -49,6 +42,20 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
     var sourceConnectionID: ConnectionID
     /// The version in use.
     let version: QUICVersion
+    /// Source CID from the first authenticated peer Initial. Later Initial
+    /// packets with a different SCID are discarded (RFC 9000 section 7.2).
+    var peerInitialSourceConnectionID: ConnectionID?
+    /// Retry state retained through transport-parameter authentication.
+    var retrySourceConnectionID: ConnectionID?
+    var initialToken: [UInt8] = []
+    var processedRetry = false
+    var processedAuthenticatedPeerPacket = false
+    /// Connection IDs issued by this endpoint and accepted as packet DCIDs.
+    var localConnectionIDs: QUICConnectionIDState
+    /// Connection IDs issued by the peer and eligible as packet destinations.
+    var peerConnectionIDs: QUICConnectionIDState
+    /// Limit the peer advertised for IDs that this endpoint may issue.
+    var peerActiveConnectionIDLimit: UInt64 = 2
 
     /// High-level lifecycle status.
     var status: Status = .handshaking
@@ -61,7 +68,7 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
 
     // MARK: - Keys / protection
 
-    var keys: QUICKeyState<C>
+    var keys: QUICKeyState
 
     // MARK: - Packet-number spaces (RFC 9000 §12.3)
 
@@ -84,14 +91,16 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
 
     /// Reassembled CRYPTO offsets per level. The companion message framers
     /// retain partial TLS headers/bodies and emit only complete messages.
-    var cryptoReassembly: [EncryptionLevel: StreamReassemblyBuffer] = [:]
-    var cryptoMessageFraming: [EncryptionLevel: QUICCryptoMessageFramer] = [:]
+    var cryptoReassembly = EncryptionLevelSlots<StreamReassemblyBuffer>()
+    var cryptoMessageFraming = EncryptionLevelSlots<QUICCryptoMessageFramer>()
     /// Outbound CRYPTO send offset per level (for framing handshake bytes we send).
-    var cryptoSendOffset: [EncryptionLevel: UInt64] = [:]
+    var cryptoSendOffset = EncryptionLevelSlots<UInt64>()
     /// Queued CRYPTO bytes awaiting framing per level.
-    var cryptoSendQueue: [EncryptionLevel: [UInt8]] = [:]
+    var cryptoSendQueue = EncryptionLevelSlots<[UInt8]>()
 
     var handshakeConfirmed = false
+    /// Absolute deadline for discarding the reordered-packet read generation.
+    var previousReadKeysDiscardDeadlineNanos: UInt64?
 
     // MARK: - Timers
 
@@ -106,7 +115,7 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
     /// Whether a HANDSHAKE_DONE frame is owed (server, after handshake complete).
     var handshakeDonePending = false
     /// Whether the peer sent HANDSHAKE_DONE (client confirms handshake).
-    var pendingClose: ConnectionCloseInfo?
+    var pendingClose: ConnectionCloseSlot = .absent
     /// Queued unreliable DATAGRAM payloads to send (RFC 9221).
     var pendingDatagrams: [[UInt8]] = []
     /// Peer's max DATAGRAM frame size (0 = datagrams not permitted by peer).
@@ -114,12 +123,12 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
     /// Whether the peer advertised RESET_STREAM_AT support.
     var peerEnableResetStreamAt = false
     /// Per-level pending PTO probe (PING) flags, set by the loss-detection timer.
-    var pendingPing: [EncryptionLevel: Bool] = [:]
+    var pendingPing = EncryptionLevelSlots<Bool>()
     /// Frames collected from producer state but not yet successfully transmitted,
     /// plus retransmittable information restored after packet loss.
-    var pendingFrames: [EncryptionLevel: [Frame]] = [:]
+    var pendingFrames = EncryptionLevelSlots<[Frame]>()
     /// Retransmittable information retained until ACK or loss resolves its packet.
-    var sentFrameLedger: [EngineSentFrameKey: [Frame]] = [:]
+    var sentFrameLedger = EncryptionLevelSlots<UInt64ValueMap<[Frame]>>()
     /// Whether a local PATH_CHALLENGE is outstanding (arms the validation timer).
     var pathValidationPending = false
     /// ACK delay exponent this endpoint advertised and uses when encoding ACKs.
@@ -135,7 +144,7 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
     /// keys immediately (RFC 9001 §5.2). Throws if the version has no salt or the
     /// key derivation fails.
     public init(
-        configuration: QUICConnectionEngineConfiguration<C>,
+        configuration: QUICConnectionEngineConfiguration,
         nowNanos: UInt64
     ) throws(QUICEngineError) {
         self.config = configuration
@@ -143,6 +152,13 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
         self.version = configuration.version
         self.sourceConnectionID = configuration.localConnectionID
         self.destinationConnectionID = configuration.initialPeerConnectionID
+        self.localConnectionIDs = QUICConnectionIDState(
+            initialConnectionID: configuration.localConnectionID,
+            statelessResetToken: configuration.localTransportParameters.statelessResetToken
+        )
+        self.peerConnectionIDs = QUICConnectionIDState(
+            initialConnectionID: configuration.initialPeerConnectionID
+        )
 
         let maxDatagram = configuration.maxDatagramSize
         self.congestion = CubicCore(maxDatagramSize: maxDatagram)
@@ -182,7 +198,7 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
         self.idleTimeout = IdleTimeoutCore(localTimeoutNanos: idle, nowNanos: nowNanos)
         self.pathValidation = PathValidationCore(validationTimeoutNanos: configuration.pathValidationTimeoutNanos)
 
-        var keyState = QUICKeyState<C>()
+        var keyState = QUICKeyState()
         guard let salt = configuration.version.initialSaltBytes else {
             throw .transportParameter("unsupported QUIC version (no initial salt)")
         }
@@ -203,7 +219,7 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
     public var isClosed: Bool { status == .closed }
 
     /// The current 1-RTT key phase bit applied to outbound short-header packets.
-    public var currentKeyPhase: UInt8 { keys.currentKeyPhase }
+    public var currentKeyPhase: UInt8 { keys.currentWriteKeyPhase }
 
     /// The current destination connection ID (post-migration aware).
     public var currentDestinationConnectionID: ConnectionID { destinationConnectionID }
@@ -255,9 +271,4 @@ public struct QUICConnectionEngine<C: CryptoProvider, T: MonotonicClock>: Sendab
         let (nanos, nanosOverflow) = micros.multipliedReportingOverflow(by: 1_000)
         return nanosOverflow ? UInt64.max : nanos
     }
-}
-
-struct EngineSentFrameKey: Sendable, Hashable {
-    let encryptionLevel: EncryptionLevel
-    let packetNumber: UInt64
 }

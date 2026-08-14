@@ -1,8 +1,7 @@
 /// The minimal RTT view a value-type congestion controller needs.
 ///
-/// The host `RTTEstimator` stores `Duration` values; this core consumes only the
-/// smoothed RTT (as monotonic nanoseconds) and whether an estimate exists. The
-/// adapter projects its `RTTEstimator` into this snapshot before calling the core.
+/// Congestion control consumes only the smoothed RTT in monotonic nanoseconds and
+/// whether an estimate exists.
 ///
 /// Embedded-clean: no Foundation, no `Duration`, no `ContinuousClock`.
 public struct RTTSnapshot: Sendable, Equatable {
@@ -22,9 +21,8 @@ public struct RTTSnapshot: Sendable, Equatable {
 
 /// The per-packet information a value-type congestion controller consumes.
 ///
-/// The host `SentPacket` carries a `ContinuousClock.Instant`; this core consumes
-/// only the byte count, the monotonic send time as nanoseconds, and the in-flight
-/// flag. The adapter projects each `SentPacket` into this view.
+/// Congestion control consumes only the byte count, monotonic send time, and
+/// in-flight flag.
 public struct CongestionPacket: Sendable, Equatable {
     /// Packet size in bytes (the unit of congestion-window accounting).
     public let sentBytes: Int

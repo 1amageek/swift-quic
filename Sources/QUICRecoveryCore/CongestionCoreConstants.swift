@@ -1,9 +1,7 @@
 /// Embedded-clean congestion-control constants (RFC 9002 §7 / RFC 9438).
 ///
-/// These mirror the values in the host-side `LossDetectionConstants` exactly so the
-/// value-type controllers in this core produce byte-identical results. Time-typed
-/// constants (`Duration`-based granularity etc.) stay adapter-side; only the
-/// numeric congestion-control constants live here.
+/// Numeric constants shared by the value-type congestion controllers. Clock and
+/// scheduling concerns remain outside this target.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`.
 

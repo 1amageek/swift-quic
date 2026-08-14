@@ -1,11 +1,8 @@
 /// Flow controller core (RFC 9000 Section 4) as a value type.
 ///
 /// Connection-level and stream-level credit-based flow control, plus stream-concurrency
-/// accounting (MAX_STREAMS / STREAMS_BLOCKED). This is the byte-identical accounting of
-/// the host `FlowController`, expressed as a `struct` with `mutating` methods. The host
-/// `FlowController` wraps it and exposes the same public API, so observable behavior —
-/// including window-update thresholds, blocked detection, and overflow saturation — is
-/// unchanged.
+/// accounting (MAX_STREAMS / STREAMS_BLOCKED). It is a caller-owned value with
+/// explicit mutation; the connection engine owns ordering and synchronization.
 ///
 /// QUIC uses credit-based flow control similar to HTTP/2: the receiver advertises the
 /// maximum amount of data the sender can send. The frame types returned here
@@ -83,10 +80,10 @@ public struct FlowControllerCore: Sendable {
     public let initialMaxStreamDataUni: UInt64
 
     /// Per-stream receive limits (stream ID -> current limit).
-    private var streamRecvLimits: [UInt64: UInt64]
+    private var streamRecvLimits: UInt64ValueMap<UInt64>
 
     /// Per-stream bytes received (stream ID -> bytes received).
-    private var streamBytesReceivedMap: [UInt64: UInt64]
+    private var streamBytesReceivedMap: UInt64ValueMap<UInt64>
 
     // MARK: - Initialization
 
@@ -128,8 +125,8 @@ public struct FlowControllerCore: Sendable {
         self.initialMaxStreamDataBidiRemote = initialMaxStreamDataBidiRemote
         self.initialMaxStreamDataUni = initialMaxStreamDataUni
 
-        self.streamRecvLimits = [:]
-        self.streamBytesReceivedMap = [:]
+        self.streamRecvLimits = UInt64ValueMap()
+        self.streamBytesReceivedMap = UInt64ValueMap()
     }
 
     // MARK: - Connection-Level Flow Control
@@ -288,7 +285,7 @@ public struct FlowControllerCore: Sendable {
 
     /// Get all tracked stream IDs (for cleanup on connection close).
     public var trackedStreamIDs: [UInt64] {
-        Array(streamRecvLimits.keys)
+        streamRecvLimits.keys
     }
 
     // MARK: - Stream Concurrency

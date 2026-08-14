@@ -5,6 +5,26 @@
 
 import QUICWire
 
+package enum ConnectionCloseSlot: Sendable, Equatable {
+    case absent
+    case present(ConnectionCloseInfo)
+
+    package init(_ value: ConnectionCloseInfo?) {
+        if let value {
+            self = .present(value)
+        } else {
+            self = .absent
+        }
+    }
+
+    package var value: ConnectionCloseInfo? {
+        switch self {
+        case .absent: nil
+        case .present(let value): value
+        }
+    }
+}
+
 /// What a single ``QUICConnectionEngine`` step produced.
 ///
 /// The engine is sans-IO: instead of touching a socket, it returns the datagrams
@@ -39,7 +59,12 @@ public struct QUICEngineOutput: Sendable {
     public var peerClosed: Bool
 
     /// A peer CONNECTION_CLOSE reason, if one arrived in this step.
-    public var closeReason: ConnectionCloseInfo?
+    package var closeReasonSlot: ConnectionCloseSlot
+
+    public var closeReason: ConnectionCloseInfo? {
+        get { closeReasonSlot.value }
+        set { closeReasonSlot = ConnectionCloseSlot(newValue) }
+    }
 
     public init(
         datagramsToSend: [[UInt8]] = [],
@@ -58,7 +83,7 @@ public struct QUICEngineOutput: Sendable {
         self.datagrams = datagrams
         self.handshakeComplete = handshakeComplete
         self.peerClosed = peerClosed
-        self.closeReason = closeReason
+        self.closeReasonSlot = ConnectionCloseSlot(closeReason)
     }
 
     /// Whether this output carries nothing for the facade to act on.

@@ -1,13 +1,9 @@
 /// Embedded-clean loss detector (RFC 9002 §6) as a value type.
 ///
-/// This is the byte-identical loss-detection logic of the host `LossDetector`,
-/// expressed as a `struct` with `mutating` methods over a sorted array of
-/// `SentPacketView`. Time is injected as monotonic `UInt64` nanoseconds; emitted
-/// deadlines (`lossTimeNanos`) are returned as `UInt64` nanosecond values. The host
-/// adapter holds a `Mutex<LossDetectorCore>`, fixes a `ContinuousClock` epoch,
-/// converts `Instant`/`Duration` to nanoseconds, decodes the wire `AckFrame` into
-/// `[AckInterval]`, and reconstructs host `SentPacket`s from the returned views — so
-/// observable behavior is unchanged.
+/// The caller-owned `struct` stores a sorted array of `SentPacketView` values.
+/// Time is injected as monotonic `UInt64` nanoseconds and emitted deadlines are
+/// returned in the same unit. The connection engine decodes wire ACK ranges before
+/// invoking this core and owns all scheduling and I/O.
 ///
 /// ## Algorithm (RFC 9002 §6.1)
 /// - Packet threshold (`kPacketThreshold = 3`): a packet is lost when at least

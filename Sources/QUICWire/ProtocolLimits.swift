@@ -70,6 +70,10 @@ public enum ProtocolLimits {
     /// Typical implementations use much smaller values
     public static let maxAckRanges: UInt64 = 256
 
+    /// Maximum stream count carried by MAX_STREAMS / STREAMS_BLOCKED and the
+    /// corresponding transport parameters (RFC 9000 Sections 19.11 and 19.14).
+    public static let maxStreams: UInt64 = 1 << 60
+
     // MARK: - Transport Parameters (RFC 9000 Section 18)
 
     /// Maximum transport parameter value length

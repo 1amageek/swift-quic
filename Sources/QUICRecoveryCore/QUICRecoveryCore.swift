@@ -27,12 +27,6 @@
 // (`nextSendNanos`, recovery start, `lossTimeNanos`, PTO) are returned as `UInt64`
 // values. The caller owns synchronization and the clock.
 //
-// NOT in this target (host-only, see the QUICRecovery adapter): the caller-locked
-// holders (`NewRenoCongestionController`, `CubicCongestionController`, `Pacer`,
-// `RTTEstimator`, `LossDetector`, `AntiAmplificationLimiter`) that wrap these value
-// types, read the host `ContinuousClock`, convert `Instant`/`Duration` to/from
-// nanoseconds, decode the wire `AckFrame`'s gap/rangeLength encoding into
-// `[AckInterval]`, and project `SentPacket`/`RTTEstimator` into the core views; the
-// `CongestionController` protocol and `CongestionControlAlgorithm` factory; and the
-// ACK-generation / PN-space orchestration (`AckManager`, `PacketNumberSpaceManager`)
-// which remain host-side over `ContinuousClock.Instant`/`Duration`.
+// Packet-number-space orchestration and timer scheduling live in
+// `QUICConnectionEngineCore`. The public driver supplies monotonic time through
+// `NetworkingTime` and performs suspension outside engine isolation.

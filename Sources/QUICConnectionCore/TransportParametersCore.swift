@@ -1,11 +1,8 @@
 /// QUIC Transport Parameters value types — Embedded-clean core (RFC 9000 §18).
 ///
-/// `TransportParametersCore` mirrors the host adapter's `TransportParameters`
-/// but stores byte fields as `[UInt8]` instead of `Data`, and the
-/// `preferred_address` IP fields as their wire bytes (`[UInt8]`: 4 for IPv4, 16
-/// for IPv6) rather than textual strings. The adapter converts at the boundary
-/// (String <-> bytes via `IPAddressCodec`, `Data` <-> `[UInt8]`) so its public
-/// `TransportParameters` API and the existing tests stay unchanged.
+/// Byte fields use owned `[UInt8]` storage. The `preferred_address` IP fields
+/// retain their network-order wire representation (`[UInt8]`: 4 for IPv4, 16
+/// for IPv6); textual formatting is an application-boundary concern.
 ///
 /// Embedded-clean: no Foundation, no `any`. The wire codec lives in
 /// ``TransportParameterCodecCore``.
@@ -72,22 +69,22 @@ public struct TransportParametersCore: Sendable, Hashable {
     public var enableResetStreamAt: Bool
     public var maxDatagramFrameSize: UInt64
 
-    /// Creates transport parameters with the protocol default values.
+    /// Creates transport parameters with the RFC defaults used when a parameter
+    /// is absent from the peer's TLS extension.
     ///
-    /// These defaults match the host adapter's `TransportParameters.init()` so
-    /// that decoding (which starts from defaults and overwrites only present
-    /// parameters) produces identical absent-parameter values.
+    /// Decoding starts from these defaults and overwrites only parameters that
+    /// are present on the wire.
     public init() {
         self.originalDestinationConnectionID = nil
-        self.maxIdleTimeout = 30_000
+        self.maxIdleTimeout = 0
         self.statelessResetToken = nil
         self.maxUDPPayloadSize = 65527
-        self.initialMaxData = 10_000_000
-        self.initialMaxStreamDataBidiLocal = 1_000_000
-        self.initialMaxStreamDataBidiRemote = 1_000_000
-        self.initialMaxStreamDataUni = 1_000_000
-        self.initialMaxStreamsBidi = 100
-        self.initialMaxStreamsUni = 100
+        self.initialMaxData = 0
+        self.initialMaxStreamDataBidiLocal = 0
+        self.initialMaxStreamDataBidiRemote = 0
+        self.initialMaxStreamDataUni = 0
+        self.initialMaxStreamsBidi = 0
+        self.initialMaxStreamsUni = 0
         self.ackDelayExponent = 3
         self.maxAckDelay = 25
         self.disableActiveMigration = false
@@ -97,5 +94,20 @@ public struct TransportParametersCore: Sendable, Hashable {
         self.retrySourceConnectionID = nil
         self.enableResetStreamAt = false
         self.maxDatagramFrameSize = 0
+    }
+
+    /// Creates a practical local advertisement without changing the RFC defaults
+    /// used by decoding. Applications remain free to tune every field before the
+    /// value is passed to the engine configuration.
+    public static func recommendedLocal() -> Self {
+        var parameters = Self()
+        parameters.maxIdleTimeout = 30_000
+        parameters.initialMaxData = 10_000_000
+        parameters.initialMaxStreamDataBidiLocal = 1_000_000
+        parameters.initialMaxStreamDataBidiRemote = 1_000_000
+        parameters.initialMaxStreamDataUni = 1_000_000
+        parameters.initialMaxStreamsBidi = 100
+        parameters.initialMaxStreamsUni = 100
+        return parameters
     }
 }

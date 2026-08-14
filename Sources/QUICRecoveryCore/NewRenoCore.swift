@@ -1,11 +1,8 @@
 /// Embedded-clean NewReno congestion controller (RFC 9002 §7) as a value type.
 ///
-/// This is the byte-identical math of the host `NewRenoCongestionController`,
-/// expressed as a `struct` with `mutating` methods. Time is injected as a monotonic
-/// `UInt64` nanosecond value (`nowNanos` / `timeSentNanos`); the controller never
-/// reads a clock. The host adapter holds a `Mutex<NewRenoCore>`, reads its
-/// `ContinuousClock`, converts to nanoseconds, and calls these methods under the
-/// lock — observable behavior is unchanged.
+/// The controller is a `struct` with `mutating` methods. Time is injected as a
+/// monotonic `UInt64` nanosecond value (`nowNanos` / `timeSentNanos`); the
+/// controller never reads a clock.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`.
 public struct NewRenoCore: Sendable {

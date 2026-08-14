@@ -2,10 +2,8 @@
 ///
 /// Before address validation completes, a server MUST NOT send more than three times
 /// the number of bytes received, preventing amplification attacks. This is the
-/// byte-identical accounting of the host `AntiAmplificationLimiter`, expressed as a
-/// `struct` with saturating arithmetic. The host adapter wraps it in a `Mutex` and
-/// exposes the same public API; observable behavior (including overflow saturation) is
-/// unchanged.
+/// value-type accounting used by the connection engine, expressed as a `struct`
+/// with saturating arithmetic.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`.
 public struct AntiAmplificationCore: Sendable, Equatable {

@@ -1,10 +1,7 @@
 /// Embedded-clean idle-timeout core (RFC 9000 §10.1) as a value type.
 ///
-/// This is the byte-identical idle-timeout logic of the host `IdleTimeoutManager`,
-/// expressed as a `struct` operating purely on monotonic `UInt64` nanosecond values.
-/// The host `IdleTimeoutManager` keeps `Duration`-typed public fields plus a
-/// `Mutex` and a `ContinuousClock` epoch; it converts `Duration`/`Instant` to/from
-/// nanoseconds and delegates the math here, so observable behavior is unchanged.
+/// A caller-owned `struct` operating purely on injected monotonic `UInt64`
+/// nanosecond values. It computes deadlines but never creates timer tasks.
 ///
 /// RFC 9000 §10.1: the effective idle timeout is the minimum of the local and peer
 /// `max_idle_timeout` values; a value of 0 means "no timeout" on that side. Keep-alive
@@ -131,7 +128,7 @@ public struct IdleTimeoutCore: Sendable, Equatable {
         guard effectiveTimeoutNanos > 0 else {
             return false
         }
-        let deadline = lastActivityNanos &+ effectiveTimeoutNanos
+        let deadline = saturatingDeadline(after: effectiveTimeoutNanos)
         if nowNanos >= deadline {
             currentState = .timedOut
             return true
@@ -144,7 +141,7 @@ public struct IdleTimeoutCore: Sendable, Equatable {
     public func timeUntilTimeoutNanos(nowNanos: UInt64) -> UInt64? {
         guard currentState == .active else { return nil }
         guard effectiveTimeoutNanos > 0 else { return nil }
-        let deadline = lastActivityNanos &+ effectiveTimeoutNanos
+        let deadline = saturatingDeadline(after: effectiveTimeoutNanos)
         if deadline <= nowNanos {
             return 0
         }
@@ -156,7 +153,7 @@ public struct IdleTimeoutCore: Sendable, Equatable {
     public func timeUntilKeepAliveNanos(nowNanos: UInt64) -> UInt64? {
         guard currentState == .active else { return nil }
         guard let interval = keepAliveIntervalNanos else { return nil }
-        let deadline = lastActivityNanos &+ interval
+        let deadline = saturatingDeadline(after: interval)
         if deadline <= nowNanos {
             return 0
         }
@@ -167,7 +164,7 @@ public struct IdleTimeoutCore: Sendable, Equatable {
     public func shouldSendKeepAlive(nowNanos: UInt64) -> Bool {
         guard currentState == .active else { return false }
         guard let interval = keepAliveIntervalNanos else { return false }
-        let deadline = lastActivityNanos &+ interval
+        let deadline = saturatingDeadline(after: interval)
         return nowNanos >= deadline
     }
 
@@ -181,10 +178,10 @@ public struct IdleTimeoutCore: Sendable, Equatable {
         var earliest: UInt64? = nil
 
         if effectiveTimeoutNanos > 0 {
-            earliest = lastActivityNanos &+ effectiveTimeoutNanos
+            earliest = saturatingDeadline(after: effectiveTimeoutNanos)
         }
         if let interval = keepAliveIntervalNanos {
-            let keepAliveDeadline = lastActivityNanos &+ interval
+            let keepAliveDeadline = saturatingDeadline(after: interval)
             if let current = earliest {
                 earliest = keepAliveDeadline < current ? keepAliveDeadline : current
             } else {
@@ -193,5 +190,11 @@ public struct IdleTimeoutCore: Sendable, Equatable {
         }
 
         return earliest
+    }
+
+    @inline(__always)
+    private func saturatingDeadline(after durationNanos: UInt64) -> UInt64 {
+        let (deadline, overflow) = lastActivityNanos.addingReportingOverflow(durationNanos)
+        return overflow ? UInt64.max : deadline
     }
 }

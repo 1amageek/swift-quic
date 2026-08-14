@@ -3,13 +3,11 @@
 /// Provides encoding and decoding for all QUIC frame types.
 ///
 /// Embedded-clean: no Foundation, no `any`. Encoding flows through
-/// `P2PCoreBytes` `ByteWriter`; decoding through `ByteReader`; byte payloads are
-/// `[UInt8]`; all failures are typed (``FrameCodecError``). The Foundation
-/// adapter restores the historical `Data`-based / `DataReader`-based surface
-/// (`encode(_:) -> Data`, `decode(from: inout DataReader)`,
-/// `decodeFrames(from: Data)`).
+/// `QUICWireWriter`; decoding through `QUICWireReader`; byte payloads are
+/// `[UInt8]`; all failures are typed (``FrameCodecError``). Synchronous decode
+/// borrows packet storage through ``QUICWireReader``.
 
-import P2PCoreBytes
+import NetworkingCore
 
 // MARK: - Frame Codec Errors
 
@@ -47,7 +45,7 @@ public protocol FrameDecoder: Sendable {
     /// Decodes a single frame from a byte reader
     /// - Parameter reader: The reader positioned at the frame start
     /// - Returns: The decoded frame
-    func decode(from reader: inout ByteReader) throws(FrameCodecError) -> Frame
+    func decode(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame
 
     /// Decodes all frames from a byte array
     /// - Parameter bytes: The bytes containing one or more frames
@@ -73,7 +71,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     public func encodeBytes(_ frame: Frame) throws(FrameCodecError) -> [UInt8] {
         // Pre-calculate frame size and reserve exact capacity to avoid reallocations.
         let frameSize = FrameSize.frame(frame)
-        var writer = ByteWriter(reservingCapacity: frameSize)
+        var writer = QUICWireWriter(reservingCapacity: frameSize)
         try encodeFrame(frame, to: &writer)
         return writer.finishArray()
     }
@@ -85,7 +83,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         for frame in frames {
             totalSize += FrameSize.frame(frame)
         }
-        var writer = ByteWriter(reservingCapacity: totalSize)
+        var writer = QUICWireWriter(reservingCapacity: totalSize)
         for frame in frames {
             try encodeFrame(frame, to: &writer)
         }
@@ -93,11 +91,11 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     }
 
     /// Internal encode implementation.
-    internal func encodeFrame(_ frame: Frame, to writer: inout ByteWriter) throws(FrameCodecError) {
+    internal func encodeFrame(_ frame: Frame, to writer: inout QUICWireWriter) throws(FrameCodecError) {
         switch frame {
         case .padding(let count):
             // PADDING frames are just 0x00 bytes.
-            writer.qWriteZeroBytes(count)
+            writer.writeZeroBytes(count)
 
         case .ping:
             // PING frame: just type byte.
@@ -153,6 +151,11 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             try writeVarint(maxStreamData.maxStreamData, to: &writer)
 
         case .maxStreams(let maxStreams):
+            guard maxStreams.maxStreams <= ProtocolLimits.maxStreams else {
+                throw FrameCodecError.invalidFrameFormat(
+                    "MAX_STREAMS value exceeds 2^60: \(maxStreams.maxStreams)"
+                )
+            }
             writer.writeByte(maxStreams.isBidirectional ? 0x12 : 0x13)
             try writeVarint(maxStreams.maxStreams, to: &writer)
 
@@ -166,6 +169,11 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             try writeVarint(blocked.streamDataLimit, to: &writer)
 
         case .streamsBlocked(let blocked):
+            guard blocked.streamLimit <= ProtocolLimits.maxStreams else {
+                throw FrameCodecError.invalidFrameFormat(
+                    "STREAMS_BLOCKED value exceeds 2^60: \(blocked.streamLimit)"
+                )
+            }
             writer.writeByte(blocked.isBidirectional ? 0x16 : 0x17)
             try writeVarint(blocked.streamLimit, to: &writer)
 
@@ -220,17 +228,21 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
 
     /// Writes a QUIC varint, re-wrapping wire-overflow as a frame-format error.
     @inline(__always)
-    internal func writeVarint(_ value: UInt64, to writer: inout ByteWriter) throws(FrameCodecError) {
+    internal func writeVarint(_ value: UInt64, to writer: inout QUICWireWriter) throws(FrameCodecError) {
         do {
             try writer.writeVarint(value)
         } catch {
-            // ByteWriter rejects values above the 2^62-1 varint range.
+            // QUICWireWriter rejects values above the 2^62-1 varint range.
             throw FrameCodecError.invalidFrameFormat("varint value exceeds QUIC varint range: \(value)")
         }
     }
 
     /// Encodes an ACK frame.
-    internal func encodeAckFrame(_ ack: AckFrame, to writer: inout ByteWriter) throws(FrameCodecError) {
+    internal func encodeAckFrame(_ ack: AckFrame, to writer: inout QUICWireWriter) throws(FrameCodecError) {
+        try validateAckRanges(
+            largestAcknowledged: ack.largestAcknowledged,
+            ranges: ack.ackRanges
+        )
         // Type byte: 0x02 (ACK) or 0x03 (ACK with ECN)
         let hasECN = ack.ecnCounts != nil
         writer.writeByte(hasECN ? 0x03 : 0x02)
@@ -270,7 +282,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     }
 
     /// Encodes a STREAM frame.
-    internal func encodeStreamFrame(_ stream: StreamFrame, to writer: inout ByteWriter) throws(FrameCodecError) {
+    internal func encodeStreamFrame(_ stream: StreamFrame, to writer: inout QUICWireWriter) throws(FrameCodecError) {
         // Build type byte with flags
         var typeByte: UInt8 = 0x08
         let hasOffset = stream.offset > 0
@@ -297,7 +309,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     }
 
     /// Encodes a CONNECTION_CLOSE frame.
-    internal func encodeConnectionCloseFrame(_ close: ConnectionCloseFrame, to writer: inout ByteWriter) throws(FrameCodecError) {
+    internal func encodeConnectionCloseFrame(_ close: ConnectionCloseFrame, to writer: inout QUICWireWriter) throws(FrameCodecError) {
         // Type: 0x1c (transport) or 0x1d (application)
         writer.writeByte(close.isApplicationError ? 0x1d : 0x1c)
 
@@ -317,7 +329,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     // MARK: - Decoding
 
     /// Decodes a frame from a byte reader.
-    public func decode(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    public func decode(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let firstByte: UInt8
         do {
             firstByte = try reader.peekUInt8()
@@ -440,7 +452,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
 
     /// Decodes all frames from a byte array.
     public func decodeFrames(from bytes: [UInt8]) throws(FrameCodecError) -> [Frame] {
-        var reader = ByteReader(bytes)
+        var reader = QUICWireReader(bytes)
         var frames: [Frame] = []
         var lastFrameHadNoLength = false
 
@@ -477,7 +489,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
 
     /// Reads a QUIC varint, re-wrapping insufficient-data as a frame-codec error.
     @inline(__always)
-    internal func readVarint(from reader: inout ByteReader) throws(FrameCodecError) -> UInt64 {
+    internal func readVarint(from reader: inout QUICWireReader) throws(FrameCodecError) -> UInt64 {
         do {
             return try reader.readVarint()
         } catch {
@@ -488,11 +500,16 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
     // MARK: - Frame-Specific Decoders
 
     /// Decodes an ACK frame.
-    internal func decodeAckFrame(from reader: inout ByteReader, hasECN: Bool) throws(FrameCodecError) -> Frame {
+    internal func decodeAckFrame(from reader: inout QUICWireReader, hasECN: Bool) throws(FrameCodecError) -> Frame {
         let largestAcked = try readVarint(from: &reader)
         let ackDelay = try readVarint(from: &reader)
         let rangeCount = try readVarint(from: &reader)
         let firstRangeLength = try readVarint(from: &reader)
+        guard firstRangeLength <= largestAcked else {
+            throw FrameCodecError.invalidFrameFormat(
+                "ACK first range exceeds largest acknowledged"
+            )
+        }
 
         // Validate rangeCount against remaining data.
         // Each ACK range requires at least 2 bytes (minimum size of 2 varints).
@@ -522,11 +539,25 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         var ranges: [AckRange] = []
         ranges.reserveCapacity(safeRangeCount + 1)
         ranges.append(AckRange(gap: 0, rangeLength: firstRangeLength))
+        var smallestAcknowledged = largestAcked - firstRangeLength
 
         for _ in 0..<safeRangeCount {
             let gap = try readVarint(from: &reader)
             let rangeLength = try readVarint(from: &reader)
+            let (gapWidth, gapOverflow) = gap.addingReportingOverflow(2)
+            guard !gapOverflow, smallestAcknowledged >= gapWidth else {
+                throw FrameCodecError.invalidFrameFormat(
+                    "ACK gap underflows the packet number space"
+                )
+            }
+            let nextLargest = smallestAcknowledged - gapWidth
+            guard rangeLength <= nextLargest else {
+                throw FrameCodecError.invalidFrameFormat(
+                    "ACK range underflows the packet number space"
+                )
+            }
             ranges.append(AckRange(gap: gap, rangeLength: rangeLength))
+            smallestAcknowledged = nextLargest - rangeLength
         }
 
         var ecnCounts: ECNCounts? = nil
@@ -545,7 +576,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    internal func decodeResetStreamFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    internal func decodeResetStreamFrame(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let streamID = try readVarint(from: &reader)
         let errorCode = try readVarint(from: &reader)
         let finalSize = try readVarint(from: &reader)
@@ -556,7 +587,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    internal func decodeResetStreamAtFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    internal func decodeResetStreamAtFrame(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let streamID = try readVarint(from: &reader)
         let errorCode = try readVarint(from: &reader)
         let finalSize = try readVarint(from: &reader)
@@ -574,7 +605,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    internal func decodeStopSendingFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    internal func decodeStopSendingFrame(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let streamID = try readVarint(from: &reader)
         let errorCode = try readVarint(from: &reader)
         return .stopSending(StopSendingFrame(
@@ -583,7 +614,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    internal func decodeCryptoFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    internal func decodeCryptoFrame(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let offset = try readVarint(from: &reader)
         let length = try readVarint(from: &reader)
         let safeLength: Int
@@ -628,7 +659,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         }
     }
 
-    internal func decodeNewTokenFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    internal func decodeNewTokenFrame(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let length = try readVarint(from: &reader)
         let safeLength: Int
         do {
@@ -645,7 +676,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         return .newToken(token)
     }
 
-    internal func decodeStreamFrame(from reader: inout ByteReader, typeByte: UInt8) throws(FrameCodecError) -> Frame {
+    internal func decodeStreamFrame(from reader: inout QUICWireReader, typeByte: UInt8) throws(FrameCodecError) -> Frame {
         let hasOffset = (typeByte & 0x04) != 0
         let hasLength = (typeByte & 0x02) != 0
         let hasFin = (typeByte & 0x01) != 0
@@ -684,7 +715,11 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         } else {
             // No length means data extends to end of packet.
             // Per RFC 9000 Section 12.4, this frame must be last in packet.
-            data = reader.readRemaining()
+            do {
+                data = try reader.readRemaining()
+            } catch {
+                throw FrameCodecError.insufficientData
+            }
             // Even without an explicit length field, the resulting end offset must remain
             // within the varint range (RFC 9000 §4.5).
             try Self.validateEndOffsetWithinVarintRange(
@@ -703,7 +738,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    internal func decodeMaxStreamDataFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    internal func decodeMaxStreamDataFrame(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let streamID = try readVarint(from: &reader)
         let maxStreamData = try readVarint(from: &reader)
         return .maxStreamData(MaxStreamDataFrame(
@@ -712,15 +747,20 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    internal func decodeMaxStreamsFrame(from reader: inout ByteReader, isBidi: Bool) throws(FrameCodecError) -> Frame {
+    internal func decodeMaxStreamsFrame(from reader: inout QUICWireReader, isBidi: Bool) throws(FrameCodecError) -> Frame {
         let maxStreams = try readVarint(from: &reader)
+        guard maxStreams <= ProtocolLimits.maxStreams else {
+            throw FrameCodecError.invalidFrameFormat(
+                "MAX_STREAMS value exceeds 2^60: \(maxStreams)"
+            )
+        }
         return .maxStreams(MaxStreamsFrame(
             maxStreams: maxStreams,
             isBidirectional: isBidi
         ))
     }
 
-    internal func decodeStreamDataBlockedFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    internal func decodeStreamDataBlockedFrame(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let streamID = try readVarint(from: &reader)
         let limit = try readVarint(from: &reader)
         return .streamDataBlocked(StreamDataBlockedFrame(
@@ -729,15 +769,57 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    internal func decodeStreamsBlockedFrame(from reader: inout ByteReader, isBidi: Bool) throws(FrameCodecError) -> Frame {
+    internal func decodeStreamsBlockedFrame(from reader: inout QUICWireReader, isBidi: Bool) throws(FrameCodecError) -> Frame {
         let limit = try readVarint(from: &reader)
+        guard limit <= ProtocolLimits.maxStreams else {
+            throw FrameCodecError.invalidFrameFormat(
+                "STREAMS_BLOCKED value exceeds 2^60: \(limit)"
+            )
+        }
         return .streamsBlocked(StreamsBlockedFrame(
             streamLimit: limit,
             isBidirectional: isBidi
         ))
     }
 
-    internal func decodeNewConnectionIDFrame(from reader: inout ByteReader) throws(FrameCodecError) -> Frame {
+    /// Validates the compressed ACK range representation without iterating over
+    /// packet numbers. The peer controls every field, so arithmetic is checked
+    /// before subtraction and malformed ranges are never clamped.
+    private func validateAckRanges(
+        largestAcknowledged: UInt64,
+        ranges: [AckRange]
+    ) throws(FrameCodecError) {
+        guard UInt64(ranges.count) <= ProtocolLimits.maxAckRanges else {
+            throw FrameCodecError.invalidFrameFormat(
+                "ACK range count exceeds \(ProtocolLimits.maxAckRanges)"
+            )
+        }
+        guard let first = ranges.first else { return }
+        guard first.rangeLength <= largestAcknowledged else {
+            throw FrameCodecError.invalidFrameFormat(
+                "ACK first range exceeds largest acknowledged"
+            )
+        }
+
+        var smallestAcknowledged = largestAcknowledged - first.rangeLength
+        for range in ranges.dropFirst() {
+            let (gapWidth, gapOverflow) = range.gap.addingReportingOverflow(2)
+            guard !gapOverflow, smallestAcknowledged >= gapWidth else {
+                throw FrameCodecError.invalidFrameFormat(
+                    "ACK gap underflows the packet number space"
+                )
+            }
+            let nextLargest = smallestAcknowledged - gapWidth
+            guard range.rangeLength <= nextLargest else {
+                throw FrameCodecError.invalidFrameFormat(
+                    "ACK range underflows the packet number space"
+                )
+            }
+            smallestAcknowledged = nextLargest - range.rangeLength
+        }
+    }
+
+    internal func decodeNewConnectionIDFrame(from reader: inout QUICWireReader) throws(FrameCodecError) -> Frame {
         let seqNum = try readVarint(from: &reader)
         let retirePriorTo = try readVarint(from: &reader)
 
@@ -786,7 +868,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         }
     }
 
-    internal func decodeConnectionCloseFrame(from reader: inout ByteReader, isApp: Bool) throws(FrameCodecError) -> Frame {
+    internal func decodeConnectionCloseFrame(from reader: inout QUICWireReader, isApp: Bool) throws(FrameCodecError) -> Frame {
         let errorCode = try readVarint(from: &reader)
 
         var frameType: UInt64? = nil
@@ -822,7 +904,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         ))
     }
 
-    internal func decodeDatagramFrame(from reader: inout ByteReader, hasLength: Bool) throws(FrameCodecError) -> Frame {
+    internal func decodeDatagramFrame(from reader: inout QUICWireReader, hasLength: Bool) throws(FrameCodecError) -> Frame {
         let data: [UInt8]
         if hasLength {
             let length = try readVarint(from: &reader)
@@ -838,7 +920,11 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
             }
             do { data = try reader.readBytes(safeLength) } catch { throw FrameCodecError.insufficientData }
         } else {
-            data = reader.readRemaining()
+            do {
+                data = try reader.readRemaining()
+            } catch {
+                throw FrameCodecError.insufficientData
+            }
         }
 
         return .datagram(DatagramFrame(data: data, hasLength: hasLength))

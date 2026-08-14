@@ -1,706 +1,128 @@
 # swift-quic
 
-A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002), designed for the swift-libp2p networking stack. It is **Embedded-first**: the protocol logic lives in value-type, sans-IO core targets whose byte currency is `[UInt8]` / `Span`, with thin Foundation host adapters over them.
+Pure Swift QUIC transport for Native, WASM, and Embedded Swift. The package
+owns QUIC wire semantics, packet protection composition, recovery, streams,
+connection state, and the driver that binds the sans-I/O engine to injected
+datagram and timer capabilities.
 
-> **Release status.** Current release: `1.4.0`. Live QUIC factories use
-> `swift-tls/QUICTLS` backed by `swift-ssl/SSLQUIC`.
+## Responsibility boundary
 
-## Secure-transport boundary
-
-`swift-quic` owns QUIC
-> CRYPTO offsets and reassembly, transport parameters, packet/header protection,
-> key installation, packet-number spaces, recovery, congestion control, streams,
-> and datagram orchestration. TLS session semantics are consumed through
-> `swift-tls/QUICTLS`, whose canonical mechanism implementation is
-> `swift-ssl`.
-
-```text
-swift-libp2p -> swift-quic -> swift-tls / QUICTLS -> swift-ssl
+```mermaid
+flowchart TD
+    App["application / swift-libp2p"] --> QUIC["swift-quic"]
+    QUIC --> TLS["swift-tls / QUICTLS<br/>TLS session lifecycle"]
+    TLS --> SSL["swift-ssl<br/>crypto, PKI, TLS mechanisms"]
+    QUIC --> Core["swift-networking<br/>bytes, datagram, time, TLSTypes"]
+    Adapter["NetworkingPOSIX or an injected DatagramTransport"] --> Core
 ```
 
-QUIC no longer carries a TLS state machine. QUIC CRYPTO reassembly remains here,
-while handshake semantics are delegated to `swift-tls/QUICTLS`. See the
-[workspace secure-transport architecture](../../SECURE_TRANSPORT_ARCHITECTURE.md).
-
-## Features
-
-- **RFC 9000/9001/9002 Compliant**: Full QUIC transport protocol implementation
-- **TLS 1.3 Integration**: QUIC TLS session semantics from `swift-tls`,
-  backed by the Pure Swift `swift-ssl/SSLQUIC` mechanism and injected certificate
-  policy over DER bytes
-- **Enforced Peer Authentication**: CertificateVerify signature is always verified; a server cannot skip Certificate/CertificateVerify, and Finished is accepted only after authentication completes (no unauthenticated/MITM channel)
-- **0-RTT Support**: Early data transmission with session resumption
-- **Connection Migration**: PATH_CHALLENGE/RESPONSE with address validation
-- **Type-Safe**: Leverages Swift's type system for compile-time safety
-- **Modern Concurrency**: Built with async/await, Sendable types, and structured concurrency
-- **Modular Design**: Clean separation between core types, crypto, and connection handling
-- **High Performance**: Optimized for 1Gbps+ throughput
-  - Loss detection: 26K ops/sec
-  - Multi-range ACK: 4.8K ops/sec
-  - Full ACK cycle: 1.9M pkts/sec
-- **Memory Safe**: Validated encoding/decoding with bounds checking and overflow protection
-- **Graceful Shutdown**: Proper continuation management prevents hangs
-- **Security Hardened**: Integer overflow protection, ACK range validation, race condition prevention, enforced peer authentication, and RFC-mandated frame/transport-parameter validations (see [Security](#security))
-
-## Requirements
-
-- Swift 6.4 development snapshot `2026-07-23` (tools version `6.4`)
-- macOS 26+ / iOS 26+ / tvOS 26+ / watchOS 26+ / visionOS 26+
-
-## Installation
-
-Add swift-quic to your `Package.swift`:
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/1amageek/swift-quic.git", from: "1.4.0")
-]
-```
-
-### Dependencies
-
-swift-quic uses the following libraries:
-
-- [swift-crypto](https://github.com/1amageek/swift-crypto) (`4.5.3+`) - Cryptographic operations for Native, WASM, and Embedded
-- [swift-ssl](https://github.com/1amageek/swift-ssl) (`0.1.1+`) - Pure Swift cryptography and TLS/QUIC mechanism owner
-- `swift-tls` (`1.3.3+`) - sans-I/O Stream/DTLS/QUIC TLS session contracts
-- [swift-log](https://github.com/apple/swift-log) (`1.9.0+`) - Logging
-- [swift-docc-plugin](https://github.com/swiftlang/swift-docc-plugin) (`1.4.3+`) - Documentation
-- swift-p2p-core (`0.3.2+`) - Embedded-clean byte primitives, crypto seam, and the unified `P2PCrypto.DefaultCryptoProvider`
-- swift-nio-udp - UDP transport
-
-## Migrating to 1.4
-
-- Version Negotiation packets are now rejected when their version list is not
-  aligned to 4-byte entries or when they contain the version attempted by the
-  client, as required by RFC 9000 section 6.2.
-- The endpoint validates Version Negotiation against the original Initial
-  destination connection ID and the actual attempted version.
-- `validateAndParseVersionNegotiation(...)` remains as a deprecated forwarding
-  shim. New code should call `offeredVersions(...)`.
-- Facade state uses the same `Synchronization.Mutex` contract on Native, WASM,
-  and Embedded targets.
-
-## Quick Start
-
-### High-Level API (ManagedConnection)
-
-```swift
-import QUIC
-
-// A TLS 1.3 provider must always be configured (no insecure default).
-var config = QUICConfiguration()
-config.tlsProviderFactory = { isClient in
-    try MyTLSProvider(isClient: isClient)
-}
-
-// Server: bind a socket, serve, and accept incoming connections
-let serverSocket = NIOQUICSocket(configuration: .unicast(port: 4433))
-let (server, _) = try await QUICEndpoint.serve(socket: serverSocket, configuration: config)
-
-for await connection in server.incomingConnections {
-    Task {
-        // Handle incoming streams
-        for await stream in connection.incomingStreams {
-            let data = try await stream.read()
-            try await stream.write(data)
-            try await stream.closeWrite()
-        }
-    }
-}
-
-// Client: dial a server (returns once the handshake completes)
-let client = QUICEndpoint(configuration: config)
-let connection = try await client.dial(address: SocketAddress(ipAddress: "127.0.0.1", port: 4433))
-
-// Open a stream
-let stream = try await connection.openStream()
-try await stream.write(requestData)
-try await stream.closeWrite()
-let response = try await stream.read()
-
-// Graceful shutdown
-await connection.close(error: nil)
-try await client.shutdown()
-```
-
-### Frame Encoding/Decoding
-
-```swift
-import QUICCore
-
-let codec = StandardFrameCodec()
-
-// Encode frames
-let frames: [Frame] = [
-    .ping,
-    .ack(AckFrame(largestAcknowledged: 100, ackDelay: 10, ackRanges: [AckRange(gap: 0, rangeLength: 5)])),
-    .stream(StreamFrame(streamID: 4, offset: 0, data: payload, fin: false))
-]
-let encoded = try codec.encodeFrames(frames)
-
-// Decode frames
-let decoded = try codec.decodeFrames(from: encoded)
-```
-
-### Packet Header Parsing
-
-```swift
-import QUICCore
-
-// Parse a (still header-protected) packet header
-let (header, headerLength) = try ProtectedPacketHeader.parse(from: packetData, dcidLength: 8)
-
-switch header {
-case .long(let longHeader):
-    print("Long header: \(longHeader.packetType)")
-    // Retry packets include integrity tag
-    if longHeader.packetType == .retry {
-        print("Retry token: \(longHeader.token?.count ?? 0) bytes")
-        print("Integrity tag: \(longHeader.retryIntegrityTag?.count ?? 0) bytes")
-    }
-case .short(let shortHeader):
-    print("Short header")
-}
-```
-
-### Coalesced Packets
-
-```swift
-import QUICCore
-
-// Build coalesced packet
-var builder = CoalescedPacketBuilder(maxDatagramSize: 1200)
-_ = builder.addPacket(initialPacket)
-_ = builder.addPacket(handshakePacket)
-let datagram = builder.build()
-
-// Parse coalesced packet
-let packets = try CoalescedPacketParser.parse(datagram: datagram, dcidLength: 8)
-```
-
-### Initial Packet Encoding (with automatic padding)
-
-```swift
-import QUICCore
-
-let encoder = PacketEncoder()
-
-// Initial packets are automatically padded to 1200 bytes (RFC 9000 Section 14.1)
-let encoded = try encoder.encodeLongHeaderPacket(
-    frames: frames,
-    header: initialHeader,
-    packetNumber: 0,
-    sealer: sealer
-)
-// encoded.count >= 1200
-```
+`swift-quic` owns CRYPTO offsets and reassembly, transport parameters, packet
+numbers, frames, header and packet protection orchestration, loss recovery,
+congestion control, stream flow control, and connection-ID state. It does not
+own TLS transcripts, certificate policy, UDP sockets, NIO, DNS, or application
+protocol semantics.
 
 ## Products
 
-swift-quic is split into two tiers:
+| Product | Responsibility |
+|---|---|
+| `QUIC` | `QUICClient`, `QUICServerConnection`, and `QUICEngineConnection` over injected `DatagramTransport` and `AsyncTimer` |
+| `QUICWire` | QUIC varints, packets, frames, and strict wire errors |
+| `QUICPacketProtectionCore` | RFC 9001 packet/header protection composition |
+| `QUICRecoveryCore` | RTT, loss detection, pacing, NewReno, and CUBIC state |
+| `QUICStreamCore` | Send/receive stream state, reassembly, and flow control |
+| `QUICConnectionCore` | Transport parameters, path validation, packet parsing, and connection values |
+| `QUICConnectionEngineCore` | Caller-locked, sans-I/O connection state machine |
 
-- **Embedded-clean cores** (dual-build: host + Embedded Swift) — value-type,
-  caller-locked, sans-IO building blocks generic over the crypto seam. No
-  Foundation, no `any` existentials, no `Mutex`/`ContinuousClock`, typed throws.
-  Cipher-suite dispatch is a closed `SuiteProtector<C>` enum, not `any
-  PacketOpener`/`any PacketSealer`.
-- **Host adapters** (Foundation-backed) — hold the cores under a `Mutex`, bridge
-  `Data`/`SymmetricKey`, and add the I/O orchestration. These remain the public
-  high-level API and are unchanged for callers.
+The split is by responsibility, not by platform. Native, WASM, and Embedded
+compile the same engine and synchronization contract.
 
-### Embedded-clean Cores
+## Ownership and I/O
 
-#### QUICWire (Tier-3 wire codec)
-
-Embedded-clean varint + frame + packet-header codec over `Bytes`/`[UInt8]`:
-
-- **Varint**: Variable-length integer encoding (RFC 9000 Section 16)
-- **ConnectionID**: Connection identification with secure random generation
-- **PacketHeader**: Long and Short header parsing with validation
-- **Version**: QUIC version constants, initial salt, retry-integrity key/nonce
-- **Frame** / **FrameCodec** (`StandardFrameCodec`): all 19 QUIC frame types
-- **ProtocolLimits**: RFC-compliant protocol limit constants
-- **SafeConversions**: Overflow-checked integer conversions
-
-#### QUICPacketProtectionCore
-
-Embedded-clean packet protection generic over the crypto provider:
-
-- **PacketProtector<C, A>**: AEAD payload protection + header protection over the `CryptoProvider` / `HeaderProtectionProvider` seam
-- **SuiteProtector<C>**: closed cipher-suite enum (AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305) that replaces the `any PacketOpener`/`any PacketSealer` existentials
-- **QUICKeyDerivation**: RFC 9001 §5.1 key material derivation
-
-#### QUICRecoveryCore
-
-Value-type loss detection + congestion control with time injected as a monotonic `UInt64` nanosecond parameter:
-
-- **LossDetectorCore**: sorted-array packet/time threshold loss detection
-- **RTTEstimatorCore**: RTT smoothing and min-RTT tracking
-- **CubicCore** (RFC 9438) / **NewRenoCore** (RFC 9002 §7): congestion controllers
-- **PacerCore**: token-bucket pacing (RFC 9002 §7.7)
-- **AntiAmplificationCore**: server 3x amplification limit
-
-#### QUICStreamCore
-
-Value-type STREAM state machines over `[UInt8]` payloads (RFC 9000 §2-4):
-
-- **SendStreamCore** / **ReceiveStreamCore**: send/receive FSMs
-- **StreamReassemblyBuffer**: out-of-order reassembly
-- **FlowControllerCore**: connection + stream-level flow control
-
-#### Historical TLS sources (not an active target)
-
-The former in-package TLS 1.3 handshake + key schedule sources are retained only
-for deletion audit. The active QUIC TLS implementation is
-`swift-tls/QUICTLS` over `swift-ssl/SSLQUIC`:
-
-- **TLSKeyScheduleCore**: early/handshake/master secrets, HKDF-Expand-Label, traffic secrets, finished/verify-data (RFC 8446 §7.1)
-- **TLSTranscriptHashCore**: incremental transcript hash
-- **QUICClientHandshake** / **QUICServerHandshake** / **QUICClientAuthMachine**: handshake FSMs
-- Handshake message + extension wire codecs (ClientHello, ServerHello, Certificate, ...)
-
-#### QUICConnectionCore
-
-Pure value-type connection state machines that are neither codec nor crypto:
-
-- **PathMTUSearchCore**: DPLPMTUD search (RFC 8899 / RFC 9000 §14)
-- **TransportParameterCodecCore** + **IPAddressCodec**: transport-params codec (RFC 9000 §18) with a Foundation-free IPv4/IPv6 parser
-- **PacketParsingCore**: packet parse/serialize core driving `SuiteProtector<C>` (RFC 9000 §12/§17, RFC 9001 §5)
-- **ConnectionStateCore** / **IdleTimeoutCore** / **PathValidationCore**: connection lifecycle state machines
-
-#### QUICConnectionEngineCore
-
-The cored connection orchestrator — `QUICConnectionEngine<C, T>`, a value-type,
-caller-locked, sans-IO, clock-free engine that **drives** the other six cores
-(packet-number spaces, recovery + CC + pacing, ACK generation, stream multiplex,
-flow control, idle, path validation). Timers are clock-free: time is injected as
-`nowNanos: UInt64`, and `deadlines(nowNanos:)` / `handleTimeout(nowNanos:)` mirror
-the DTLS engine pattern. I/O is inverted to the facade, which owns the
-`DatagramTransport` + `AsyncTimer`. Crypto/cert are injected via typed-throws
-closures; X.509 stays out of the engine. **Status:** the portable `QUIC` product
-uses this engine through `QUICEngineConnection`; the Native host orchestrator
-retains its existing `QUICEndpoint` / `ManagedConnection` / `TimerManager` spine.
-
-### Host Adapters
-
-### QUIC
-
-High-level Native API for QUIC connections (the WASM / Embedded surface is the
-separate `[UInt8]` engine facade in the same `QUIC` product):
-
-- **QUICEndpoint**: Server and client endpoint management
-- **ManagedConnection**: High-level connection with async stream APIs
-- **ManagedStream**: Stream wrapper implementing QUICStreamProtocol
-- **ConnectionRouter**: DCID-based packet routing with reverse mapping
-- **PacketProcessor**: Unified packet encryption/decryption (over `SuiteProtector<C>`)
-- **TimerManager**: Loss-detection / PTO timer scheduling
-
-### QUICCore
-
-Foundation adapter over `QUICWire` + `QUICConnectionCore`. Restores the historical
-`Data`-based views over the Embedded-clean wire codec:
-
-- **Varint**: Variable-length integer encoding (RFC 9000 Section 16)
-- **ConnectionID**: Connection identification with secure random generation
-- **PacketHeader**: Long and Short header parsing with validation
-- **Frame**: All 19 QUIC frame types
-- **FrameCodec**: Frame encoding/decoding with varint frame type support
-- **PacketCodec**: Packet encoding/decoding with encryption and Initial packet padding
-- **CoalescedPackets**: Multiple packet handling
-
-> The wire codec primitives (`Varint`, `ConnectionID`, `PacketHeader`, `Version`,
-> `Frame`/`FrameCodec`, `ProtocolLimits`, `SafeConversions`) now live in
-> `QUICWire`; `QUICCore` re-exports Foundation-friendly adapters over them.
-
-### QUICCrypto
-
-Packet protection and host-facing adapters (specialised at `C =
-QUICCryptoProvider`, the unified `DefaultCryptoProvider`). TLS handshake state
-is not owned by this target:
-
-- **InitialSecrets**: Initial key derivation (RFC 9001)
-- **KeyMaterial**: Encryption key management
-- **AEAD**: AES-128-GCM and ChaCha20-Poly1305 encryption (over `PacketProtector<C,A>`)
-- **HeaderProtection**: header protection routed through the `HeaderProtectionProvider` seam and the common `DefaultCryptoProvider`
-- **KeyUpdate**: AEAD limit tracking and key rotation (RFC 9001 Section 6)
-- **RetryIntegrityTag**: Retry packet integrity verification (RFC 9001 Section 5.8)
-- **SwiftSSLQUICTLSProvider**: adapter to `swift-tls/QUICTLS` and
-  `swift-ssl/SSLQUIC`
-- **ClientSessionCache**: Client-side session resumption
-
-### QUICRecovery
-
-Loss detection and congestion control (RFC 9002):
-
-- **RTTEstimator**: Smoothed RTT calculation with min RTT tracking
-- **AckManager**: Interval-based ACK frame generation with O(1) sequential packet tracking
-- **LossDetector**: Optimized packet/time threshold loss detection
-  - Sorted array storage for cache-efficient iteration
-  - Binary search for O(log n) range queries
-  - Bounded iteration (only processes relevant packets)
-- **PacketNumberSpaceManager**: Multi-level packet number space coordination
-- **SentPacket**: Sent packet metadata for loss tracking
-- **CongestionController**: Congestion control protocol with pacing support
-- **NewRenoCongestionController**: NewReno implementation with slow start, congestion avoidance, and recovery
-- **AntiAmplificationLimiter**: Server-side 3x amplification limit (RFC 9000 Section 8.1)
-
-### QUICConnection
-
-Connection state management:
-
-- **ConnectionState**: State machine for QUIC connections
-- **QUICConnectionHandler**: Main connection orchestrator
-- **CryptoStreamManager**: CRYPTO frame reassembly
-- **PathValidationManager**: PATH_CHALLENGE/RESPONSE handling
-- **StatelessResetManager**: Stateless reset token generation and validation
-- **IdleTimeoutManager**: Connection idle timeout tracking
-
-### QUICTransport
-
-Transport-level features:
-
-- **ECN**: Explicit Congestion Notification support
-- **Pacing**: Token bucket pacing for burst prevention
-- **UDPSocket**: UDP datagram transmission
-
-### QUICStream
-
-Stream management and flow control (RFC 9000 Section 2-4):
-
-- **DataStream**: Individual stream state machine with send/receive buffers
-- **StreamManager**: Stream multiplexing, creation, and lifecycle management
-- **FlowController**: Connection and stream-level flow control
-- **DataBuffer**: Out-of-order data reassembly with FIN tracking
-- **StreamState**: Send/receive state machines per RFC 9000
-
-## Architecture
-
-The public surface is the host `QUIC` facade; below it sit the Embedded-clean
-cores (see [Products](#products)). The host orchestration layering:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  QUICEndpoint (Server/Client Entry Point)                   │
-├─────────────────────────────────────────────────────────────┤
-│  ManagedConnection (High-Level Connection API)              │
-│  - AsyncStream<QUICStreamProtocol> for incoming streams     │
-│  - Graceful shutdown with continuation cleanup              │
-├─────────────────────────────────────────────────────────────┤
-│  ConnectionRouter (DCID-based Packet Routing)               │
-├─────────────────────────────────────────────────────────────┤
-│  QUICConnectionHandler (Connection State Machine)           │
-├─────────────────────────────────────────────────────────────┤
-│  PacketProcessor (Encryption/Decryption Integration)        │
-├─────────────────────────────────────────────────────────────┤
-│  QUICStream (Stream Multiplexing, Flow Control)             │
-├─────────────────────────────────────────────────────────────┤
-│  Packet Codec (Encoding/Decoding with Encryption)           │
-├─────────────────────────────────────────────────────────────┤
-│  Frame Codec (All 19 QUIC Frame Types)                      │
-├─────────────────────────────────────────────────────────────┤
-│  Coalesced Packets (Multiple packets per UDP datagram)      │
-├─────────────────────────────────────────────────────────────┤
-│  Crypto (AEAD, Header Protection, Key Derivation)           │
-├─────────────────────────────────────────────────────────────┤
-│  Core Types (Varint, ConnectionID, Version, Headers)        │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Receive["DatagramTransport.receive()<br/>OwnedBytes"] -->|"scoped Span"| Engine["QUICConnectionEngine"]
+    Engine --> Output["final Array packet owner"]
+    Output -->|"consuming transfer"| Send["DatagramTransport.send(OwnedBytes)"]
 ```
 
-The cored `QUICConnectionEngine<C, T>` (in `QUICConnectionEngineCore`) is the
-value-type, sans-IO substrate that will replace the per-connection orchestration
-the host layers above perform under `Mutex`; the facade rewire onto it is the
-pending quic Slice B (M11) work.
+- A received payload is borrowed synchronously and no pointer crosses `await`.
+- Final outbound array storage is consumed by `OwnedBytes`; the QUIC driver does
+  not make another payload-sized copy.
+- The engine is a value type. Public drivers protect it with the same
+  `Synchronization.Mutex` contract on every target and perform I/O outside the
+  critical section.
+- Transport cancellation, clean close, backend failure, queue overflow, and
+  timer failure remain distinct typed outcomes.
 
-## Security
+## Dependencies
 
-- Enforced peer authentication: CertificateVerify signature is always verified; a server cannot skip Certificate/CertificateVerify, and Finished is accepted only after authentication (no silent fallback to an unauthenticated channel)
-- Integer overflow protection with saturating arithmetic
-- ACK range underflow validation (prevents malformed ACK processing)
-- ACK range count validation (prevents memory exhaustion attacks)
-- ACK processing is DoS-bounded: loss detection iterates the locally-known sent packets and tests membership against the ACK ranges (`O(sentPackets × ranges)`), never iterating an attacker-controlled range
-- PATH_CHALLENGE/PATH_RESPONSE 8-byte payload enforcement
-- Path-bound, amplification-budgeted PATH_RESPONSE (RFC 9000 Section 8.2.1: a response for an unvalidated path is charged against the 3x anti-amplification budget and sent on the path the challenge arrived on)
-- STREAM/DATAGRAM frame boundary validation
-- STREAM/CRYPTO final-offset bound: `offset + length` must not exceed 2^62-1
-- Flow control violation detection (connection close on violation)
-- RESET_STREAM final size validation against advertised limits and reconciliation with previously received/buffered data (final-size immutability)
-- NEW_CONNECTION_ID `retire_prior_to` bound (`retire_prior_to <= sequence_number`; anti-DoS)
-- `active_connection_id_limit` clamped to a practical maximum to bound state
-- Transport-parameter <-> Connection-ID cross-validation (RFC 9000 Section 7.3): `initial_source_connection_id`, `original_destination_connection_id`, and `retry_source_connection_id` are checked against the connection IDs observed during the handshake (mismatch is a TRANSPORT_PARAMETER_ERROR)
-- DCID length validation (0-20 bytes per RFC 9000 Section 17.2)
-- Double-start prevention in connection handshake
-- Race condition prevention in shutdown paths
-- Graceful shutdown prevents continuation leaks and resource exhaustion
+- `swift-networking`: `NetworkingCore`, `NetworkingDatagram`,
+  `NetworkingTime`, and `TLSTypes`
+- `swift-tls`: `QUICTLS` session orchestration
+- `swift-ssl`: Pure Swift TLS/PKI/cryptographic mechanisms
 
-## RFC Compliance
+There is no dependency on `swift-p2p-core`, `swift-p2p-transport`, BoringSSL,
+or SwiftNIO. Applications choose a datagram adapter separately.
 
-### Implemented
+## Installation
 
-- **RFC 9000 Section 2**: Stream types (bidirectional, unidirectional) with proper ID assignment
-- **RFC 9000 Section 3**: Stream state machines (send/receive states)
-- **RFC 9000 Section 3.5**: STOP_SENDING triggers RESET_STREAM generation
-- **RFC 9000 Section 4**: Flow control (connection and stream level)
-- **RFC 9000 Section 4.5**: Stream Final Size validation
-  - Final size immutability enforcement
-  - RESET_STREAM final size vs flow control limit validation
-  - Out-of-order FIN validation against buffered data
-- **RFC 9000 Section 7.3**: Transport-parameter <-> Connection-ID cross-validation
-  - `initial_source_connection_id`, `original_destination_connection_id`, and `retry_source_connection_id` checked against connection IDs observed during the handshake (mismatch is TRANSPORT_PARAMETER_ERROR)
-- **RFC 9000 Section 8.1**: Anti-Amplification Limit
-  - Server-side 3x amplification limit before address validation
-  - Overflow-safe byte tracking with saturating arithmetic
-- **RFC 9000 Section 8.2.1**: Path-bound, amplification-budgeted PATH_RESPONSE
-  - A PATH_RESPONSE for an unvalidated path is charged against the anti-amplification budget and sent on the path the challenge arrived on
-- **RFC 9000 Section 12.4**: Varint-encoded frame types (supports extended frame types)
-- **RFC 9000 Section 14.1**: Initial packet minimum size (1200 bytes) with automatic padding
-- **RFC 9000 Section 17**: Long and Short header formats with validation
-- **RFC 9000 Section 19**: All 19 frame types with proper encoding/decoding
-- **RFC 9001 Section 4**: 0-RTT early data with replay protection
-- **RFC 9001 Section 5.2**: Initial keys with AES-128-GCM-SHA256
-- **RFC 9001 Section 5.4**: Header protection with 4-byte packet number handling
-- **RFC 9001 Section 5.8**: Retry packet integrity tag verification
-- **RFC 9001 Section 6**: 1-RTT Key Update wired into the live connection
-  - Usage-limit-driven initiation (AEAD confidentiality/integrity limits per cipher suite)
-  - Cipher-suite-correct key derivation and key-phase opener selection on receive
-  - Known limitation: continuous multi-generation rotation (ACK-driven re-enable of subsequent updates) is not yet live; only the first rotation occurs automatically
-- **RFC 9218**: Extensible priority scheme (urgency 0-7, incremental flag)
-  - Priority-based stream scheduling
-  - Fair queuing within same priority level (round-robin)
-  - Mutable stream priorities
-- **RFC 9002 Section 6**: Loss Detection
-  - Packet and time threshold based detection
-  - PTO (Probe Timeout) calculation
-- **RFC 9002 Section 7**: Congestion Control
-  - NewReno congestion controller with slow start, congestion avoidance, recovery
-  - Pacing support for burst prevention
-  - Persistent congestion detection
-  - ECN congestion event handling
-- **RFC 9221**: Unreliable DATAGRAM extension (frame types 0x30 / 0x31, with and without an explicit length field)
-- **RFC 9369**: QUIC Version 2 (version `0x6b3343cf`, with the v2-specific Initial salt and Retry integrity key/nonce)
+```swift
+dependencies: [
+    .package(url: "https://github.com/1amageek/swift-quic.git", from: "2.0.0"),
+]
+```
 
-The cryptographic constants are verified against the specifications: the v1/v2
-Initial salts, the HKDF-Expand-Label `"tls13 "` prefix and QUIC labels
-(`"client in"` / `"server in"` / `"quic key"` / `"quic iv"` / `"quic hp"` /
-`"quic ku"`), the AES-128-GCM key/IV/tag sizes (16/12/16 bytes), the header-protection
-sample offset (`pn_offset + 4`, 16 bytes) and first-byte masks (0x0F long / 0x1F
-short), the nonce construction (IV XOR left-padded PN), and the v1/v2 Retry
-integrity key+nonce.
+## Verification
 
-### Compliance summary
-
-| RFC | Title | Status |
-|-----|-------|--------|
-| RFC 9000 | QUIC: A UDP-Based Multiplexed and Secure Transport | Compliant |
-| RFC 9001 | Using TLS to Secure QUIC | Compliant |
-| RFC 9002 | QUIC Loss Detection and Congestion Control | Compliant |
-| RFC 9221 | Unreliable DATAGRAM Extension | Compliant |
-| RFC 9369 | QUIC Version 2 | Compliant |
-
-## Performance
-
-Benchmarks measured on 2026-08-07 on Apple Silicon
-(`arm64-apple-macosx`) with the pinned Swift 6.4 development snapshot:
-
-### Packet Processing
-
-| Operation | Performance |
-|-----------|-------------|
-| Short header parsing | 1.54M ops/sec |
-| Long header parsing | 746K ops/sec |
-| DCID extraction (short) | 1.05M ops/sec |
-| DCID extraction (long) | 1.11M ops/sec |
-| ConnectionRouter lookup | 527K ops/sec |
-| Packet type extraction | 9.55M ops/sec |
-
-### Core Operations
-
-| Operation | Performance |
-|-----------|-------------|
-| Varint encoding | 6.59M ops/sec |
-| Varint decoding | 8.73M ops/sec |
-| Varint fast path (1-byte) | 13.15M ops/sec |
-| ConnectionID creation | 1.06M ops/sec |
-| ConnectionID equality | 10.41M ops/sec |
-| ConnectionID hash | 16.10M ops/sec |
-| ConnectionID random | 1.04M ops/sec |
-| CID Dictionary lookup | 8.41M ops/sec |
-
-### Frame Operations
-
-| Operation | Performance |
-|-----------|-------------|
-| PING frame encoding | 11.46M ops/sec |
-| PING frame decoding | 4.73M ops/sec |
-| ACK frame encoding | 3.54M ops/sec |
-| ACK frame decoding | 2.26M ops/sec |
-| STREAM frame encoding | 2.98M ops/sec |
-| Frame roundtrip | 1.09M ops/sec |
-
-### Crypto Operations
-
-| Operation | Performance |
-|-----------|-------------|
-| Initial key derivation | 17.6K ops/sec |
-| KeyMaterial derivation | 56.2K ops/sec |
-| AES-GCM Sealer creation | 1.38M ops/sec |
-
-### Packet Operations
-
-| Operation | Performance |
-|-----------|-------------|
-| Packet number encoding | 5.10M ops/sec |
-| Packet number decoding | 16.16M ops/sec |
-| Coalesced packet building | 2.04M ops/sec |
-| Coalesced packet parsing | 981K ops/sec |
-
-Run benchmarks:
+Normal correctness tests are separate from opt-in benchmarks:
 
 ```bash
-SWIFT_QUIC_ENABLE_BENCHMARKS=1 xcodebuild test \
+scripts/swift-test-timeout.sh 120 env \
+  TOOLCHAINS=org.swift.64202607231a \
+  xcodebuild test \
   -scheme swift-quic-Package \
   -destination 'platform=macOS' \
-  -only-testing:QUICBenchmarks \
-  -maximum-test-execution-time-allowance 60
+  -parallel-testing-enabled NO \
+  "LD_RUNPATH_SEARCH_PATHS=\$(inherited) $HOME/Library/Developer/Toolchains/swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a.xctoolchain/usr/lib/swift/macosx/testing"
+
+SWIFT_QUIC_ENABLE_BENCHMARKS=1 \
+TOOLCHAINS=org.swift.64202607231a \
+swift run -c release -debug-info-format none quic-benchmarks
 ```
 
-## Testing
-
-Run all tests:
+Portable builds use the pinned matching Swift 6.4 snapshot and SDK:
 
 ```bash
-xcodebuild test \
-  -scheme swift-quic-Package \
-  -destination 'platform=macOS' \
-  -maximum-test-execution-time-allowance 60
+SWIFT_NETWORKING_WASM=1 SWIFT_QUIC_ENABLE_WASM_VALIDATION=1 \
+swift run --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm \
+  -c release quic-wasm-validation
+
+SWIFT_NETWORKING_EMBEDDED=1 SWIFT_QUIC_ENABLE_WASM_VALIDATION=1 \
+swift run --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm-embedded \
+  -c release quic-wasm-validation
 ```
 
-### Interoperability Testing
+The benchmark and WASM validation executables are opt-in and are not part of
+the normal product or test graph.
 
-The repository contains Docker fixtures for Quinn and ngtcp2, but no executable
-Swift interoperability test currently drives them. External interoperability is
-therefore not claimed by this release.
+Release verification on 2026-08-14 passed 102 native tests, the same 102 tests
+under Address Sanitizer, and the standard and Embedded WASM validation
+executables through compile, link, and runtime.
 
-| Implementation | Language | Fixture | Executed gate |
-|----------------|----------|---:|---:|
-| Quinn | Rust | Available | Not implemented |
-| ngtcp2 | C | Available | Not implemented |
+### Current benchmark
 
-Start the fixtures for development with:
+Measured on 2026-08-14 with an Apple M4 Max (14 cores), Swift
+`ef761e567dc94ee`, and the Release configuration. The table reports the median
+of five consecutive executions of the same built executable.
 
-```bash
-cd docker && docker compose up -d
-```
+| Byte path | Median throughput |
+|---|---:|
+| QUIC varint encode/decode round-trip | 15.55 M operations/s |
+| STREAM frame 1,200-byte encode/decode round-trip | 3.48 M operations/s |
+| Borrowed coalesced datagram split, 1,200 bytes | 17.56 M operations/s |
+| AES-128-GCM seal/open round-trip, 1,200 bytes | 0.69 M operations/s |
+| Connection ID dictionary lookup | 20.16 M operations/s |
 
-### Unit Tests
-
-Coverage includes:
-- Frame encoding/decoding for all 19 frame types
-- Packet encoding/decoding with header protection
-- Coalesced packet building and parsing
-- Varint encoding/decoding
-- ConnectionID operations
-- Header validation
-- Loss detection and recovery (AckManager, LossDetector)
-- Stream management (DataStream, StreamManager, FlowController)
-- Flow control (connection and stream level)
-- Out-of-order data reassembly (DataBuffer)
-- Priority scheduling (StreamPriority, StreamScheduler)
-- RFC 9000 Section 4.5 compliance (Stream Final Size)
-- RFC 9001 test vectors (Initial secrets, key derivation)
-- TLS 1.3 handshake flow (client/server, HelloRetryRequest)
-- 0-RTT early data handling
-- Key Update state transitions and AEAD limits
-- Version Negotiation and Retry packet processing
-- Anti-amplification limit enforcement
-- ManagedConnection shutdown safety (continuation management)
-- AsyncStream lifecycle and graceful termination
-- Safe integer conversion (overflow/underflow protection)
-
-Run specific test suites:
-
-```bash
-xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
-  -only-testing:QUICCoreTests -maximum-test-execution-time-allowance 60
-xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
-  -only-testing:QUICCryptoTests -maximum-test-execution-time-allowance 60
-xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
-  -only-testing:QUICRecoveryTests -maximum-test-execution-time-allowance 60
-xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
-  -only-testing:QUICStreamTests -maximum-test-execution-time-allowance 60
-xcodebuild test -scheme swift-quic-Package -destination 'platform=macOS' \
-  -only-testing:QUICTests -maximum-test-execution-time-allowance 60
-```
-
-## Roadmap
-
-- [x] Phase 1: Packet Processing Pipeline
-  - [x] Frame Codec (all 19 frame types)
-  - [x] Packet Codec (Long/Short headers with encryption)
-  - [x] Coalesced Packets
-  - [x] Initial packet padding (1200 bytes minimum)
-  - [x] Retry packet integrity tag parsing
-- [x] Phase 2: Connection Handler (RFC 9002)
-  - [x] QUICConnectionHandler orchestrator
-  - [x] AckManager with interval-based tracking
-  - [x] LossDetector with packet/time threshold
-  - [x] RTTEstimator with smoothed RTT
-  - [x] PacketNumberSpaceManager
-- [x] Phase 3: TLS 1.3 Integration (RFC 9001)
-  - [x] TLS13Provider protocol
-  - [x] MockTLSProvider for testing
-  - [x] CryptoStreamManager for CRYPTO frame handling
-  - [x] TransportParameters encoding/decoding
-  - [x] KeySchedule with key update support
-  - [x] KeyPhaseManager for 1-RTT key rotation
-- [x] Phase 4: Stream Management (RFC 9000 Section 2-4)
-  - [x] DataStream with send/receive state machines
-  - [x] StreamManager for multiplexing and lifecycle
-  - [x] FlowController (connection and stream level)
-  - [x] DataBuffer for out-of-order reassembly
-  - [x] STOP_SENDING/RESET_STREAM handling
-  - [x] Priority scheduling (RFC 9218)
-- [x] Phase 5: Version Negotiation & Retry
-  - [x] VersionNegotiator for VN packet handling
-  - [x] RetryIntegrityTag verification (RFC 9001 Section 5.8)
-  - [x] AntiAmplificationLimiter (RFC 9000 Section 8.1)
-- [x] Phase 6: Connection Migration
-  - [x] PathValidationManager (PATH_CHALLENGE/RESPONSE)
-  - [x] StatelessResetManager
-  - [x] IdleTimeoutManager
-- [x] Phase 7: 0-RTT & Session Resumption
-  - [x] ClientSessionCache for session tickets
-  - [x] startWith0RTT() API
-- [x] Phase 8: Quality Improvements
-  - [x] ECN support for congestion signaling
-  - [x] Pacing for send rate control
-  - [x] 1-RTT Key Update wired into the live connection (usage-limit-driven, cipher-suite-correct)
-    - Known limitation: continuous multi-generation rotation (ACK-driven re-enable) is not yet live; only the first rotation is automatic
-  - [x] ChaCha20-Poly1305 support
-- [x] Phase 9: Security Hardening
-  - [x] Integer overflow protection (saturating arithmetic)
-  - [x] ACK range underflow validation
-  - [x] Race condition prevention in shutdown
-  - [x] Double-start vulnerability fix
-- [ ] Phase 10: Interoperability Testing
-  - [ ] Quinn (Rust) interop tests
-  - [ ] ngtcp2 (C) interop tests
-  - [x] Docker-based test environment
-
-## References
-
-- [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html) - QUIC: A UDP-Based Multiplexed and Secure Transport
-- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html) - Using TLS to Secure QUIC
-- [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html) - QUIC Loss Detection and Congestion Control
-- [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218.html) - Extensible Prioritization Scheme for HTTP
-- [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html) - An Unreliable Datagram Extension to QUIC
-- [RFC 9369](https://www.rfc-editor.org/rfc/rfc9369.html) - QUIC Version 2
-- [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html) - The Transport Layer Security (TLS) Protocol Version 1.3
-
-## License
-
-MIT License
-
-## Contributing
-
-Contributions are welcome! Please read the contributing guidelines before submitting a pull request.
+These measurements are regression baselines for the current Swift byte paths;
+they are not cross-library comparisons.

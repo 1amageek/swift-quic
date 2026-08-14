@@ -5,11 +5,10 @@
 /// - Short Header: Used after handshake completion (1-RTT)
 ///
 /// Embedded-clean: no Foundation, no `any`. Token / retry-integrity bytes are
-/// `[UInt8]`; reading flows through `P2PCoreBytes` `ByteReader`; all failures are
-/// typed (``QUICWireError``). The Foundation adapter restores the historical
-/// `Data`-based `parse(from: Data)` / `token: Data?` surface.
+/// `[UInt8]`; reading flows through borrowed `QUICWireReader`; all failures are
+/// typed (``QUICWireError``).
 
-import P2PCoreBytes
+import NetworkingCore
 
 // MARK: - Packet Type
 
@@ -59,6 +58,14 @@ public enum EncryptionLevel: Int, Sendable, Hashable, CaseIterable {
     case zeroRTT = 1
     case handshake = 2
     case application = 3
+}
+
+/// Typed failures for locally constructed packet headers.
+public enum PacketHeaderConstructionError: Error, Sendable, Equatable {
+    case invalidLongHeaderPacketType(PacketType)
+    case unsupportedVersion(UInt32)
+    case invalidPacketNumberLength(Int)
+    case invalidRetryIntegrityTagLength(Int)
 }
 
 // MARK: - Packet Header
@@ -128,12 +135,17 @@ public struct LongHeader: Sendable, Hashable {
             return .versionNegotiation
         }
         let typeValue = (firstByte >> 4) & 0x03
-        switch typeValue {
-        case 0x00: return .initial
-        case 0x01: return .zeroRTT
-        case 0x02: return .handshake
-        case 0x03: return .retry
-        default: fatalError("Invalid long header type")
+        switch version.longPacketType(forTypeBits: typeValue) {
+        case .initial: return .initial
+        case .zeroRTT: return .zeroRTT
+        case .handshake: return .handshake
+        case .retry: return .retry
+        case .versionNegotiation: return .versionNegotiation
+        case nil:
+            // LongHeader instances are constructed only for supported versions;
+            // unknown versions are parsed as protected headers and rejected by
+            // the connection engine before reaching this value type.
+            return .versionNegotiation
         }
     }
 
@@ -148,7 +160,18 @@ public struct LongHeader: Sendable, Hashable {
         length: UInt64? = nil,
         packetNumber: UInt64 = 0,
         packetNumberLength: Int = 4
-    ) {
+    ) throws(PacketHeaderConstructionError) {
+        if packetType == .oneRTT {
+            throw .invalidLongHeaderPacketType(packetType)
+        }
+        if packetType == .initial || packetType == .zeroRTT || packetType == .handshake {
+            guard (1...4).contains(packetNumberLength) else {
+                throw .invalidPacketNumberLength(packetNumberLength)
+            }
+        }
+        if let retryIntegrityTag, retryIntegrityTag.count != 16 {
+            throw .invalidRetryIntegrityTagLength(retryIntegrityTag.count)
+        }
         // Build first byte based on packet type
         // RFC 9000 Section 17.2: Long Header format
         var byte: UInt8
@@ -157,19 +180,31 @@ public struct LongHeader: Sendable, Hashable {
         switch packetType {
         case .initial:
             // Form (1) | Fixed (1) | Type 00 | Reserved (2) | PN Length (2)
-            byte = 0xC0 | (0x00 << 4) | UInt8(packetNumberLength - 1) & 0x03
+            guard let bits = version.typeBits(for: .initial) else {
+                throw .unsupportedVersion(version.rawValue)
+            }
+            byte = 0xC0 | (bits << 4) | UInt8(packetNumberLength - 1) & 0x03
 
         case .zeroRTT:
             // Form (1) | Fixed (1) | Type 01 | Reserved (2) | PN Length (2)
-            byte = 0xC0 | (0x01 << 4) | UInt8(packetNumberLength - 1) & 0x03
+            guard let bits = version.typeBits(for: .zeroRTT) else {
+                throw .unsupportedVersion(version.rawValue)
+            }
+            byte = 0xC0 | (bits << 4) | UInt8(packetNumberLength - 1) & 0x03
 
         case .handshake:
             // Form (1) | Fixed (1) | Type 02 | Reserved (2) | PN Length (2)
-            byte = 0xC0 | (0x02 << 4) | UInt8(packetNumberLength - 1) & 0x03
+            guard let bits = version.typeBits(for: .handshake) else {
+                throw .unsupportedVersion(version.rawValue)
+            }
+            byte = 0xC0 | (bits << 4) | UInt8(packetNumberLength - 1) & 0x03
 
         case .retry:
             // RFC 9000 Section 17.2.5: Retry packets have no packet number
-            byte = 0xC0 | (0x03 << 4)
+            guard let bits = version.typeBits(for: .retry) else {
+                throw .unsupportedVersion(version.rawValue)
+            }
+            byte = 0xC0 | (bits << 4)
             effectivePNLength = 0
 
         case .versionNegotiation:
@@ -178,7 +213,7 @@ public struct LongHeader: Sendable, Hashable {
             effectivePNLength = 0
 
         case .oneRTT:
-            fatalError("Cannot create long header for 1-RTT packet")
+            throw .invalidLongHeaderPacketType(packetType)
         }
 
         self.firstByte = byte
@@ -190,6 +225,28 @@ public struct LongHeader: Sendable, Hashable {
         self.length = length
         self.packetNumber = packetNumber
         self.packetNumberLength = effectivePNLength
+    }
+
+    package init(
+        parsedFirstByte: UInt8,
+        version: QUICVersion,
+        destinationConnectionID: ConnectionID,
+        sourceConnectionID: ConnectionID,
+        token: [UInt8]?,
+        retryIntegrityTag: [UInt8]?,
+        length: UInt64?,
+        packetNumber: UInt64,
+        packetNumberLength: Int
+    ) {
+        self.firstByte = parsedFirstByte
+        self.version = version
+        self.destinationConnectionID = destinationConnectionID
+        self.sourceConnectionID = sourceConnectionID
+        self.token = token
+        self.retryIntegrityTag = retryIntegrityTag
+        self.length = length
+        self.packetNumber = packetNumber
+        self.packetNumberLength = packetNumberLength
     }
 
     /// Whether this packet type has a packet number
@@ -238,7 +295,10 @@ public struct ShortHeader: Sendable, Hashable {
         packetNumberLength: Int = 4,
         spinBit: Bool = false,
         keyPhase: Bool = false
-    ) {
+    ) throws(PacketHeaderConstructionError) {
+        guard (1...4).contains(packetNumberLength) else {
+            throw .invalidPacketNumberLength(packetNumberLength)
+        }
         // Build first byte: 0 | 1 | S | RR | K | PP
         var byte: UInt8 = 0x40  // Header form = 0, Fixed bit = 1
 
@@ -302,7 +362,7 @@ public struct ProtectedLongHeader: Sendable, Hashable {
             return .versionNegotiation
         }
         let typeValue = (protectedFirstByte >> 4) & 0x03
-        return LongPacketType(rawValue: typeValue) ?? .initial
+        return version.longPacketType(forTypeBits: typeValue) ?? .versionNegotiation
     }
 
     /// Whether this packet type has a packet number
@@ -326,8 +386,8 @@ public struct ProtectedLongHeader: Sendable, Hashable {
     /// This method only extracts header fields without validation of protected bits.
     /// - Parameter bytes: The packet bytes
     /// - Returns: The parsed protected header and the number of bytes consumed
-    public static func parse(from bytes: [UInt8]) throws(ParseError) -> (ProtectedLongHeader, Int) {
-        var reader = ByteReader(bytes)
+    public static func parse(from bytes: Span<UInt8>) throws(ParseError) -> (ProtectedLongHeader, Int) {
+        var reader = QUICWireReader(bytes)
         let startPosition = reader.position
 
         let firstByte: UInt8
@@ -382,10 +442,12 @@ public struct ProtectedLongHeader: Sendable, Hashable {
             return (header, reader.position - startPosition)
         }
 
-        let packetType = (firstByte >> 4) & 0x03
+        guard let packetType = version.longPacketType(forTypeBits: (firstByte >> 4) & 0x03) else {
+            throw ParseError.invalidHeader
+        }
 
         switch packetType {
-        case 0x00:  // Initial
+        case .initial:
             // Read token length and token
             let tokenLengthValue: UInt64
             do { tokenLengthValue = try reader.readVarint() } catch { throw ParseError.insufficientData }
@@ -405,13 +467,13 @@ public struct ProtectedLongHeader: Sendable, Hashable {
             // Read Length field
             do { length = try reader.readVarint() } catch { throw ParseError.insufficientData }
 
-        case 0x01:  // 0-RTT
+        case .zeroRTT:
             do { length = try reader.readVarint() } catch { throw ParseError.insufficientData }
 
-        case 0x02:  // Handshake
+        case .handshake:
             do { length = try reader.readVarint() } catch { throw ParseError.insufficientData }
 
-        case 0x03:  // Retry
+        case .retry:
             // RFC 9001 Section 5.8: Retry Token + 16-byte Retry Integrity Tag
             let remainingCount = reader.remaining
             if remainingCount >= ProtocolLimits.retryIntegrityTagLength {
@@ -426,8 +488,8 @@ public struct ProtectedLongHeader: Sendable, Hashable {
                 }
             }
 
-        default:
-            break
+        case .versionNegotiation:
+            throw ParseError.invalidHeader
         }
 
         let header = ProtectedLongHeader(
@@ -443,24 +505,18 @@ public struct ProtectedLongHeader: Sendable, Hashable {
         return (header, reader.position - startPosition)
     }
 
+    public static func parse(from bytes: borrowing [UInt8]) throws(ParseError) -> (ProtectedLongHeader, Int) {
+        try parse(from: bytes.span)
+    }
+
     /// Creates a validated LongHeader after header protection removal
     public func unprotect(
         unprotectedFirstByte: UInt8,
         packetNumber: UInt64,
         packetNumberLength: Int
     ) throws(HeaderValidationError) -> LongHeader {
-        // Determine packet type from protected bits (bits 5-4 are not protected)
-        let actualPacketType: PacketType
-        switch packetType {
-        case .initial: actualPacketType = .initial
-        case .zeroRTT: actualPacketType = .zeroRTT
-        case .handshake: actualPacketType = .handshake
-        case .retry: actualPacketType = .retry
-        case .versionNegotiation: actualPacketType = .versionNegotiation
-        }
-
-        var header = LongHeader(
-            packetType: actualPacketType,
+        let header = LongHeader(
+            parsedFirstByte: unprotectedFirstByte,
             version: version,
             destinationConnectionID: destinationConnectionID,
             sourceConnectionID: sourceConnectionID,
@@ -470,7 +526,6 @@ public struct ProtectedLongHeader: Sendable, Hashable {
             packetNumber: packetNumber,
             packetNumberLength: packetNumberLength
         )
-        header.firstByte = unprotectedFirstByte
 
         // Validate after header protection removal. QUIC reserved bits must be zero.
         try header.validate(strict: true)
@@ -519,8 +574,8 @@ public struct ProtectedShortHeader: Sendable, Hashable {
     }
 
     /// Parses a protected short header from a byte array.
-    public static func parse(from bytes: [UInt8], dcidLength: Int) throws(ParseError) -> (ProtectedShortHeader, Int) {
-        var reader = ByteReader(bytes)
+    public static func parse(from bytes: Span<UInt8>, dcidLength: Int) throws(ParseError) -> (ProtectedShortHeader, Int) {
+        var reader = QUICWireReader(bytes)
 
         let firstByte: UInt8
         do {
@@ -549,6 +604,13 @@ public struct ProtectedShortHeader: Sendable, Hashable {
 
         // Header length = 1 (first byte) + dcidLength
         return (header, 1 + dcidLength)
+    }
+
+    public static func parse(
+        from bytes: borrowing [UInt8],
+        dcidLength: Int
+    ) throws(ParseError) -> (ProtectedShortHeader, Int) {
+        try parse(from: bytes.span, dcidLength: dcidLength)
     }
 
     /// Creates a validated ShortHeader after header protection removal
@@ -586,7 +648,7 @@ public enum ProtectedPacketHeader: Sendable, Hashable {
     }
 
     /// Parses a protected packet header from a byte array.
-    public static func parse(from bytes: [UInt8], dcidLength: Int = 0) throws(ParseError) -> (ProtectedPacketHeader, Int) {
+    public static func parse(from bytes: Span<UInt8>, dcidLength: Int = 0) throws(ParseError) -> (ProtectedPacketHeader, Int) {
         guard !bytes.isEmpty else {
             throw ParseError.insufficientData
         }
@@ -613,6 +675,13 @@ public enum ProtectedPacketHeader: Sendable, Hashable {
                 throw ParseError.invalidHeader
             }
         }
+    }
+
+    public static func parse(
+        from bytes: borrowing [UInt8],
+        dcidLength: Int = 0
+    ) throws(ParseError) -> (ProtectedPacketHeader, Int) {
+        try parse(from: bytes.span, dcidLength: dcidLength)
     }
 
     /// The encryption level for this packet

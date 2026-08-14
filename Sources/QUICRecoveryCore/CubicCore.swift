@@ -1,19 +1,13 @@
 /// Embedded-clean CUBIC congestion controller (RFC 9438) as a value type.
 ///
-/// This is the byte-identical math of the host `CubicCongestionController`,
-/// expressed as a `struct` with `mutating` methods. Time is injected as a monotonic
-/// `UInt64` nanosecond value; the controller never reads a clock. Elapsed seconds
-/// for the cubic curve are derived as `Double(nowNanos - epochNanos) / 1e9`, which
-/// equals the host's `Duration.components` decomposition because the adapter
-/// converts each `ContinuousClock.Instant` to epoch-relative nanoseconds identically.
-///
-/// The host adapter holds a `Mutex<CubicCore>`, reads its `ContinuousClock`, converts
-/// to nanoseconds, and calls these methods under the lock — observable behavior is
-/// unchanged.
+/// The controller is a `struct` with `mutating` methods. Time is injected as a
+/// monotonic `UInt64` nanosecond value; the controller never reads a clock.
+/// Elapsed seconds for the cubic curve are derived as
+/// `Double(nowNanos - epochNanos) / 1e9`.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`. The
 /// cube root needed for `K` (RFC 9438 §4.2) routes through the libm `cbrt` symbol
-/// where available (byte-identical to the original implementation) and a portable
+/// where available and a portable
 /// Halley fallback on WASI/Embedded targets where libm `cbrt` is not in scope.
 #if !hasFeature(Embedded)
 #if canImport(Glibc)
@@ -237,8 +231,7 @@ public struct CubicCore: Sendable {
 
     /// Cube root of a non-negative value.
     ///
-    /// On Darwin and Glibc this is the libm `cbrt` symbol, byte-identical to the
-    /// original `CubicCongestionController`. WASI and Embedded Swift use the
+    /// On Darwin and Glibc this is the libm `cbrt` symbol. WASI and Embedded Swift use the
     /// portable Halley implementation because libm `cbrt` is not in scope there.
     @inline(__always)
     static func cubeRoot(_ x: Double) -> Double {
@@ -332,7 +325,7 @@ public struct CubicCore: Sendable {
 
         // Elapsed time since the epoch start, in seconds. The decomposition into
         // (seconds, sub-second) mirrors the host's `Duration.components` arithmetic
-        // exactly so the cubic curve is byte-identical.
+        // exactly so the curve uses the same units on every target.
         let epoch = epochStartNanos ?? nowNanos
         let elapsedNanos = nowNanos >= epoch ? nowNanos - epoch : 0
         let t = Self.nanosToSeconds(elapsedNanos)

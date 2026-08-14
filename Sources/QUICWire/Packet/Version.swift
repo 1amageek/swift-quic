@@ -2,11 +2,10 @@
 ///
 /// QUIC versions are identified by a 32-bit unsigned number.
 ///
-/// Embedded-clean: no Foundation, no `any`. The salt / retry-integrity
-/// constants are exposed as `[UInt8]` (the Foundation adapter restores the
-/// historical `Data?` views).
+/// Embedded-clean: no Foundation, no `any`. Salt and retry-integrity constants
+/// are exposed as `[UInt8]`.
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// A QUIC protocol version
 public struct QUICVersion: RawRepresentable, Hashable, Sendable {
@@ -112,13 +111,13 @@ public struct QUICVersion: RawRepresentable, Hashable, Sendable {
 
 extension QUICVersion {
     /// Encodes the version as 4 bytes (big-endian).
-    public func encode(to writer: inout ByteWriter) {
+    public func encode(to writer: inout QUICWireWriter) {
         writer.writeUInt32(rawValue)
     }
 
     /// Decodes a version from 4 bytes, advancing the reader. Returns `nil` on
     /// insufficient data (matching the historical optional API).
-    public static func decode(from reader: inout ByteReader) -> QUICVersion? {
+    public static func decode(from reader: inout QUICWireReader) -> QUICVersion? {
         do {
             let value = try reader.readUInt32()
             return QUICVersion(rawValue: value)
@@ -170,5 +169,43 @@ extension QUICVersion {
     /// Checks if a version is in the supported list
     public static func isVersionSupported(_ version: QUICVersion) -> Bool {
         supportedVersions.contains(version)
+    }
+
+    /// Decodes the two long-header packet-type bits for this QUIC version.
+    /// QUIC v2 deliberately changes this mapping from QUIC v1 (RFC 9369 §3.2).
+    public func longPacketType(forTypeBits bits: UInt8) -> LongPacketType? {
+        guard bits <= 0x03 else { return nil }
+        switch self {
+        case .v1:
+            return LongPacketType(rawValue: bits)
+        case .v2:
+            switch bits {
+            case 0x00: return .retry
+            case 0x01: return .initial
+            case 0x02: return .zeroRTT
+            case 0x03: return .handshake
+            default: return nil
+            }
+        default:
+            return nil
+        }
+    }
+
+    /// Encodes a long-header packet type using this QUIC version's mapping.
+    public func typeBits(for packetType: LongPacketType) -> UInt8? {
+        switch self {
+        case .v1:
+            return packetType == .versionNegotiation ? nil : packetType.rawValue
+        case .v2:
+            switch packetType {
+            case .retry: return 0x00
+            case .initial: return 0x01
+            case .zeroRTT: return 0x02
+            case .handshake: return 0x03
+            case .versionNegotiation: return nil
+            }
+        default:
+            return nil
+        }
     }
 }

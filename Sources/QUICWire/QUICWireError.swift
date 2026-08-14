@@ -1,14 +1,14 @@
 /// Unified typed error for the QUIC wire codec.
 ///
 /// Embedded Swift requires typed throws end-to-end (no `any Error`). The wire
-/// codec's primitives (`ByteReader`/`ByteWriter`) throw ``ByteError``; the codec
+/// codec's borrowed reader reports ``ByteError``; the codec
 /// itself raises domain-specific failures (malformed varints, frames, headers,
 /// out-of-range lengths). ``QUICWireError`` is the single closed enum that wraps
 /// all of them so every codec entry point can declare `throws(QUICWireError)`
 /// and callers get an exhaustive `catch`. There is no `try?` and no silent
 /// fallback: every failure is a distinct typed case.
 
-import P2PCoreBytes
+import NetworkingCore
 
 public enum QUICWireError: Error, Equatable, Sendable {
     /// A lower-level byte read/write failed (insufficient bytes, overflow, ...).

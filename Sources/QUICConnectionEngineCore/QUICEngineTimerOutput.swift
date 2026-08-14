@@ -25,6 +25,8 @@ public enum QUICTimerKind: Sendable, Equatable, CaseIterable {
     case pathValidation
     /// Pacing release (RFC 9002 §7.7): the pacer's next send instant.
     case pacing
+    /// Previous application read keys have reached their 3-PTO retention bound.
+    case keyDiscard
 }
 
 /// The set of absolute deadlines the engine currently wants the facade to honor.
@@ -39,25 +41,28 @@ public struct QUICEngineDeadlines: Sendable, Equatable {
     public var idleNanos: UInt64?
     public var pathValidationNanos: UInt64?
     public var pacingNanos: UInt64?
+    public var keyDiscardNanos: UInt64?
 
     public init(
         lossDetectionNanos: UInt64? = nil,
         ackDelayNanos: UInt64? = nil,
         idleNanos: UInt64? = nil,
         pathValidationNanos: UInt64? = nil,
-        pacingNanos: UInt64? = nil
+        pacingNanos: UInt64? = nil,
+        keyDiscardNanos: UInt64? = nil
     ) {
         self.lossDetectionNanos = lossDetectionNanos
         self.ackDelayNanos = ackDelayNanos
         self.idleNanos = idleNanos
         self.pathValidationNanos = pathValidationNanos
         self.pacingNanos = pacingNanos
+        self.keyDiscardNanos = keyDiscardNanos
     }
 
     /// The nearest armed deadline across all timers, or `nil` if none are armed.
     public var earliestDeadlineNanos: UInt64? {
         var best: UInt64? = nil
-        for candidate in [lossDetectionNanos, ackDelayNanos, idleNanos, pathValidationNanos, pacingNanos] {
+        for candidate in [lossDetectionNanos, ackDelayNanos, idleNanos, pathValidationNanos, pacingNanos, keyDiscardNanos] {
             guard let candidate else { continue }
             if let current = best {
                 if candidate < current { best = candidate }

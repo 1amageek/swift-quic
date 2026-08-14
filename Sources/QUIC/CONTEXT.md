@@ -1,122 +1,87 @@
-# QUIC — CONTEXT
-Scope/role: the dual-build `QUIC` entry point: host orchestration on Native and
-the `[UInt8]` engine facade on WASM / Embedded.
-Last reviewed: 2026-08-03
+# QUIC source context
 
-Invariants and design intent the source does not state structurally. Read this
-before changing the I/O loop, key installation, or the connection lifecycle. This
-owns the UDP I/O loops, the per-connection async orchestration, and the public
-high-level API on Native. On WASM / Embedded it exposes the cored engine path and
-gates the Foundation/NIO host spine.
+This target is the public, transport-independent QUIC session facade. It owns
+TLS 1.3 handshake orchestration around the sans-I/O `QUICConnectionEngine` and
+drives that engine through capabilities supplied by the embedder.
 
-## Contracts (the load-bearing rules)
+## Public roles
 
-- **Cipher-suite dispatch goes through the cored seam.** `PacketProcessor`
-  encryption/decryption selects the cipher suite via `SuiteProtector<C>` (a closed
-  enum, `C = QUICCryptoProvider`), NOT `any PacketOpener` / `any PacketSealer`.
-- **Key installation must propagate the negotiated cipher suite.** Take
-  `cipherSuite` from `KeysAvailableInfo`, derive `KeyMaterial` with it, and build
-  the protector via the key-derivation factory. Never hardcode AES-128-GCM on the
-  install path — that silently breaks ChaCha20-Poly1305 connections.
-- **The I/O loop must be cancellation-clean.** `run(socket:)` wraps its task group
-  in `withTaskCancellationHandler` and stops the socket on cancel; the socket's
-  `shutdown()` MUST `finish()` the incoming-packet continuation. Without this,
-  `for await packet in socket.incomingPackets` blocks forever and `shutdown()`
-  hangs. (See AsyncStream rule: a type vending an AsyncStream must implement
-  `shutdown()` that finishes the continuation.)
+- `QUICClient` owns one client TLS session and one engine-backed connection.
+- `QUICServerConnection` owns one accepted server TLS session and one
+  engine-backed connection. Listener routing and connection-ID demultiplexing
+  remain transport responsibilities.
+- `QUICEngineConnection` owns the receive and timer loops and exposes stream,
+  datagram, connection-close, and peer-event operations.
+- `QUICTLSCapabilityProviding` resolves signature, certificate, and key-exchange
+  operations requested by the TLS state machine.
 
-## Invariants (must hold; tests guard them)
+There is no legacy endpoint facade or fallback implementation in this target.
 
-- **A TLS provider is mandatory — no insecure default.** Configuration is via
-  `.production` / `.development` (caller supplies a provider). The `.testing`
-  mode fails explicitly unless the caller injects its own deterministic provider.
-- **Graceful shutdown prevents continuation leaks.** `shutdown()` and `close()`
-  guard against concurrent/duplicate calls; `start()` / `startWith0RTT()` is an
-  atomic state transition (double-start prevention).
-- **Fail-closed peer authentication** is enforced through the crypto/TLS layer:
-  CertificateVerify is always verified and Finished is accepted only after
-  authentication; the facade never exposes an unauthenticated connection.
+## Dependency and ownership boundary
 
-## Packet flow
+```text
+NetworkingDatagram + NetworkingTime
+                 |
+                 v
+        QUICEngineConnection
+                 |
+        QUICConnectionEngineCore
+                 |
+                 v
+       QUICClient / QUICServerConnection
+                 |
+              QUICTLS
+                 |
+            swift-ssl
+```
 
-- Inbound: UDP datagram → `CoalescedPacketParser.parse` (split coalesced packets)
-  → `PacketProcessor.decryptPacket` (extract header info, pick the per-level
-  `CryptoContext`, remove header protection, AEAD-open) → parsed frames.
-- Outbound: frames + header → `PacketProcessor.encrypt{Long,Short}HeaderPacket`
-  (AEAD-seal, apply header protection) → encrypted packet → coalesce → send.
-- Encryption levels (packet-number spaces): Initial, 0-RTT (client only),
-  Handshake, Application (1-RTT short header).
+- `NetworkingCore` owns `OwnedBytes`, `Span` borrowing, and IP endpoints.
+- `NetworkingDatagram` owns the asynchronous datagram contract.
+- `NetworkingTime` owns the monotonic clock and sleep contract.
+- QUIC targets own QUIC varints, packet framing, recovery, transport parameters,
+  stream state, and connection state.
+- `swift-tls` owns TLS 1.3 and QUIC-TLS state transitions.
+- `swift-ssl` owns cryptographic primitives, ASN.1, X.509, and TLS mechanisms.
 
-## Status: Slice B rails landed (engine-driven path is additive)
+## Data path
 
-The cored orchestration engine `QUICConnectionEngine<C, T>` (target
-`QUICConnectionEngineCore`) is now driven by a seam-based facade alongside the
-proven host orchestrator:
+```text
+transport.receive()
+    -> InboundDatagram owns OwnedBytes
+    -> scoped Span borrow
+    -> QUICConnectionEngine.receive
+    -> engine emits owned [UInt8] datagrams
+    -> consume Array storage into OwnedBytes
+    -> transport.send(OwnedBytes)
+```
 
-- `FacadeLock.swift` — one `Synchronization.Mutex` contract shared by Native,
-  WASM, and Embedded targets.
-- `AsyncTimerClock.swift` — the host `AsyncTimer` (`ContinuousClock`+`Task.sleep`),
-  the engine's `T` clock seam (host-gated; Embedded injects its own `AsyncTimer`).
-- `QUICEngineConnection.swift` — the `final class & Sendable` driver holding
-  `FacadeLock<QUICConnectionEngine>` over the `DatagramTransport` (UDP) +
-  `AsyncTimer` (clock+sleep) seams. It inverts I/O (`transport.incoming →
-  engine.receive → transport.send`) and drives the clock-free timer loop (read
-  `deadlines(nowNanos:)`, `sleep(untilNanos: earliest)`, on wake
-  `handleTimeout(nowNanos:)`). No `ContinuousClock`/`Task.sleep`/`Date` in the
-  driver — all time flows through the injected `AsyncTimer`.
-- `QUICEngineConfigurationStrategy.swift` — host vs portable crypto/cert capability
-  behind one signature: host CSPRNG + injected X.509 validator (fail-closed);
-  WASM / Embedded RPK (RFC 7250) leaf-SPKI parsing via `P2PCoreDER` (fail-closed).
+The receive parser borrows the datagram only during the synchronous engine
+step. The pointer never escapes the borrow closure or crosses an `await`.
+Outbound arrays are consumed into `OwnedBytes`; do not replace that transfer
+with `OwnedBytes(copying:)` on the packet loop.
 
-The driver is wired and unit-tested end-to-end (`QUICEngineConnectionTests`:
-stream round-trip + close over an in-memory loopback transport), but it is NOT yet
-the live data path: `QUICEndpoint`/`ManagedConnection` keep their proven
-`QUICConnectionHandler`/`PacketProcessor` spine so the public Foundation/NIO API
-and the 895 host tests stay intact. Now-internal orchestrators (`PacketProcessor`,
-`ConnectionRouter`, `TimerManager`/`TimerWheel`) are demoted to `package`.
+## Concurrency and failure contracts
 
-## Embedded gate (the milestone): `--target QUIC -c release` COMPILES (quic Slice C)
+- Native, WASM, and Embedded use the same `Synchronization.Mutex` storage and
+  mutation entries. Platform branches must not replace a mutex with raw state.
+- Engine and TLS state are mutated only inside their mutex closures.
+- I/O, timer sleep, TLS capability calls, and external callbacks execute after
+  the corresponding mutex is released.
+- `run()` is single-use. A second call fails with a typed invalid-state error.
+- Datagram I/O, time, TLS, and engine failures remain distinguishable through
+  `QUICConnectionDriverError`; they are never converted to a successful close.
+- A clean transport close is represented by `receive() == nil`.
+- Timer waiters are terminated on loop exit so cancellation cannot leave a
+  suspended continuation behind.
+- Peer authentication is fail-closed. Missing or rejected TLS capabilities
+  terminate the handshake.
 
-The `QUIC` target is now DUAL-BUILD via the proven swift-tls Slice B route
-(currency + Foundation-gating; the host spine is NOT rewritten):
+## Verification
 
-- **Host spine gated host-only.** `QUICEndpoint` / `ManagedConnection` /
-  `ManagedStream` / `QUICConnection` (the Foundation-`Data` `QUICStreamProtocol`
-  + NIO `SocketAddress` bridge) / `QUICConfiguration` / `PacketProcessor` /
-  `ConnectionRouter` / `TimerManager` / `VersionNegotiator` are each wrapped
-  whole in `#if !hasFeature(Embedded) && !os(WASI)`. The public host API
-  (`QUICEndpoint` / `ManagedConnection` / `QUICConnectionProtocol` /
-  `QUICStreamProtocol` / `QUICConfiguration` / `QUIC.SocketAddress`) is UNCHANGED,
-  so swift-libp2p builds unchanged.
-- **Conditional dependencies.** `Package.swift`'s `quicFacadeDependencies` drops
-  the host adapter targets (`QUICCore` / `QUICCrypto` / `QUICConnection` /
-  `QUICStream` / `QUICRecovery` / `QUICTransport` + `Logging`) under
-  `P2P_CORE_WASM=1` or `P2P_CORE_EMBEDDED=1`; the `QUIC` target carries
-  `swiftSettings: coreSettings`.
-- **The Embedded surface** is the `[UInt8]`/`SocketEndpoint` facade: the cored,
-  sans-IO `QUICEngineConnection` driver plus the public concrete
-  `QUICEngineClient` (pinned to `DefaultCryptoProvider`) over it, with the
-  dual-build seams `FacadeLock` / `AsyncTimerClock` (host-gated impl) /
-  `QUICEngineConfigurationStrategy` (host X.509 vs portable RPK, fail-closed).
-
-Phase-2 features (Retry / 0-RTT / connection-migration / peer-initiated
-key-update live-wiring) are DEFERRED — the engine drops/does-not-wire them and the
-facade surfaces them as a typed throw (`QUICEngineError.invalidState`), never a
-silent fallback.
-
-## Build
-
-- Host: `xcodebuild build` / `xcodebuild test`. The full Foundation/NIO
-  spine compiles; `QUICEngineClient` / `QUICEngineConnection` compile alongside it.
-- Benchmarks: set `SWIFT_QUIC_ENABLE_BENCHMARKS=1` and run the
-  `QUICBenchmarks` suite through `xcodebuild test`.
-  The package manifest leaves throughput benchmarks out of the default test graph
-  because SwiftPM runs every test target by default.
-- WASM: use the pinned Swift 6.4 snapshot and matching
-  `swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm` SDK with
-  `P2P_CORE_WASM=1 swift build --target QUIC --configuration release`.
-- Embedded: use the pinned Swift 6.4 snapshot and matching
-  `swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm-embedded` SDK with
-  `P2P_CORE_EMBEDDED=1 swift build --target QUIC
-  --configuration release`. Only the cores + the
-  `[UInt8]` engine facade compile; the host spine is gated away.
+- Native behavior tests run with `xcodebuild test`.
+- Throughput benchmarks are opt-in through `SWIFT_QUIC_ENABLE_BENCHMARKS=1` and
+  remain outside the default test graph.
+- WASM and Embedded validation compile, link, and run the opt-in
+  `quic-wasm-validation` executable with the pinned Swift 6.4 toolchain and
+  matching SDKs. The same source-level ownership and synchronization contracts
+  apply on every target.

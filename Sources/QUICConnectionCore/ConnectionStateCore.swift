@@ -1,22 +1,14 @@
 /// Embedded-clean connection lifecycle state machine (RFC 9000 §10) as a value type.
 ///
-/// This is the byte-identical lifecycle / packet-number bookkeeping of the host
-/// `ConnectionState`, expressed as a `struct` with `mutating` transition methods and
-/// deadline computations driven by injected `UInt64` nanosecond time. The host
-/// `ConnectionState` is held inside the `QUICConnectionHandler`'s `Mutex`; it keeps the
-/// same public surface (`status`, `getNextPacketNumber`, `updateLargestReceived`, the
-/// per-level packet-number dictionaries) and forwards to this core, so observable
-/// behavior is unchanged.
+/// A standalone caller-owned value with explicit lifecycle transitions,
+/// per-encryption-level packet-number bookkeeping, and injected nanosecond time.
 ///
 /// The per-level packet-number maps are stored here as a fixed 4-element array indexed
-/// by `EncryptionLevel.rawValue` (0...3), which is numerically identical to the host's
-/// `[EncryptionLevel: UInt64]` while staying Embedded-clean (no custom-Hashable
-/// dictionaries). The adapter exposes the dictionary view for source compatibility.
+/// by `EncryptionLevel.rawValue` (0...3), avoiding a dictionary on the portable path.
 ///
 /// Close / drain timing (RFC 9000 §10.2): once a connection enters the closing/draining
 /// period it remains there for 3 * PTO. `drainDeadlineNanos(closeStartedNanos:ptoNanos:)`
-/// computes that deadline as a value from injected time; the adapter owns the timer task
-/// that fires it.
+/// computes that deadline as a value; its caller owns any timer task.
 ///
 /// Embedded-clean: no Foundation, no `ContinuousClock`, no `any`, no `Mutex`.
 
@@ -44,6 +36,12 @@ public enum ConnectionRoleCore: Sendable {
     case client
     /// This endpoint accepted the connection (server).
     case server
+}
+
+/// Errors produced by connection-state accounting.
+public enum ConnectionStateCoreError: Error, Sendable, Equatable {
+    /// A packet-number space exhausted QUIC's 62-bit packet-number range.
+    case packetNumberExhausted(EncryptionLevel)
 }
 
 // MARK: - Connection State Core
@@ -109,10 +107,15 @@ public struct ConnectionStateCore: Sendable {
     // MARK: - Packet Number Bookkeeping
 
     /// Returns the next packet number for `level` and increments the counter.
-    public mutating func getNextPacketNumber(for level: EncryptionLevel) -> UInt64 {
+    public mutating func getNextPacketNumber(
+        for level: EncryptionLevel
+    ) throws(ConnectionStateCoreError) -> UInt64 {
         let index = level.rawValue
         let pn = nextPacketNumbers[index]
-        nextPacketNumbers[index] = pn &+ 1
+        guard pn < (1 << 62) else {
+            throw .packetNumberExhausted(level)
+        }
+        nextPacketNumbers[index] = pn + 1
         return pn
     }
 
@@ -177,6 +180,9 @@ public struct ConnectionStateCore: Sendable {
     ///   - ptoNanos: The current Probe Timeout in nanoseconds.
     /// - Returns: The deadline in epoch-relative nanoseconds (`closeStarted + 3 * PTO`).
     public func drainDeadlineNanos(closeStartedNanos: UInt64, ptoNanos: UInt64) -> UInt64 {
-        closeStartedNanos &+ (ptoNanos &* 3)
+        let (duration, durationOverflow) = ptoNanos.multipliedReportingOverflow(by: 3)
+        guard !durationOverflow else { return UInt64.max }
+        let (deadline, deadlineOverflow) = closeStartedNanos.addingReportingOverflow(duration)
+        return deadlineOverflow ? UInt64.max : deadline
     }
 }

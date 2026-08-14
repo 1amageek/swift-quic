@@ -8,7 +8,6 @@ import QUICPacketProtectionCore
 import QUICConnectionCore
 import QUICRecoveryCore
 import QUICStreamCore
-import P2PCoreCrypto
 
 extension QUICConnectionEngine {
     /// Processes one inbound UDP datagram (sans-IO).
@@ -22,7 +21,7 @@ extension QUICConnectionEngine {
     ///   §5.5 (it does not throw — that would let an attacker kill the connection)
     ///   but a malformed frame or invariant violation IS a typed throw.
     public mutating func receive(
-        datagram: [UInt8],
+        datagram: Span<UInt8>,
         nowNanos: UInt64
     ) throws(QUICEngineError) -> QUICEngineOutput {
         guard status != .closed else { throw .connectionClosed }
@@ -43,7 +42,7 @@ extension QUICConnectionEngine {
 
         var anyPacketProcessed = false
         for range in ranges {
-            let packetBytes = Array(datagram[range.offset..<(range.offset + range.length)])
+            let packetBytes = datagram.extracting(range.offset..<(range.offset + range.length))
             // Decrypt + route a single packet. A decryption failure drops the
             // packet (returns nil) without aborting the connection.
             if let processed = try processPacket(packetBytes, isLongHeader: range.isLongHeader, nowNanos: nowNanos, into: &output) {
@@ -60,10 +59,17 @@ extension QUICConnectionEngine {
         return output
     }
 
+    public mutating func receive(
+        datagram: borrowing [UInt8],
+        nowNanos: UInt64
+    ) throws(QUICEngineError) -> QUICEngineOutput {
+        try receive(datagram: datagram.span, nowNanos: nowNanos)
+    }
+
     // MARK: - Single packet
 
     private mutating func processPacket(
-        _ bytes: [UInt8],
+        _ bytes: Span<UInt8>,
         isLongHeader: Bool,
         nowNanos: UInt64,
         into output: inout QUICEngineOutput
@@ -76,67 +82,107 @@ extension QUICConnectionEngine {
     }
 
     private mutating func processLongHeaderPacket(
-        _ bytes: [UInt8],
+        _ bytes: Span<UInt8>,
         nowNanos: UInt64,
         into output: inout QUICEngineOutput
     ) throws(QUICEngineError) -> Bool? {
-        guard let firstByte = bytes.first else { return nil }
-        // Determine the level from the long-header type bits (RFC 9000 §17.2).
-        let typeBits = (firstByte & 0x30) >> 4
-        let level: EncryptionLevel
-        switch typeBits {
-        case 0x00: level = .initial
-        case 0x01: level = .zeroRTT
-        case 0x02: level = .handshake
-        default:
-            // Retry / Version Negotiation are not handled by this slice; drop.
+        guard !bytes.isEmpty else { return nil }
+        let protectedHeader: ProtectedLongHeader
+        let protectedHeaderLength: Int
+        do {
+            (protectedHeader, protectedHeaderLength) = try ProtectedLongHeader.parse(from: bytes)
+        } catch {
             return nil
+        }
+
+        switch protectedHeader.packetType {
+        case .versionNegotiation:
+            return try processVersionNegotiation(
+                protectedHeader,
+                headerLength: protectedHeaderLength,
+                bytes: bytes
+            )
+        case .retry:
+            return try processRetry(protectedHeader, bytes: bytes, nowNanos: nowNanos)
+        default:
+            break
+        }
+
+        guard protectedHeader.version == version else { return nil }
+        let level: EncryptionLevel
+        switch protectedHeader.packetType {
+        case .initial: level = .initial
+        case .zeroRTT: level = .zeroRTT
+        case .handshake: level = .handshake
+        case .retry, .versionNegotiation: return nil
         }
 
         // No keys for this level yet → drop (RFC 9001 §5.7 buffering is the
         // facade's concern; the engine simply cannot decrypt yet).
         guard keys.hasReadKeys(for: level) else { return nil }
 
-        let protector: SuiteProtector<C>
+        let protector: SuiteProtector
         do { protector = try keys.readProtector(for: level) } catch { return nil }
 
         let largestPN = space(for: level).largestReceived ?? 0
         let parsed: ParsedPacketCore
         do {
             parsed = try PacketParsingCore.parseLongHeaderPacket(bytes: bytes, protector: protector, largestPN: largestPN)
-        } catch {
-            // Decryption / parse failure on a single packet is non-fatal (drop).
+        } catch let error {
+            // Only frame decoding happens after AEAD authentication. An
+            // authenticated malformed frame is connection-fatal; unauthenticated
+            // structural/protection failures remain packet drops.
+            if case .frame = error {
+                throw .packetParsing(error)
+            }
+            try recordAuthenticationFailureIfNeeded(error, suite: protector.suite)
             return nil
         }
 
-        // Client adopts the server's SCID as the new DCID (RFC 9000 §7.2).
+        if case .long(let header) = parsed.header {
+            let acceptsOriginalDestination = !isClient
+                && level == .initial
+                && header.destinationConnectionID == config.originalDestinationConnectionID
+            guard localConnectionIDs.containsActive(header.destinationConnectionID)
+                    || acceptsOriginalDestination else {
+                return nil
+            }
+        }
+
+        // Client adopts only the first authenticated server Initial SCID. A
+        // second change is not permitted during connection establishment.
         if isClient, level == .initial, case .long(let lh) = parsed.header {
-            destinationConnectionID = lh.sourceConnectionID
+            if let peerInitialSourceConnectionID {
+                guard peerInitialSourceConnectionID == lh.sourceConnectionID else {
+                    return nil
+                }
+            } else {
+                peerInitialSourceConnectionID = lh.sourceConnectionID
+                destinationConnectionID = lh.sourceConnectionID
+                peerConnectionIDs.replaceInitialConnectionID(lh.sourceConnectionID)
+            }
         }
 
         try route(parsed: parsed, level: level, nowNanos: nowNanos, into: &output)
+        processedAuthenticatedPeerPacket = true
         return true
     }
 
     private mutating func processShortHeaderPacket(
-        _ bytes: [UInt8],
+        _ bytes: Span<UInt8>,
         nowNanos: UInt64,
         into output: inout QUICEngineOutput
     ) throws(QUICEngineError) -> Bool? {
         let level = EncryptionLevel.application
         guard keys.hasReadKeys(for: level) else { return nil }
 
-        let hpProtector: SuiteProtector<C>
-        do { hpProtector = try keys.readProtector(for: level) } catch { return nil }
+        let hpProtector: SuiteProtector
+        do { hpProtector = try keys.applicationReadHeaderProtectionProtector() }
+        catch { return nil }
 
         let largestPN = applicationSpace.largestReceived ?? 0
         let dcidLength = sourceConnectionID.bytes.count
 
-        // The opener selector returns the current-phase protector. A key update
-        // initiated by the peer (phase flip) is committed by re-deriving on a
-        // successful open; this slice accepts only the current phase and drops a
-        // mismatched-phase packet rather than silently rolling keys.
-        let currentPhase = keys.currentKeyPhase
         let parsed: ParsedPacketCore
         do {
             parsed = try PacketParsingCore.parseShortHeaderPacket(
@@ -144,17 +190,146 @@ extension QUICConnectionEngine {
                 dcidLength: dcidLength,
                 largestPN: largestPN,
                 headerProtectionProtector: hpProtector,
-                openerSelector: { phase throws(PacketParsingError) -> SuiteProtector<C>? in
-                    // Accept only the current phase in this slice (RFC 9001 §6.3
-                    // peer-initiated update live-wiring is deferred).
-                    phase == currentPhase ? hpProtector : nil
+                openerSelector: { phase, packetNumber throws(PacketParsingError) -> SuiteProtector? in
+                    keys.applicationReadProtector(
+                        keyPhase: phase,
+                        packetNumber: packetNumber
+                    )
                 }
+            )
+        } catch let error {
+            if case .frame = error {
+                throw .packetParsing(error)
+            }
+            let suite = keys.appSuite ?? hpProtector.suite
+            try recordAuthenticationFailureIfNeeded(error, suite: suite)
+            if peerConnectionIDs.matchesActiveResetToken(packet: bytes) {
+                status = .closed
+                output.peerClosed = true
+                return true
+            }
+            return nil
+        }
+
+
+        guard case .short(let header) = parsed.header,
+              localConnectionIDs.containsActive(header.destinationConnectionID) else {
+            return nil
+        }
+
+        if let keyPhase = parsed.keyPhase,
+           keys.packetUsesNextReadGeneration(
+               keyPhase: keyPhase,
+               packetNumber: parsed.packetNumber
+           ) {
+            let committedPhase = try keys.commitNextReadGeneration(
+                packetNumber: parsed.packetNumber
+            )
+            previousReadKeysDiscardDeadlineNanos = previousReadKeyDeadline(
+                nowNanos: nowNanos
+            )
+            try keys.alignWriteGeneration(to: committedPhase)
+        }
+
+        try route(parsed: parsed, level: level, nowNanos: nowNanos, into: &output)
+        processedAuthenticatedPeerPacket = true
+        return true
+    }
+
+    private mutating func processVersionNegotiation(
+        _ header: ProtectedLongHeader,
+        headerLength: Int,
+        bytes: Span<UInt8>
+    ) throws(QUICEngineError) -> Bool? {
+        guard isClient,
+              !processedAuthenticatedPeerPacket,
+              !processedRetry,
+              header.destinationConnectionID == sourceConnectionID,
+              header.sourceConnectionID == config.originalDestinationConnectionID else {
+            return nil
+        }
+        let versionBytes = bytes.count - headerLength
+        guard versionBytes > 0, versionBytes % 4 == 0 else { return nil }
+
+        var reader = QUICWireReader(bytes.extracting(headerLength..<bytes.count))
+        var advertised: [UInt32] = []
+        advertised.reserveCapacity(versionBytes / 4)
+        while reader.remaining > 0 {
+            do {
+                advertised.append(try reader.readUInt32())
+            } catch {
+                return nil
+            }
+        }
+        // A VN packet listing the attempted version is downgrade noise and MUST
+        // be discarded rather than causing the attempt to fail.
+        guard !advertised.contains(version.rawValue) else { return nil }
+        throw .versionNegotiationRequired(supportedVersions: advertised)
+    }
+
+    private mutating func processRetry(
+        _ header: ProtectedLongHeader,
+        bytes: Span<UInt8>,
+        nowNanos: UInt64
+    ) throws(QUICEngineError) -> Bool? {
+        guard isClient,
+              !processedRetry,
+              !processedAuthenticatedPeerPacket,
+              header.version == version,
+              header.destinationConnectionID == sourceConnectionID,
+              header.sourceConnectionID != config.originalDestinationConnectionID,
+              let token = header.token,
+              !token.isEmpty,
+              let tag = header.retryIntegrityTag,
+              bytes.count >= RetryIntegrityCore.tagLength else {
+            return nil
+        }
+
+        let withoutTag = bytes.extracting(0..<(bytes.count - RetryIntegrityCore.tagLength))
+        let valid: Bool
+        do {
+            valid = try RetryIntegrityCore.verify(
+                tag: tag.span,
+                originalDestinationConnectionID: config.originalDestinationConnectionID,
+                retryPacketWithoutTag: withoutTag,
+                version: version
             )
         } catch {
             return nil
         }
+        guard valid else { return nil }
 
-        try route(parsed: parsed, level: level, nowNanos: nowNanos, into: &output)
+        // Replay the exact Initial CRYPTO information under a fresh packet-number
+        // space and keys derived from the Retry SCID (RFC 9000 section 17.2.5.3).
+        var replay = pendingFrames[.initial] ?? []
+        if let ledger = sentFrameLedger[.initial] {
+            for frames in ledger.values {
+                replay.append(contentsOf: frames)
+            }
+        }
+        pendingFrames[.initial] = replay
+        sentFrameLedger[.initial] = UInt64ValueMap<[Frame]>()
+        initialSpace = PacketNumberSpace()
+        ptoCount = 0
+        congestion = CubicCore(maxDatagramSize: config.maxDatagramSize)
+        pacer = PacerCore(
+            rate: UInt64.max,
+            maxBurst: UInt64(config.maxDatagramSize) * 10,
+            nowNanos: nowNanos
+        )
+        keys.discard(level: .zeroRTT)
+        guard let salt = version.initialSaltBytes else {
+            throw .transportParameter("unsupported QUIC version (no initial salt)")
+        }
+        try keys.installInitial(
+            connectionID: header.sourceConnectionID.bytes,
+            salt: salt,
+            isClient: true
+        )
+        destinationConnectionID = header.sourceConnectionID
+        retrySourceConnectionID = header.sourceConnectionID
+        initialToken = token
+        processedRetry = true
         return true
     }
 
@@ -176,7 +351,13 @@ extension QUICConnectionEngine {
         withSpace(level) { $0.recordReceived(packetNumber: parsed.packetNumber, ackEliciting: ackEliciting, nowNanos: nowNanos) }
 
         for frame in parsed.frames {
-            try handleFrame(frame, level: level, nowNanos: nowNanos, into: &output)
+            try handleFrame(
+                frame,
+                level: level,
+                receivedDestinationConnectionID: parsed.header.destinationConnectionID,
+                nowNanos: nowNanos,
+                into: &output
+            )
         }
     }
 
@@ -190,6 +371,7 @@ extension QUICConnectionEngine {
     private mutating func handleFrame(
         _ frame: Frame,
         level: EncryptionLevel,
+        receivedDestinationConnectionID: ConnectionID,
         nowNanos: UInt64,
         into output: inout QUICEngineOutput
     ) throws(QUICEngineError) {
@@ -272,19 +454,73 @@ extension QUICConnectionEngine {
         case .handshakeDone:
             // Client confirms the handshake (RFC 9001 §4.1.2).
             if isClient {
-                handshakeConfirmed = true
-                keys.discard(level: .handshake)
-                handshakeSpace.isDiscarded = true
+                markHandshakeConfirmed()
             }
 
         case .datagram(let dg):
             output.datagrams.append(dg.data)
 
-        case .newToken, .dataBlocked, .streamDataBlocked, .streamsBlocked,
-             .newConnectionID, .retireConnectionID:
-            // Accepted but not acted on in this slice (no state corruption).
+        case .dataBlocked, .streamDataBlocked, .streamsBlocked:
+            // Advisory flow-control telemetry. No state transition is required.
             break
+
+        case .newToken:
+            // NEW_TOKEN is optional for a client that does not persist address
+            // validation tokens. Ignoring it is explicitly permitted by RFC 9000.
+            break
+
+        case .newConnectionID(let frame):
+            var candidate = peerConnectionIDs
+            let retired = try candidate.receive(
+                frame,
+                activeLimit: max(2, config.localTransportParameters.activeConnectionIDLimit)
+            )
+            peerConnectionIDs = candidate
+            if !retired.isEmpty {
+                var pending = pendingFrames[.application] ?? []
+                for sequenceNumber in retired {
+                    pending.append(.retireConnectionID(sequenceNumber))
+                }
+                pendingFrames[.application] = pending
+            }
+            if !peerConnectionIDs.containsActive(destinationConnectionID),
+               let replacement = peerConnectionIDs.firstActive() {
+                destinationConnectionID = replacement.connectionID
+            }
+
+        case .retireConnectionID(let sequenceNumber):
+            guard let record = localConnectionIDs.record(sequenceNumber: sequenceNumber) else {
+                throw .protocolViolation("RETIRE_CONNECTION_ID exceeds the largest issued sequence number")
+            }
+            guard record.connectionID != receivedDestinationConnectionID else {
+                throw .protocolViolation("RETIRE_CONNECTION_ID refers to the packet destination connection ID")
+            }
+            _ = localConnectionIDs.retire(sequenceNumber: sequenceNumber)
+            if sourceConnectionID == record.connectionID,
+               let replacement = localConnectionIDs.firstActive() {
+                sourceConnectionID = replacement.connectionID
+            }
         }
+    }
+
+    private mutating func recordAuthenticationFailureIfNeeded(
+        _ error: PacketParsingError,
+        suite: QUICProtectionSuite
+    ) throws(QUICEngineError) {
+        guard case .protection(.aead(.authenticationFailed)) = error else { return }
+        let failures = keys.recordFailedAuthentication()
+        if failures > config.aeadUsageLimits.integrityLimit(for: suite) {
+            status = .closed
+            throw .aeadLimitReached
+        }
+    }
+
+    private func previousReadKeyDeadline(nowNanos: UInt64) -> UInt64 {
+        let pto = rtt.probeTimeoutNanos(maxAckDelayNanos: peerMaxAckDelayNanos)
+        let (retention, multiplyOverflow) = pto.multipliedReportingOverflow(by: 3)
+        if multiplyOverflow { return UInt64.max }
+        let (deadline, addOverflow) = nowNanos.addingReportingOverflow(retention)
+        return addOverflow ? UInt64.max : deadline
     }
 
     // MARK: - Frame handlers
@@ -331,6 +567,9 @@ extension QUICConnectionEngine {
             congestion.onPacketsAcknowledged(packets: ackedPackets, nowNanos: nowNanos, rtt: snapshot)
             for packet in result.acked {
                 acknowledgePacketFrames(packet, level: level)
+                if level == .application {
+                    keys.recordApplicationPacketAcknowledged(packet.packetNumber)
+                }
             }
         }
         if !result.lost.isEmpty {
@@ -383,7 +622,16 @@ extension QUICConnectionEngine {
         }
 
         // Connection-level flow control (RFC 9000 §4.1).
-        let endOffset = stream.offset &+ UInt64(stream.data.count)
+        guard let dataLength = UInt64(exactly: stream.data.count) else {
+            throw .flowControl("STREAM payload length cannot be represented")
+        }
+        let (endOffset, offsetOverflow) = stream.offset.addingReportingOverflow(dataLength)
+        guard !offsetOverflow else {
+            throw .flowControl("STREAM end offset overflow")
+        }
+        guard endOffset <= ReceiveStreamCore.maxFinalOffset else {
+            throw .flowControl("STREAM end offset exceeds the QUIC 62-bit limit")
+        }
         let prevEnd = streams.flowController.streamBytesReceived(for: stream.streamID)
         if endOffset > prevEnd {
             let delta = endOffset - prevEnd
@@ -398,7 +646,13 @@ extension QUICConnectionEngine {
         streams.receiveStreams[stream.streamID] = recv
 
         if created { output.newStreams.append(stream.streamID) }
-        if recv.hasDataToRead { output.readableStreams.append(stream.streamID) }
+        // A FIN-only frame changes the application-visible read result from
+        // "would block" to EOF even though it carries no payload. Surface that
+        // transition so event-driven readers do not wait until an unrelated
+        // packet or the connection idle timeout.
+        if recv.hasDataToRead || recv.finReceived || recv.isReceiveClosed {
+            output.readableStreams.append(stream.streamID)
+        }
     }
 
     // MARK: - ACK decoding

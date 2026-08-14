@@ -6,30 +6,20 @@
 // Initial keys, which both peers derive identically from the original DCID.
 
 import Testing
+import NetworkingCore
 import QUICWire
 import QUICPacketProtectionCore
 import QUICConnectionCore
-import P2PCrypto
-import P2PCoreCrypto
 @testable import QUICConnectionEngineCore
 
-private typealias Provider = DefaultCryptoProvider
-
-/// A trivial monotonic clock for the engine's `T` parameter. The engine never
-/// reads it (time is injected), so it just satisfies the constraint.
-private struct TestClock: MonotonicClock {
-    func monotonicMillis() -> UInt64 { 0 }
-    func monotonicNanos() -> UInt64 { 0 }
-}
-
-private typealias Engine = QUICConnectionEngine<Provider, TestClock>
+private typealias Engine = QUICConnectionEngine
 
 @Suite("QUICConnectionEngine — cored, clock-free orchestrator")
 struct QUICConnectionEngineTests {
 
     // MARK: - Helpers
 
-    private func makeConfig(role: QUICEngineRole, dcid: ConnectionID, scid: ConnectionID, idleNanos: UInt64 = 30_000_000_000) -> QUICConnectionEngineConfiguration<Provider> {
+    private func makeConfig(role: QUICEngineRole, dcid: ConnectionID, scid: ConnectionID, idleNanos: UInt64 = 30_000_000_000) -> QUICConnectionEngineConfiguration {
         var tp = TransportParametersCore()
         tp.initialMaxData = 1_000_000
         tp.initialMaxStreamDataBidiLocal = 256 * 1024
@@ -38,7 +28,7 @@ struct QUICConnectionEngineTests {
         tp.initialMaxStreamsBidi = 100
         tp.initialMaxStreamsUni = 100
         tp.enableResetStreamAt = true
-        return QUICConnectionEngineConfiguration<Provider>(
+        return QUICConnectionEngineConfiguration(
             role: role,
             version: .v1,
             localConnectionID: scid,
@@ -55,15 +45,30 @@ struct QUICConnectionEngineTests {
     /// Builds a client + server engine pair that share the original DCID, so both
     /// install identical Initial keys (RFC 9001 §5.2) — enough to round-trip
     /// 1-RTT-shaped Initial packets in these unit tests without a TLS handshake.
-    private func makePair(idleNanos: UInt64 = 30_000_000_000) throws -> (client: Engine, server: Engine, dcid: ConnectionID, clientSCID: ConnectionID, serverSCID: ConnectionID) {
+    private func makePair(
+        idleNanos: UInt64 = 30_000_000_000,
+        aeadUsageLimits: QUICAEADUsageLimits = QUICAEADUsageLimits()
+    ) throws -> (client: Engine, server: Engine, dcid: ConnectionID, clientSCID: ConnectionID, serverSCID: ConnectionID) {
         let dcid = try #require(ConnectionID.random(length: 8))
         let clientSCID = try #require(ConnectionID.random(length: 8))
         let serverSCID = try #require(ConnectionID.random(length: 8))
-        var client = try Engine(configuration: makeConfig(role: .client, dcid: dcid, scid: clientSCID, idleNanos: idleNanos), nowNanos: 0)
+        var clientConfiguration = makeConfig(
+            role: .client,
+            dcid: dcid,
+            scid: clientSCID,
+            idleNanos: idleNanos
+        )
+        // This helper constructs an already-established pair. At that point the
+        // client has authenticated the server Initial SCID and uses it for both
+        // packet destinations and peer connection-ID state.
+        clientConfiguration.initialPeerConnectionID = serverSCID
+        clientConfiguration.aeadUsageLimits = aeadUsageLimits
+        var client = try Engine(configuration: clientConfiguration, nowNanos: 0)
         // The server's "peer CID" is the client's SCID; both derive Initial keys
         // from the SAME original DCID.
         var serverCfg = makeConfig(role: .server, dcid: clientSCID, scid: serverSCID, idleNanos: idleNanos)
         serverCfg.originalDestinationConnectionID = dcid
+        serverCfg.aeadUsageLimits = aeadUsageLimits
         var server = try Engine(configuration: serverCfg, nowNanos: 0)
         // Simulate the handshake's transport-parameter exchange so both peers know
         // each other's stream-count + flow-control limits.
@@ -89,7 +94,129 @@ struct QUICConnectionEngineTests {
         // block 1-RTT sends (post-handshake state).
         client.markHandshakeComplete()
         server.markHandshakeComplete()
+        client.markHandshakeConfirmed()
         return (client, server, dcid, clientSCID, serverSCID)
+    }
+
+    private func applicationProtector(
+        secretByte: UInt8 = 0xC0
+    ) throws -> SuiteProtector {
+        try QUICKeyDerivation.protector(
+            secret: [UInt8](repeating: secretByte, count: 32),
+            suite: .aes128GCM
+        )
+    }
+
+    private func retryPacket(
+        originalDestinationConnectionID: ConnectionID,
+        destinationConnectionID: ConnectionID,
+        sourceConnectionID: ConnectionID,
+        token: [UInt8],
+        version: QUICVersion = .v1
+    ) throws -> [UInt8] {
+        let header = try LongHeader(
+            packetType: .retry,
+            version: version,
+            destinationConnectionID: destinationConnectionID,
+            sourceConnectionID: sourceConnectionID,
+            token: token
+        )
+        var writer = QUICWireWriter(reservingCapacity: 23 + token.count)
+        writer.writeByte(header.firstByte)
+        writer.writeUInt32(version.rawValue)
+        destinationConnectionID.encode(to: &writer)
+        sourceConnectionID.encode(to: &writer)
+        writer.writeBytes(token)
+        var packet = writer.finishArray()
+        let tag = try RetryIntegrityCore.compute(
+            originalDestinationConnectionID: originalDestinationConnectionID,
+            retryPacketWithoutTag: packet.span,
+            version: version
+        )
+        packet.append(contentsOf: tag)
+        return packet
+    }
+
+    private func versionNegotiationPacket(
+        destinationConnectionID: ConnectionID,
+        sourceConnectionID: ConnectionID,
+        versions: [QUICVersion]
+    ) -> [UInt8] {
+        var writer = QUICWireWriter()
+        writer.writeByte(0xc0)
+        writer.writeUInt32(QUICVersion.negotiation.rawValue)
+        destinationConnectionID.encode(to: &writer)
+        sourceConnectionID.encode(to: &writer)
+        for version in versions {
+            writer.writeUInt32(version.rawValue)
+        }
+        return writer.finishArray()
+    }
+
+    private func malformedAuthenticatedShortPacket(
+        destinationConnectionID: ConnectionID,
+        packetNumber: UInt64 = 0
+    ) throws -> [UInt8] {
+        let protector = try applicationProtector()
+        let header = try ShortHeader(
+            destinationConnectionID: destinationConnectionID,
+            packetNumber: packetNumber,
+            packetNumberLength: 4
+        )
+        let packetNumberBytes: [UInt8] = [
+            UInt8(truncatingIfNeeded: packetNumber >> 24),
+            UInt8(truncatingIfNeeded: packetNumber >> 16),
+            UInt8(truncatingIfNeeded: packetNumber >> 8),
+            UInt8(truncatingIfNeeded: packetNumber),
+        ]
+        var authenticatedHeader = [header.firstByte]
+        authenticatedHeader.append(contentsOf: destinationConnectionID.bytes)
+        authenticatedHeader.append(contentsOf: packetNumberBytes)
+
+        // 0xff starts an eight-byte frame type but intentionally omits the
+        // remaining bytes. AEAD succeeds; frame decoding must be connection-fatal.
+        let ciphertext = try protector.seal(
+            [0xff].span,
+            packetNumber: packetNumber,
+            header: authenticatedHeader.span
+        )
+        var packet = authenticatedHeader
+        packet.append(contentsOf: ciphertext)
+
+        let packetNumberOffset = 1 + destinationConnectionID.bytes.count
+        let sampleOffset = packetNumberOffset + 4
+        let protected = try protector.applyHeaderProtection(
+            sample: packet.span.extracting(sampleOffset..<(sampleOffset + 16)),
+            firstByte: header.firstByte,
+            packetNumberBytes: packetNumberBytes
+        )
+        packet[0] = protected.firstByte
+        packet.replaceSubrange(
+            packetNumberOffset..<(packetNumberOffset + 4),
+            with: protected.packetNumberBytes
+        )
+        return packet
+    }
+
+    private func forgedShortPacket(
+        destinationConnectionID: ConnectionID,
+        packetNumber: UInt64,
+        secretByte: UInt8
+    ) throws -> [UInt8] {
+        let protector = try applicationProtector(secretByte: secretByte)
+        var packet = try PacketParsingCore.serializeShortHeaderPacket(
+            frames: [.ping],
+            header: try ShortHeader(
+                destinationConnectionID: destinationConnectionID,
+                packetNumber: packetNumber,
+                packetNumberLength: 4
+            ),
+            packetNumber: packetNumber,
+            protector: protector,
+            headerProtectionProtector: protector
+        )
+        packet[packet.count - 1] ^= 0x01
+        return packet
     }
 
     // MARK: - Construction
@@ -102,6 +229,97 @@ struct QUICConnectionEngineTests {
         #expect(!engine.isEstablished)
         #expect(!engine.isClosed)
         #expect(engine.currentKeyPhase == 0)
+    }
+
+    @Test("RFC-default peer parameters grant no stream credit")
+    func absentPeerFlowControlCredit() throws {
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let scid = try #require(ConnectionID.random(length: 8))
+        var engine = try Engine(
+            configuration: makeConfig(role: .client, dcid: dcid, scid: scid),
+            nowNanos: 0
+        )
+        var peer = TransportParametersCore()
+        peer.initialSourceConnectionID = dcid
+        peer.originalDestinationConnectionID = dcid
+        try engine.validateAndApplyPeerTransportParameters(peer)
+
+        #expect(throws: QUICEngineError.self) {
+            _ = try engine.openStream(bidirectional: true)
+        }
+    }
+
+    @Test("server rejects every server-only transport parameter from a client")
+    func serverOnlyTransportParametersFromClientFail() throws {
+        let clientCID = try #require(ConnectionID.random(length: 8))
+        let serverCID = try #require(ConnectionID.random(length: 8))
+        var engine = try Engine(
+            configuration: makeConfig(role: .server, dcid: clientCID, scid: serverCID),
+            nowNanos: 0
+        )
+        var peer = TransportParametersCore()
+        peer.initialSourceConnectionID = clientCID
+        peer.statelessResetToken = [UInt8](repeating: 0, count: 16)
+
+        #expect(throws: QUICEngineError.self) {
+            try engine.validateAndApplyPeerTransportParameters(peer)
+        }
+    }
+
+    @Test("connection IDs rotate on one path and retirement is acknowledged")
+    func connectionIDRotationRoundTrip() throws {
+        var (client, server, _, _, _) = try makePair()
+        server.antiAmplification.validateAddress()
+        let serverCID1 = try #require(ConnectionID.random(length: 8))
+        let serverCID2 = try #require(ConnectionID.random(length: 8))
+
+        try server.issueLocalConnectionID(
+            sequenceNumber: 1,
+            connectionID: serverCID1,
+            statelessResetToken: [UInt8](repeating: 0x11, count: 16)
+        )
+        for datagram in try server.flush(nowNanos: 1_000) {
+            _ = try client.receive(datagram: datagram, nowNanos: 2_000)
+        }
+        #expect(client.peerConnectionIDs.activeCount == 2)
+
+        try server.issueLocalConnectionID(
+            sequenceNumber: 2,
+            connectionID: serverCID2,
+            statelessResetToken: [UInt8](repeating: 0x22, count: 16),
+            retirePriorTo: 1
+        )
+        var retireAcknowledgements: [[UInt8]] = []
+        for datagram in try server.flush(nowNanos: 3_000) {
+            let output = try client.receive(datagram: datagram, nowNanos: 4_000)
+            retireAcknowledgements.append(contentsOf: output.datagramsToSend)
+        }
+
+        #expect(client.currentDestinationConnectionID == serverCID1)
+        #expect(client.peerConnectionIDs.activeCount == 2)
+        #expect(!retireAcknowledgements.isEmpty)
+        for datagram in retireAcknowledgements {
+            _ = try server.receive(datagram: datagram, nowNanos: 5_000)
+        }
+        #expect(server.localConnectionIDs.record(sequenceNumber: 0)?.isRetired == true)
+        #expect(server.sourceConnectionID == serverCID1)
+    }
+
+    @Test("stateless reset token closes only after packet protection fails")
+    func statelessResetDetection() throws {
+        var (client, _, _, _, _) = try makePair()
+        let token = [UInt8](repeating: 0xA7, count: 16)
+        var peerParameters = TransportParametersCore()
+        peerParameters.statelessResetToken = token
+        client.applyPeerTransportParameters(peerParameters)
+
+        var reset = [UInt8](repeating: 0x5A, count: 24)
+        reset[0] = 0x40
+        reset.replaceSubrange((reset.count - token.count)..<reset.count, with: token)
+        let output = try client.receive(datagram: reset, nowNanos: 10_000)
+
+        #expect(output.peerClosed)
+        #expect(client.isClosed)
     }
 
     @Test("unsupported version with no salt throws")
@@ -384,18 +602,207 @@ struct QUICConnectionEngineTests {
 
     @Test("application key update flips the key phase deterministically")
     func keyUpdateFlipsPhase() throws {
-        var engine = try Engine(configuration: makeConfig(role: .client, dcid: try #require(ConnectionID.random(length: 8)), scid: try #require(ConnectionID.random(length: 8))), nowNanos: 0)
+        var engine = try Engine(configuration: makeConfig(role: .server, dcid: try #require(ConnectionID.random(length: 8)), scid: try #require(ConnectionID.random(length: 8))), nowNanos: 0)
         // Install application keys (32-byte traffic secrets), then update.
         let readSecret = [UInt8](repeating: 0x01, count: 32)
         let writeSecret = [UInt8](repeating: 0x02, count: 32)
         try engine.installKeys(level: .application, readSecret: readSecret, writeSecret: writeSecret, suite: .aes128GCM)
+        engine.markHandshakeComplete()
         #expect(engine.currentKeyPhase == 0)
         let newPhase = try engine.performKeyUpdate()
         #expect(newPhase == 1)
         #expect(engine.currentKeyPhase == 1)
-        // A second update returns to phase 0.
-        let phase2 = try engine.performKeyUpdate()
-        #expect(phase2 == 0)
+        // A subsequent update is rejected until a current-phase packet is ACKed.
+        #expect(throws: QUICEngineError.self) {
+            _ = try engine.performKeyUpdate()
+        }
+    }
+
+    @Test("AES confidentiality limit advances application write keys before reuse")
+    func confidentialityLimitTriggersKeyUpdate() throws {
+        let limits = QUICAEADUsageLimits(aesGCMConfidentialityPackets: 1)
+        var (client, _, _, _, _) = try makePair(aeadUsageLimits: limits)
+        let streamID = try client.openStream(bidirectional: true)
+
+        try client.writeStream(streamID, data: [0x01])
+        #expect(!(try client.flush(nowNanos: 1_000)).isEmpty)
+        #expect(client.currentKeyPhase == 0)
+
+        try client.writeStream(streamID, data: [0x02])
+        #expect(!(try client.flush(nowNanos: 2_000)).isEmpty)
+        #expect(client.currentKeyPhase == 1)
+        #expect(client.keys.writePacketCount(for: .application) == 1)
+    }
+
+    @Test("authentication failures close the connection after the integrity limit")
+    func integrityFailureLimitClosesConnection() throws {
+        let limits = QUICAEADUsageLimits(
+            aesGCMConfidentialityPackets: 8_388_608,
+            aesGCMIntegrityFailures: 1
+        )
+        var (client, _, _, clientSCID, _) = try makePair(aeadUsageLimits: limits)
+        let first = try forgedShortPacket(
+            destinationConnectionID: clientSCID,
+            packetNumber: 0,
+            secretByte: 0x05
+        )
+        let second = try forgedShortPacket(
+            destinationConnectionID: clientSCID,
+            packetNumber: 1,
+            secretByte: 0x05
+        )
+
+        _ = try client.receive(datagram: first, nowNanos: 1_000)
+        #expect(!client.isClosed)
+        do {
+            _ = try client.receive(datagram: second, nowNanos: 2_000)
+            Issue.record("the second authentication failure must reach the configured integrity limit")
+        } catch QUICEngineError.aeadLimitReached {
+            #expect(client.isClosed)
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test("separately delivered application secrets remain available for key update")
+    func separatelyInstalledApplicationSecretsRemainAvailable() throws {
+        var engine = try Engine(
+            configuration: makeConfig(
+                role: .server,
+                dcid: try #require(ConnectionID.random(length: 8)),
+                scid: try #require(ConnectionID.random(length: 8))
+            ),
+            nowNanos: 0
+        )
+        let readSecret = [UInt8](repeating: 0x01, count: 32)
+        let writeSecret = [UInt8](repeating: 0x02, count: 32)
+
+        try engine.installKeys(
+            level: .application,
+            readSecret: readSecret,
+            writeSecret: nil,
+            suite: .aes128GCM
+        )
+        try engine.installKeys(
+            level: .application,
+            readSecret: nil,
+            writeSecret: writeSecret,
+            suite: .aes128GCM
+        )
+
+        engine.markHandshakeComplete()
+
+        #expect(try engine.performKeyUpdate() == 1)
+    }
+
+    @Test("peer key update commits after AEAD and retains reordered previous keys")
+    func peerKeyUpdateAndReorderedPreviousPacket() throws {
+        var (client, server, _, _, _) = try makePair()
+        let streamID = try client.openStream(bidirectional: true)
+
+        // Hold one phase-0 packet so it arrives after the phase-1 transition.
+        try client.writeStream(streamID, data: [0, 1, 2])
+        let delayedOldPackets = try client.flush(nowNanos: 1_000)
+        #expect(!delayedOldPackets.isEmpty)
+
+        #expect(try client.performKeyUpdate() == 1)
+        try client.writeStream(streamID, data: [3, 4, 5])
+        let updatedPackets = try client.flush(nowNanos: 2_000)
+        #expect(!updatedPackets.isEmpty)
+
+        var acknowledgements: [[UInt8]] = []
+        for packet in updatedPackets {
+            let output = try server.receive(datagram: packet, nowNanos: 3_000)
+            acknowledgements.append(contentsOf: output.datagramsToSend)
+        }
+        #expect(server.currentKeyPhase == 1)
+
+        // Packet number zero with the prior phase remains decryptable after
+        // packet number one commits the next receive generation.
+        for packet in delayedOldPackets {
+            let output = try server.receive(datagram: packet, nowNanos: 4_000)
+            acknowledgements.append(contentsOf: output.datagramsToSend)
+        }
+        #expect(server.keys.hasPreviousReadGeneration)
+        let discardDeadline = try #require(
+            server.deadlines(nowNanos: 4_000).keyDiscardNanos
+        )
+        let timerOutput = try server.handleTimeout(nowNanos: discardDeadline)
+        acknowledgements.append(contentsOf: timerOutput.datagramsToSend)
+        #expect(timerOutput.firedTimers.contains(.keyDiscard))
+        #expect(!server.keys.hasPreviousReadGeneration)
+        acknowledgements.append(contentsOf: try server.flush(nowNanos: 5_000))
+        #expect(server.readStream(streamID) == [0, 1, 2, 3, 4, 5])
+
+        for packet in acknowledgements {
+            _ = try client.receive(datagram: packet, nowNanos: 6_000)
+        }
+
+        // The phase-1 ACK both commits the client's read generation and permits
+        // the next locally initiated update.
+        #expect(try client.performKeyUpdate() == 0)
+    }
+
+    @Test("authenticated malformed frames are fatal but forged packets are dropped")
+    func authenticatedMalformedFrameIsFatal() throws {
+        var (_, server, _, _, serverSCID) = try makePair()
+        let malformed = try malformedAuthenticatedShortPacket(
+            destinationConnectionID: serverSCID
+        )
+        #expect(throws: QUICEngineError.self) {
+            _ = try server.receive(datagram: malformed, nowNanos: 1_000)
+        }
+
+        var forged = malformed
+        forged[forged.count - 1] ^= 0x01
+        _ = try server.receive(datagram: forged, nowNanos: 2_000)
+    }
+
+    @Test("STREAM end-offset overflow is rejected")
+    func streamEndOffsetOverflowIsRejected() throws {
+        var (_, server, _, _, serverSCID) = try makePair()
+        let protector = try applicationProtector()
+        let packet = try PacketParsingCore.serializeShortHeaderPacket(
+            frames: [
+                .stream(StreamFrame(
+                    streamID: 0,
+                    offset: Varint.maxValue,
+                    data: [1]
+                )),
+            ],
+            header: try ShortHeader(
+                destinationConnectionID: serverSCID,
+                packetNumber: 0,
+                packetNumberLength: 4
+            ),
+            packetNumber: 0,
+            protector: protector
+        )
+
+        #expect(throws: QUICEngineError.self) {
+            _ = try server.receive(datagram: packet, nowNanos: 1_000)
+        }
+    }
+
+    @Test("authenticated packets for an inactive destination CID are dropped")
+    func inactiveDestinationConnectionIDIsDropped() throws {
+        var (_, server, _, _, _) = try makePair()
+        let protector = try applicationProtector()
+        let inactiveCID = try #require(ConnectionID.random(length: 8))
+        let packet = try PacketParsingCore.serializeShortHeaderPacket(
+            frames: [.ping],
+            header: try ShortHeader(
+                destinationConnectionID: inactiveCID,
+                packetNumber: 0,
+                packetNumberLength: 4
+            ),
+            packetNumber: 0,
+            protector: protector
+        )
+
+        let output = try server.receive(datagram: packet, nowNanos: 1_000)
+        #expect(output.newStreams.isEmpty)
+        #expect(server.applicationSpace.largestReceived == nil)
     }
 
     @Test("key update before application keys are installed throws")
@@ -416,5 +823,117 @@ struct QUICConnectionEngineTests {
         server.queueHandshake(Array(repeating: 0xAB, count: 100), level: .initial)
         let datagrams = try server.flush(nowNanos: 1_000)
         #expect(datagrams.isEmpty)
+    }
+
+    @Test("valid Retry replays the original Initial CRYPTO with token and new keys")
+    func validRetryReplaysInitialCrypto() throws {
+        let originalDestination = try #require(ConnectionID.random(length: 8))
+        let clientSource = try #require(ConnectionID.random(length: 8))
+        let retrySource = try #require(ConnectionID.random(length: 8))
+        var client = try Engine(
+            configuration: makeConfig(
+                role: .client,
+                dcid: originalDestination,
+                scid: clientSource
+            ),
+            nowNanos: 0
+        )
+        let clientHello: [UInt8] = [0x01, 0x00, 0x00, 0x01, 0xaa]
+        client.queueHandshake(clientHello, level: .initial)
+        #expect(!(try client.flush(nowNanos: 1)).isEmpty)
+
+        let token: [UInt8] = [0xde, 0xad, 0xbe, 0xef]
+        let retry = try retryPacket(
+            originalDestinationConnectionID: originalDestination,
+            destinationConnectionID: clientSource,
+            sourceConnectionID: retrySource,
+            token: token
+        )
+        let output = try client.receive(datagram: retry, nowNanos: 2)
+        let replay = try #require(output.datagramsToSend.first)
+        let (protectedHeader, _) = try ProtectedLongHeader.parse(from: replay)
+        #expect(protectedHeader.packetType == .initial)
+        #expect(protectedHeader.destinationConnectionID == retrySource)
+        #expect(protectedHeader.sourceConnectionID == clientSource)
+        #expect(protectedHeader.token == token)
+        #expect(client.currentDestinationConnectionID == retrySource)
+
+        let salt = try #require(QUICVersion.v1.initialSaltBytes)
+        let secrets = try QUICKeyDerivation.initialSecrets(
+            connectionID: retrySource.bytes,
+            salt: salt
+        )
+        let serverProtector = try QUICKeyDerivation.protector(
+            secret: secrets.client,
+            suite: .aes128GCM
+        )
+        let parsed = try PacketParsingCore.parseLongHeaderPacket(
+            bytes: replay.span,
+            protector: serverProtector,
+            largestPN: 0
+        )
+        let replayedCrypto = parsed.frames.compactMap { frame -> [UInt8]? in
+            guard case .crypto(let crypto) = frame else { return nil }
+            return crypto.data
+        }
+        #expect(replayedCrypto == [clientHello])
+    }
+
+    @Test("forged Retry is discarded without changing destination CID")
+    func forgedRetryIsDiscarded() throws {
+        let originalDestination = try #require(ConnectionID.random(length: 8))
+        let clientSource = try #require(ConnectionID.random(length: 8))
+        let retrySource = try #require(ConnectionID.random(length: 8))
+        var client = try Engine(
+            configuration: makeConfig(
+                role: .client,
+                dcid: originalDestination,
+                scid: clientSource
+            ),
+            nowNanos: 0
+        )
+        var retry = try retryPacket(
+            originalDestinationConnectionID: originalDestination,
+            destinationConnectionID: clientSource,
+            sourceConnectionID: retrySource,
+            token: [0x01]
+        )
+        retry[retry.count - 1] ^= 0x01
+        let output = try client.receive(datagram: retry, nowNanos: 1)
+        #expect(output.isEmpty)
+        #expect(client.currentDestinationConnectionID == originalDestination)
+    }
+
+    @Test("Version Negotiation is validated and surfaced as a typed restart requirement")
+    func versionNegotiationIsValidated() throws {
+        let originalDestination = try #require(ConnectionID.random(length: 8))
+        let clientSource = try #require(ConnectionID.random(length: 8))
+        var client = try Engine(
+            configuration: makeConfig(
+                role: .client,
+                dcid: originalDestination,
+                scid: clientSource
+            ),
+            nowNanos: 0
+        )
+
+        let downgradeNoise = versionNegotiationPacket(
+            destinationConnectionID: clientSource,
+            sourceConnectionID: originalDestination,
+            versions: [.v1, .v2]
+        )
+        #expect(try client.receive(datagram: downgradeNoise, nowNanos: 1).isEmpty)
+
+        let negotiation = versionNegotiationPacket(
+            destinationConnectionID: clientSource,
+            sourceConnectionID: originalDestination,
+            versions: [.v2]
+        )
+        do {
+            _ = try client.receive(datagram: negotiation, nowNanos: 2)
+            Issue.record("Expected Version Negotiation to require a new connection attempt")
+        } catch .versionNegotiationRequired(let versions) {
+            #expect(versions == [QUICVersion.v2.rawValue])
+        }
     }
 }

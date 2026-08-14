@@ -4,9 +4,7 @@
 ///
 /// Embedded-clean: no Foundation, no `any`. Byte payloads (`StreamFrame.data`,
 /// `CryptoFrame.data`, `DatagramFrame.data`, `NewConnectionIDFrame.statelessResetToken`)
-/// are `[UInt8]`; `ConnectionCloseFrame.reasonPhrase` stays `String` (stdlib). The
-/// Foundation adapter restores the historical `Data`-accepting initializers and
-/// the `[UInt8] == Data` comparison surface.
+/// are `[UInt8]`; `ConnectionCloseFrame.reasonPhrase` stays `String` (stdlib).
 
 // MARK: - ACK Frame
 

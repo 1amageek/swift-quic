@@ -1,78 +1,39 @@
 # ``QUIC``
 
-A pure Swift implementation of the QUIC protocol (RFC 9000).
+A Pure Swift QUIC session facade for Native, WASM, and Embedded Swift.
 
 ## Overview
 
-swift-quic provides a modern, async/await-based QUIC implementation for Swift applications. It is designed primarily for libp2p integration but can be used as a standalone QUIC library.
+The module binds the sans-I/O QUIC connection engine to caller-supplied
+``NetworkingDatagram/DatagramTransport`` and ``NetworkingTime/AsyncTimer``
+capabilities. TLS 1.3 handshake state is owned by `swift-tls`; cryptography and
+PKI are owned by `swift-ssl`.
 
-QUIC is a multiplexed transport protocol built on UDP that provides:
-- Encrypted connections by default (TLS 1.3)
-- Multiplexed streams over a single connection
-- Low-latency connection establishment
-- Connection migration support
-- Improved congestion control
+Use ``QUICClient`` for a client session and ``QUICServerConnection`` for one
+accepted server session. Listener routing and connection-ID demultiplexing are
+transport-adapter responsibilities.
 
-### Key Features
+The public drivers provide:
 
-- **async/await everywhere** - Modern Swift concurrency
-- **Value types first** - Struct-based data types
-- **Protocol-oriented** - Clean abstractions
-- **Sendable compliance** - Thread-safe by design
+- TLS 1.3 authenticated connection establishment
+- bidirectional and unidirectional QUIC streams
+- QUIC datagrams
+- connection close and peer event state
+- loss-recovery and timer integration through an injected clock
 
-## Getting Started
-
-### Client Connection
-
-```swift
-var config = QUICConfiguration()
-config.tlsProviderFactory = { isClient in
-    try MyTLSProvider(isClient: isClient)
-}
-let endpoint = QUICEndpoint(configuration: config)
-let connection = try await endpoint.dial(address: serverAddress)
-let stream = try await connection.openStream()
-try await stream.write(data)
-let response = try await stream.read()
-```
-
-### Server Listener
-
-```swift
-var config = QUICConfiguration()
-config.tlsProviderFactory = { isClient in
-    try MyTLSProvider(isClient: isClient)
-}
-let endpoint = try await QUICEndpoint.listen(
-    address: bindAddress,
-    configuration: config
-)
-for await connection in endpoint.incomingConnections {
-    Task {
-        for await stream in connection.incomingStreams {
-            // Handle stream
-        }
-    }
-}
-```
+Received datagrams remain owned by `OwnedBytes` and are borrowed only during a
+synchronous engine transition. Engine-produced packet arrays transfer ownership
+into the asynchronous send operation.
 
 ## Topics
 
-### Essentials
+### Sessions
 
-- ``QUICEndpoint``
-- ``QUICConfiguration``
-- ``TLSProviderFactory``
+- ``QUICClient``
+- ``QUICServerConnection``
+- ``QUICEngineConnection``
 
-### Connections
+### Capabilities and errors
 
-- ``QUICConnectionProtocol``
-- ``SocketAddress``
-
-### Streams
-
-- ``QUICStreamProtocol``
-
-### Errors
-
-- ``QUICSecurityError``
+- ``QUICTLSCapabilityProviding``
+- ``QUICConnectionDriverError``

@@ -1,11 +1,8 @@
 /// Embedded-clean path-validation core (RFC 9000 §8.2 / §9.3) as a value type.
 ///
-/// This is the byte-identical path-validation logic of the host
-/// `PathValidationManager`, expressed as a `struct` operating purely on `[UInt8]`
-/// challenge data and monotonic `UInt64` nanosecond timestamps. The host
-/// `PathValidationManager` keeps a `Mutex`, a `ContinuousClock` epoch, and the RNG;
-/// it generates challenge data, converts `Instant`/`Duration` to/from nanoseconds,
-/// and delegates the matching/state logic here, so observable behavior is unchanged.
+/// The caller-owned `struct` operates on `[UInt8]` challenge data and injected
+/// monotonic nanosecond timestamps. Entropy, timers, and path-specific I/O are
+/// provided by the caller.
 ///
 /// Anti-spoofing (fail-closed): a path is validated ONLY by a PATH_RESPONSE whose
 /// 8 bytes exactly match a challenge we sent. A non-matching response validates
@@ -15,9 +12,8 @@
 /// only emitted when the remaining budget covers the 9-byte frame; otherwise the
 /// response is deferred (recorded), never dropped.
 ///
-/// The host uses dictionaries keyed by `Data`/`NetworkPath`; this core uses small
-/// arrays scanned by exact-byte / value equality, which preserves the identical
-/// match semantics while staying Embedded-clean (no custom-Hashable dictionaries).
+/// Small arrays are scanned by exact-byte and path value equality, avoiding
+/// platform-specific dictionary keys.
 ///
 /// Embedded-clean: no Foundation, no `Data`, no `ContinuousClock`, no `any`,
 /// no `Mutex`.
@@ -117,6 +113,10 @@ public struct PathValidationCore: Sendable {
         for path: NetworkPath,
         nowNanos: UInt64
     ) {
+        // Replacing an in-flight validation invalidates every earlier challenge
+        // for that path. A delayed response to an old challenge must not validate
+        // the new attempt.
+        challenges.removeAll { $0.path == path }
         setValidationState(.pending(challengeData: challengeData, sentAtNanos: nowNanos), for: path)
         challenges.append((data: challengeData, path: path))
     }
@@ -222,7 +222,7 @@ public struct PathValidationCore: Sendable {
                 // `now - sentAt > timeout`, computed in unsigned ns. Guard against a
                 // clock that has not advanced past sentAt (elapsed would be 0).
                 let elapsed = nowNanos >= sentAtNanos ? nowNanos - sentAtNanos : 0
-                if elapsed > validationTimeoutNanos {
+                if elapsed >= validationTimeoutNanos {
                     let path = validations[i].path
                     validations[i].state = .failed(reason: .timeout)
                     removeChallenge(matching: data)

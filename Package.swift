@@ -2,77 +2,52 @@
 
 import PackageDescription
 
-// Embedded toggle controls the experimental Embedded feature + WMO for the
-// Embedded-clean cores. Lifetimes is enabled in BOTH modes because Span-returning
-// members of the P2PCoreBytes dependency require @_lifetime.
-let embeddedEnabled = Context.environment["P2P_CORE_EMBEDDED"] == "1"
-let wasiEnabled = Context.environment["P2P_CORE_WASM"] == "1"
-let portableEnabled = embeddedEnabled || wasiEnabled
+let embeddedEnabled = Context.environment["SWIFT_NETWORKING_EMBEDDED"] == "1"
 
 let coreSettings: [SwiftSetting] = {
-    var s: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
+    var settings: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
     if embeddedEnabled {
-        s += [.enableExperimentalFeature("Embedded"), .unsafeFlags(["-wmo"])]
+        settings += [.enableExperimentalFeature("Embedded"), .unsafeFlags(["-wmo"])]
     }
-    return s
+    return settings
 }()
 
-// The `QUIC` facade target's dependencies. The cored Embedded-clean cores + the
-// unified provider + the seam-driven `[UInt8]` engine facade (`QUICEngineClient` /
-// `QUICEngineConnection`) are present in BOTH builds. The host orchestrator spine
-// (`QUICEndpoint` / `ManagedConnection` / `QUICConnectionProtocol` / Foundation /
-// NIO) lives in the host adapter targets (`QUICCore` / `QUICCrypto` /
-// `QUICConnection` / `QUICStream` / `QUICRecovery` / `QUICTransport`); those are
-// dropped under Embedded, where the host spine source is gated
-// `#if !hasFeature(Embedded)` and the facade uses only the cores + the
-// `DefaultCryptoProvider` seam. This mirrors the proven swift-tls `facadeDependencies`
-// split (quic Slice C). The host build is byte-for-byte unchanged.
-let quicFacadeDependencies: [Target.Dependency] = {
-    var d: [Target.Dependency] = [
-        // Cored sans-IO engine + cores (dual-build): the `[UInt8]` facade path.
-        "QUICConnectionEngineCore",
-        "QUICConnectionCore",
-        "QUICPacketProtectionCore",
-        "QUICWire",
-        // Unified crypto provider for the concrete `DefaultCryptoProvider` facade,
-        // and the seams the engine facade is generic over.
-        .product(name: "P2PCrypto",        package: "swift-p2p-core"),
-        .product(name: "P2PCoreCrypto",    package: "swift-ssl"),
-        .product(name: "P2PCoreBytes",     package: "swift-ssl"),
-        .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
-        // RFC 7250 raw-public-key SPKI parsing for the portable certificate
-        // strategy. Host certificate policy is injected over the same DER seam.
-        .product(name: "P2PCoreDER",       package: "swift-p2p-core"),
-    ]
-    if !portableEnabled {
-        d += [
-            // Host orchestrator spine + Foundation/NIO adapters (gated
-            // `#if !hasFeature(Embedded)` in source; dropped from the Embedded build).
-            "QUICCore",
-            "QUICCrypto",
-            "QUICConnection",
-            "QUICStream",
-            "QUICRecovery",
-            "QUICTransport",
-            .product(name: "Logging", package: "swift-log"),
-        ]
-    }
-    return d
-}()
+let benchmarksEnabled = Context.environment["SWIFT_QUIC_ENABLE_BENCHMARKS"] == "1"
+let wasmValidationEnabled = Context.environment["SWIFT_QUIC_ENABLE_WASM_VALIDATION"] == "1"
 
-// Microbenchmarks are opt-in because SwiftPM runs every test target by default,
-// while throughput assertions are host-load dependent and not correctness gates.
-// Run them with:
-//   SWIFT_QUIC_ENABLE_BENCHMARKS=1 swift test --filter QUICBenchmarks
-let benchmarkTargets: [Target] = Context.environment["SWIFT_QUIC_ENABLE_BENCHMARKS"] == "1" ? [
-    .testTarget(
+let benchmarkProducts: [Product] = benchmarksEnabled ? [
+    .executable(name: "quic-benchmarks", targets: ["QUICBenchmarks"]),
+] : []
+
+let benchmarkTargets: [Target] = benchmarksEnabled ? [
+    .executableTarget(
         name: "QUICBenchmarks",
         dependencies: [
-            "QUIC",
-            "QUICCore",
-            "QUICCrypto",
+            "QUICWire",
+            "QUICPacketProtectionCore",
+            "QUICConnectionCore",
+            .product(name: "NetworkingCore", package: "swift-networking"),
         ],
-        path: "Tests/QUICBenchmarks"
+        path: "Benchmarks/QUICBenchmarks",
+        swiftSettings: coreSettings
+    ),
+] : []
+
+let wasmValidationProducts: [Product] = wasmValidationEnabled ? [
+    .executable(name: "quic-wasm-validation", targets: ["QUICWASMValidation"]),
+] : []
+
+let wasmValidationTargets: [Target] = wasmValidationEnabled ? [
+    .executableTarget(
+        name: "QUICWASMValidation",
+        dependencies: [
+            "QUIC",
+            "QUICWire",
+            "QUICConnectionCore",
+            "QUICConnectionEngineCore",
+        ],
+        path: "Validation/QUICWASMValidation",
+        swiftSettings: coreSettings
     ),
 ] : []
 
@@ -86,208 +61,60 @@ let package = Package(
         .visionOS(.v26),
     ],
     products: [
-        // Main public API
-        .library(
-            name: "QUIC",
-            targets: ["QUIC"]
-        ),
-        // Tier-3 Embedded-clean wire codec (varint + frame + packet-header codec)
-        .library(
-            name: "QUICWire",
-            targets: ["QUICWire"]
-        ),
-        // Embedded-clean packet protection (PacketProtector<C,A> / SuiteProtector<C>)
-        .library(
-            name: "QUICPacketProtectionCore",
-            targets: ["QUICPacketProtectionCore"]
-        ),
-        // Embedded-clean congestion control (CUBIC + Reno) + pacing value types
-        .library(
-            name: "QUICRecoveryCore",
-            targets: ["QUICRecoveryCore"]
-        ),
-        // Embedded-clean STREAM state machine (send/recv FSM + reassembly + flow control)
-        .library(
-            name: "QUICStreamCore",
-            targets: ["QUICStreamCore"]
-        ),
-        // Embedded-clean TLS 1.3 signature provider (DefaultCryptoProvider + DER ECDSA)
-        .library(
-            name: "QUICTLSSignature",
-            targets: ["QUICTLSSignature"]
-        ),
-        // Embedded-clean connection state machines (DPLPMTUD search core)
-        .library(
-            name: "QUICConnectionCore",
-            targets: ["QUICConnectionCore"]
-        ),
-        // Embedded-clean connection engine (value-type, caller-locked, sans-IO,
-        // clock-free) — the cored orchestrator (M11). Drives the cores; the host
-        // facade owns the DatagramTransport + AsyncTimer.
-        .library(
-            name: "QUICConnectionEngineCore",
-            targets: ["QUICConnectionEngineCore"]
-        ),
-        // Core types (no I/O dependencies) — Foundation adapter over QUICWire
-        .library(
-            name: "QUICCore",
-            targets: ["QUICCore"]
-        ),
-        // Host compatibility adapter; new integrations should use the
-        // SwiftSSL-backed provider exported by this target.
-        .library(
-            name: "QUICCrypto",
-            targets: ["QUICCrypto"]
-        ),
-    ],
+        .library(name: "QUIC", targets: ["QUIC"]),
+        .library(name: "QUICWire", targets: ["QUICWire"]),
+        .library(name: "QUICPacketProtectionCore", targets: ["QUICPacketProtectionCore"]),
+        .library(name: "QUICRecoveryCore", targets: ["QUICRecoveryCore"]),
+        .library(name: "QUICStreamCore", targets: ["QUICStreamCore"]),
+        .library(name: "QUICConnectionCore", targets: ["QUICConnectionCore"]),
+        .library(name: "QUICConnectionEngineCore", targets: ["QUICConnectionEngineCore"]),
+    ] + benchmarkProducts + wasmValidationProducts,
     dependencies: [
-        // Canonical session contracts over the Pure Swift swift-ssl mechanism.
-        .package(
-            url: "https://github.com/1amageek/swift-tls.git",
-            from: "1.3.3"
-        ),
-        .package(
-            url: "https://github.com/1amageek/swift-p2p-core.git",
-            from: "0.3.2"
-        ),
-        .package(
-            url: "https://github.com/1amageek/swift-ssl.git",
-            from: "0.1.1"
-        ),
-        // UDP transport
-        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.1.4"),
-
-        // One cryptography implementation repository across Native, WASM, and Embedded.
-        .package(
-            url: "https://github.com/1amageek/swift-crypto.git",
-            from: "4.5.3"
-        ),
-
-        // Logging
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
-
-        // Documentation
-        .package(url: "https://github.com/swiftlang/swift-docc-plugin.git", from: "1.4.3"),
-
+        .package(url: "https://github.com/1amageek/swift-tls.git", from: "2.0.0"),
+        .package(url: "https://github.com/1amageek/swift-ssl.git", from: "0.2.0"),
+        .package(url: "https://github.com/1amageek/swift-networking.git", from: "0.1.0"),
     ],
     targets: [
-        // MARK: - Embedded-clean wire codec (dual-build: host + Embedded)
-
         .target(
             name: "QUICWire",
             dependencies: [
-                .product(name: "P2PCoreBytes", package: "swift-ssl"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
             ],
             path: "Sources/QUICWire",
             swiftSettings: coreSettings
         ),
-
-        // MARK: - Embedded-clean packet protection (dual-build: host + Embedded)
-
-        // The generic packet protector: PacketProtector<C, A> (AEAD payload
-        // protection + header protection over the CryptoProvider /
-        // HeaderProtectionProvider seam) and the SuiteProtector<C> closed enum
-        // that replaces the `any PacketOpener`/`any PacketSealer` existentials.
         .target(
             name: "QUICPacketProtectionCore",
             dependencies: [
                 "QUICWire",
-                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
+                .product(name: "SSLCrypto", package: "swift-ssl"),
             ],
             path: "Sources/QUICPacketProtectionCore",
             swiftSettings: coreSettings
         ),
-
-        // MARK: - Embedded-clean congestion control + pacing (dual-build: host + Embedded)
-
-        // The value-type congestion controllers (CUBIC RFC 9438 + NewReno RFC 9002 §7)
-        // and the token-bucket pacer (RFC 9002 §7.7), with time injected as a
-        // monotonic `UInt64` nanosecond parameter. No Foundation/any/Mutex/ContinuousClock.
         .target(
             name: "QUICRecoveryCore",
-            dependencies: [
-                "QUICWire",
-                .product(name: "P2PCoreBytes", package: "swift-ssl"),
-            ],
+            dependencies: ["QUICWire"],
             path: "Sources/QUICRecoveryCore",
             swiftSettings: coreSettings
         ),
-
-        // MARK: - Embedded-clean STREAM state machine (dual-build: host + Embedded)
-
-        // The value-type QUIC STREAM cores (RFC 9000 §2–4): SendStreamCore /
-        // ReceiveStreamCore FSMs, StreamReassemblyBuffer, and FlowControllerCore, over
-        // `[UInt8]` payloads. No Foundation/any/Mutex/ContinuousClock. The QUICStream
-        // adapter holds these under a Mutex and bridges Data.
         .target(
             name: "QUICStreamCore",
-            dependencies: [
-                "QUICWire",
-                .product(name: "P2PCoreBytes", package: "swift-ssl"),
-            ],
+            dependencies: ["QUICWire"],
             path: "Sources/QUICStreamCore",
             swiftSettings: coreSettings
         ),
-
-        // MARK: - Embedded-clean TLS signature provider (dual-build: host + Embedded)
-
-        // The crypto provider that drives the TLS 1.3 handshake SIGNATURE path:
-        // `DefaultCryptoProvider` with ECDSA overridden to DER (RFC 8446 §4.4.3 /
-        // X.509 leaf), the encoding go-libp2p / rust-libp2p require on the wire. The
-        // shared provider emits RAW `r || s` (correct for Noise/libp2p, wrong for
-        // TLS), so this composite DER-encodes ONLY the ECDSA signature and inherits
-        // everything else (so handshake keys stay byte-identical). The dual-build
-        // counterpart of the host-only `QUICCryptoProvider`. No Foundation, no `any`,
-        // no swift-crypto — the DER codec is `P2PCoreDER`.
-        .target(
-            name: "QUICTLSSignature",
-            dependencies: [
-                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
-                .product(name: "P2PCoreDER",    package: "swift-p2p-core"),
-                .product(name: "P2PCrypto",     package: "swift-p2p-core"),
-            ],
-            path: "Sources/QUICTLSSignature",
-            swiftSettings: coreSettings
-        ),
-
-        // MARK: - Embedded-clean connection state machines (dual-build: host + Embedded)
-
-        // The pure value-type connection state machines that are neither codec nor
-        // crypto: currently the DPLPMTUD search core (RFC 8899 / RFC 9000 §14), a
-        // `struct` state machine over `Int`/`UInt64`; the transport-parameters codec
-        // core (RFC 9000 §18) with a Foundation-free IPv4/IPv6 parser for
-        // preferred_address; and the packet parse/serialize core (RFC 9000 §12/§17,
-        // RFC 9001 §5) over `[UInt8]`/`ByteReader` driving the cored
-        // `SuiteProtector<C>`. No Foundation/any/Mutex/ContinuousClock/inet_pton.
-        // The QUICConnection / QUICCore / QUICCrypto adapters hold these and bridge Data.
         .target(
             name: "QUICConnectionCore",
             dependencies: [
                 "QUICWire",
                 "QUICPacketProtectionCore",
-                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
             ],
             path: "Sources/QUICConnectionCore",
             swiftSettings: coreSettings
         ),
-
-        // MARK: - Embedded-clean connection engine (dual-build: host + Embedded)
-
-        // The value-type, caller-locked, sans-IO connection orchestration engine
-        // `QUICConnectionEngine<C, T>` (M11). It owns the per-connection orchestration
-        // ManagedConnection currently does under Mutex — packet-number spaces, key
-        // phases, loss recovery + CC + pacing, ACK generation, stream multiplexing,
-        // flow control, connection state, idle timeout, path validation — driving the
-        // existing cores (NOT reimplementing them). Timers are clock-free: time is
-        // injected as `nowNanos: UInt64`, and `handleTimeout(nowNanos:)` returns what
-        // to send + the next deadline (mirroring DTLS's `DTLSFlightController`). I/O
-        // is inverted: `receive(datagram:from:nowNanos:) -> QUICEngineOutput` and the
-        // facade owns the `DatagramTransport` + `AsyncTimer`. Crypto/cert are injected
-        // via typed-throws closures; X.509 stays out of the engine. No Foundation,
-        // no `any`, no `Mutex`/`ContinuousClock`, no direct-Crypto.
         .target(
             name: "QUICConnectionEngineCore",
             dependencies: [
@@ -296,156 +123,61 @@ let package = Package(
                 "QUICConnectionCore",
                 "QUICRecoveryCore",
                 "QUICStreamCore",
-                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
             ],
             path: "Sources/QUICConnectionEngineCore",
             exclude: ["CONTEXT.md"],
             swiftSettings: coreSettings
         ),
-
-        // MARK: - Core Types (Foundation adapter over QUICWire)
-
-        .target(
-            name: "QUICCore",
-            dependencies: [
-                "QUICWire",
-                "QUICConnectionCore",
-                .product(name: "P2PCoreFoundation", package: "swift-p2p-core"),
-            ],
-            path: "Sources/QUICCore",
-            exclude: ["QUICCore.docc"]
-        ),
-
-        // MARK: - Crypto Layer
-
-        .target(
-            name: "QUICCrypto",
-            dependencies: [
-                "QUICCore",
-                "QUICConnectionCore",
-                "QUICPacketProtectionCore",
-                .product(name: "QUICTLS", package: "swift-tls"),
-                // Unified provider: the host adapter specialises every generic
-                // engine at C = DefaultCryptoProvider,
-                // replacing the deleted QUICFoundationProvider.
-                .product(name: "P2PCrypto", package: "swift-p2p-core"),
-                .product(name: "Crypto", package: "swift-crypto"),
-                .product(name: "TLSWire", package: "swift-ssl"),
-                .product(name: "SSLCore", package: "swift-ssl"),
-                .product(name: "SSLQUIC", package: "swift-ssl"),
-                .product(name: "SSLTLS", package: "swift-ssl"),
-                .product(name: "SSLCrypto", package: "swift-ssl"),
-            ],
-            path: "Sources/QUICCrypto",
-            exclude: ["CONTEXT.md"]
-        ),
-
-        // MARK: - Connection Management
-
-        .target(
-            name: "QUICConnection",
-            dependencies: [
-                "QUICCore",
-                "QUICConnectionCore",
-                "QUICCrypto",
-                "QUICStream",
-                "QUICRecovery",
-                .product(name: "Crypto", package: "swift-crypto"),
-            ],
-            path: "Sources/QUICConnection",
-            exclude: ["CONTEXT.md"]
-        ),
-
-        // MARK: - Stream Management
-
-        .target(
-            name: "QUICStream",
-            dependencies: [
-                "QUICCore",
-                "QUICStreamCore",
-            ],
-            path: "Sources/QUICStream",
-            exclude: ["CONTEXT.md"]
-        ),
-
-        // MARK: - Loss Detection & Congestion Control
-
-        .target(
-            name: "QUICRecovery",
-            dependencies: [
-                "QUICCore",
-                "QUICRecoveryCore",
-            ],
-            path: "Sources/QUICRecovery",
-            exclude: ["CONTEXT.md"]
-        ),
-
-        // MARK: - UDP Transport Integration
-
-        .target(
-            name: "QUICTransport",
-            dependencies: [
-                "QUICCore",
-                "QUICRecoveryCore",
-                .product(name: "NIOUDPTransport", package: "swift-nio-udp"),
-            ],
-            path: "Sources/QUICTransport"
-        ),
-
-        // MARK: - Main Public API
-
-        // Dual-build: on host the full Foundation/NIO orchestrator spine compiles
-        // (the `QUICEndpoint` / `ManagedConnection` API swift-libp2p uses); under
-        // Embedded the spine is gated `#if !hasFeature(Embedded)` and only the
-        // cores + the `[UInt8]` engine facade (`QUICEngineClient` /
-        // `QUICEngineConnection`) compile. Dependencies switch via
-        // `quicFacadeDependencies`; `swiftSettings: coreSettings` applies the
-        // Embedded feature when `P2P_CORE_EMBEDDED=1` (quic Slice C).
         .target(
             name: "QUIC",
-            dependencies: quicFacadeDependencies,
+            dependencies: [
+                "QUICWire",
+                "QUICPacketProtectionCore",
+                "QUICConnectionCore",
+                "QUICRecoveryCore",
+                "QUICStreamCore",
+                "QUICConnectionEngineCore",
+                .product(name: "QUICTLS", package: "swift-tls"),
+                .product(name: "TLSTypes", package: "swift-networking"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
+                .product(name: "NetworkingDatagram", package: "swift-networking"),
+                .product(name: "NetworkingTime", package: "swift-networking"),
+            ],
             path: "Sources/QUIC",
-            exclude: ["CONTEXT.md", "QUIC.docc"],
+            exclude: [
+                "CONTEXT.md",
+                "QUIC.docc",
+            ],
             swiftSettings: coreSettings
         ),
-
-        // MARK: - Tests
-
         .testTarget(
-            name: "QUICCoreTests",
-            dependencies: ["QUICCore"],
-            path: "Tests/QUICCoreTests"
+            name: "QUICWireTests",
+            dependencies: ["QUICWire"],
+            path: "Tests/QUICWireTests"
         ),
-
         .testTarget(
-            name: "QUICCryptoTests",
+            name: "QUICPacketProtectionCoreTests",
             dependencies: [
-                "QUICCrypto",
                 "QUICPacketProtectionCore",
-                .product(name: "P2PCrypto", package: "swift-p2p-core"),
-                .product(name: "P2PCoreBytes", package: "swift-ssl"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
             ],
-            path: "Tests/QUICCryptoTests"
+            path: "Tests/QUICPacketProtectionCoreTests"
         ),
-
         .testTarget(
-            name: "QUICTLSSignatureTests",
-            dependencies: [
-                "QUICTLSSignature",
-                .product(name: "P2PCoreBytes",  package: "swift-ssl"),
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
-                .product(name: "Crypto", package: "swift-crypto"),
-            ],
-            path: "Tests/QUICTLSSignatureTests"
+            name: "QUICRecoveryCoreTests",
+            dependencies: ["QUICRecoveryCore"],
+            path: "Tests/QUICRecoveryCoreTests"
         ),
-
         .testTarget(
-            name: "QUICRecoveryTests",
-            dependencies: ["QUICRecovery", "QUICRecoveryCore", "QUICCore"],
-            path: "Tests/QUICRecoveryTests"
+            name: "QUICStreamCoreTests",
+            dependencies: ["QUICStreamCore", "QUICWire"],
+            path: "Tests/QUICStreamCoreTests"
         ),
-
+        .testTarget(
+            name: "QUICConnectionCoreTests",
+            dependencies: ["QUICConnectionCore", "QUICWire"],
+            path: "Tests/QUICConnectionCoreTests"
+        ),
         .testTarget(
             name: "QUICConnectionEngineCoreTests",
             dependencies: [
@@ -453,28 +185,10 @@ let package = Package(
                 "QUICWire",
                 "QUICPacketProtectionCore",
                 "QUICConnectionCore",
-                .product(name: "P2PCrypto", package: "swift-p2p-core"),
-                .product(name: "P2PCoreBytes", package: "swift-ssl"),
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
             ],
             path: "Tests/QUICConnectionEngineCoreTests"
         ),
-
-        .testTarget(
-            name: "QUICStreamTests",
-            dependencies: ["QUICStream", "QUICCore"],
-            path: "Tests/QUICStreamTests"
-        ),
-
-        .testTarget(
-            name: "QUICTests",
-            dependencies: ["QUIC", "QUICRecovery", "QUICTransport"],
-            path: "Tests/QUICTests"
-        ),
-
-        // Seam-driven engine driver (quic Slice B): exercises QUICEngineConnection
-        // (FacadeLock<engine> + DatagramTransport + AsyncTimer) end-to-end over an
-        // in-memory loopback transport, proving the facade-on-engine rewire.
         .testTarget(
             name: "QUICEngineConnectionTests",
             dependencies: [
@@ -483,12 +197,15 @@ let package = Package(
                 "QUICWire",
                 "QUICPacketProtectionCore",
                 "QUICConnectionCore",
-                .product(name: "P2PCrypto", package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
-                .product(name: "P2PCoreTransport", package: "swift-p2p-core"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
+                .product(name: "NetworkingDatagram", package: "swift-networking"),
+                .product(name: "NetworkingTime", package: "swift-networking"),
+                .product(name: "QUICTLS", package: "swift-tls"),
+                .product(name: "SSLCore", package: "swift-ssl"),
+                .product(name: "SSLCrypto", package: "swift-ssl"),
+                .product(name: "SSLX509", package: "swift-ssl"),
             ],
             path: "Tests/QUICEngineConnectionTests"
         ),
-
-    ] + benchmarkTargets
+    ] + benchmarkTargets + wasmValidationTargets
 )

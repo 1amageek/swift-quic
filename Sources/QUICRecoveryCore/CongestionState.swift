@@ -1,9 +1,7 @@
 /// The phase of a congestion controller, expressed Embedded-cleanly.
 ///
-/// This mirrors the host-side `CongestionState` but expresses the recovery start
-/// time as an injected monotonic `UInt64` nanosecond value rather than a
-/// `ContinuousClock.Instant`. The host adapter maps `recovery(startNanos:)` back to
-/// `.recovery(startTime: ContinuousClock.Instant)` for its public API.
+/// Recovery start time is an injected monotonic `UInt64` nanosecond value, so
+/// the state does not own or read a clock.
 ///
 /// Embedded-clean: no Foundation, no `ContinuousClock`.
 

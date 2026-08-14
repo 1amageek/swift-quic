@@ -10,9 +10,9 @@ import QUICStreamCore
 /// All open streams plus connection-level flow control.
 struct QUICStreamSet: Sendable {
     /// Send FSMs keyed by stream ID.
-    var sendStreams: [UInt64: SendStreamCore] = [:]
+    var sendStreams = UInt64ValueMap<SendStreamCore>()
     /// Receive FSMs keyed by stream ID.
-    var receiveStreams: [UInt64: ReceiveStreamCore] = [:]
+    var receiveStreams = UInt64ValueMap<ReceiveStreamCore>()
     /// Connection-level flow control + stream-count limits.
     var flowController: FlowControllerCore
 

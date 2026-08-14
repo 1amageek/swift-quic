@@ -6,24 +6,20 @@
 /// - parse: remove header protection -> decode packet number -> AEAD open ->
 ///   decode frames.
 ///
-/// Crypto is supplied as the already-cored generic ``SuiteProtector`` (a closed
-/// `enum` over the `CryptoProvider` AEAD/header-protection seam), so this core
-/// carries no `any PacketOpener`/`any PacketSealer` existential and no
-/// swift-crypto dependency. The byte-offset logic is identical to the historical
-/// `Data`-based `PacketEncoder`/`PacketDecoder`, so the wire format is unchanged.
+/// Crypto is supplied as the closed-suite ``SuiteProtector`` owner, so this core
+/// carries no packet-opener/sealer existential and no `swift-crypto` dependency.
 ///
-/// The stateful pieces stay adapter-side: the connection's per-level
+/// The stateful pieces stay engine-side: the connection's per-level
 /// `SuiteProtector` selection, packet-number-space tracking, ACK tracking, key
 /// phase commitment (RFC 9001 §6.3), the `Mutex`, and the async I/O loop. The
-/// adapter passes a `SuiteProtector` (and, for 1-RTT, a phase-aware selector
-/// closure) in, and drives this core.
+/// engine passes a `SuiteProtector` (and, for 1-RTT, a phase-aware selector
+/// closure) in and drives this parser.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`;
 /// typed throws (``PacketParsingError``); no silent fallback — a decrypt failure
 /// or malformed packet throws, never a garbage/empty return.
 
-import P2PCoreBytes
-import P2PCoreCrypto
+import NetworkingCore
 import QUICWire
 import QUICPacketProtectionCore
 
@@ -102,11 +98,11 @@ public enum PacketParsingCore {
     /// Mirrors the historical `PacketEncoder.encodeLongHeaderPacket` byte-for-byte:
     /// frames -> payload (+Initial padding) -> Length field -> AEAD seal (AAD =
     /// header || unprotected PN) -> apply header protection.
-    public static func serializeLongHeaderPacket<C: CryptoProvider>(
+    public static func serializeLongHeaderPacket(
         frames: [Frame],
         header: LongHeader,
         packetNumber: UInt64,
-        protector: SuiteProtector<C>,
+        protector: SuiteProtector,
         maxPacketSize: Int = defaultMTU,
         padToMinimum: Bool = true
     ) throws(PacketParsingError) -> [UInt8] {
@@ -131,7 +127,7 @@ public enum PacketParsingCore {
         let lengthValue = header.packetNumberLength + payload.count + aeadTagSize
 
         // Build header up to (and including) the Length field.
-        let headerWithLength = buildLongHeaderWithLength(header, length: UInt64(lengthValue))
+        let headerWithLength = try buildLongHeaderWithLength(header, length: UInt64(lengthValue))
 
         // Build packet-number bytes.
         let pnBytes = encodePacketNumberBytes(packetNumber, length: header.packetNumberLength)
@@ -143,7 +139,7 @@ public enum PacketParsingCore {
         // Encrypt payload.
         let ciphertext: [UInt8]
         do {
-            ciphertext = try protector.seal(payload, packetNumber: packetNumber, header: aad)
+            ciphertext = try protector.seal(payload.span, packetNumber: packetNumber, header: aad.span)
         } catch {
             throw .protection(error)
         }
@@ -159,12 +155,16 @@ public enum PacketParsingCore {
         guard packet.count >= sampleOffset + 16 else {
             throw .invalidPacketFormat("Packet too short for header protection sample")
         }
-        let sample = Array(packet[sampleOffset..<(sampleOffset + 16)])
         let protectedFirstByte: UInt8
         let protectedPN: [UInt8]
         do {
-            (protectedFirstByte, protectedPN) = try protector.applyHeaderProtection(
-                sample: sample, firstByte: packet[0], packetNumberBytes: pnBytes)
+            (protectedFirstByte, protectedPN) = try protectHeader(
+                packet: packet,
+                sampleOffset: sampleOffset,
+                firstByte: packet[0],
+                packetNumberBytes: pnBytes,
+                protector: protector
+            )
         } catch {
             throw .protection(error)
         }
@@ -180,11 +180,12 @@ public enum PacketParsingCore {
 
     /// Serializes and protects a Short Header (1-RTT) packet (RFC 9000 §17.3,
     /// RFC 9001 §5). Mirrors `PacketEncoder.encodeShortHeaderPacket` byte-for-byte.
-    public static func serializeShortHeaderPacket<C: CryptoProvider>(
+    public static func serializeShortHeaderPacket(
         frames: [Frame],
         header: ShortHeader,
         packetNumber: UInt64,
-        protector: SuiteProtector<C>,
+        protector: SuiteProtector,
+        headerProtectionProtector: SuiteProtector? = nil,
         maxPacketSize: Int = defaultMTU
     ) throws(PacketParsingError) -> [UInt8] {
         var header = header
@@ -205,7 +206,7 @@ public enum PacketParsingCore {
 
         let ciphertext: [UInt8]
         do {
-            ciphertext = try protector.seal(payload, packetNumber: packetNumber, header: aad)
+            ciphertext = try protector.seal(payload.span, packetNumber: packetNumber, header: aad.span)
         } catch {
             throw .protection(error)
         }
@@ -219,12 +220,16 @@ public enum PacketParsingCore {
         guard packet.count >= sampleOffset + 16 else {
             throw .invalidPacketFormat("Packet too short for header protection sample")
         }
-        let sample = Array(packet[sampleOffset..<(sampleOffset + 16)])
         let protectedFirstByte: UInt8
         let protectedPN: [UInt8]
         do {
-            (protectedFirstByte, protectedPN) = try protector.applyHeaderProtection(
-                sample: sample, firstByte: packet[0], packetNumberBytes: pnBytes)
+            (protectedFirstByte, protectedPN) = try protectHeader(
+                packet: packet,
+                sampleOffset: sampleOffset,
+                firstByte: packet[0],
+                packetNumberBytes: pnBytes,
+                protector: headerProtectionProtector ?? protector
+            )
         } catch {
             throw .protection(error)
         }
@@ -246,9 +251,9 @@ public enum PacketParsingCore {
     /// is `nil` only for unprotected packets (Version Negotiation / Retry); a
     /// protected packet with no protector throws ``PacketParsingError`` rather
     /// than returning garbage.
-    public static func parseLongHeaderPacket<C: CryptoProvider>(
-        bytes: [UInt8],
-        protector: SuiteProtector<C>?,
+    public static func parseLongHeaderPacket(
+        bytes: Span<UInt8>,
+        protector: SuiteProtector?,
         largestPN: UInt64
     ) throws(PacketParsingError) -> ParsedPacketCore {
         // Step 1: Parse the protected header.
@@ -264,16 +269,8 @@ public enum PacketParsingCore {
 
         // Unprotected special packets (Version Negotiation / Retry).
         if protectedHeader.packetType == .versionNegotiation || protectedHeader.packetType == .retry {
-            let actualPacketType: PacketType
-            switch protectedHeader.packetType {
-            case .initial: actualPacketType = .initial
-            case .zeroRTT: actualPacketType = .zeroRTT
-            case .handshake: actualPacketType = .handshake
-            case .retry: actualPacketType = .retry
-            case .versionNegotiation: actualPacketType = .versionNegotiation
-            }
-            var header = LongHeader(
-                packetType: actualPacketType,
+            let header = LongHeader(
+                parsedFirstByte: protectedHeader.protectedFirstByte,
                 version: protectedHeader.version,
                 destinationConnectionID: protectedHeader.destinationConnectionID,
                 sourceConnectionID: protectedHeader.sourceConnectionID,
@@ -283,7 +280,6 @@ public enum PacketParsingCore {
                 packetNumber: 0,
                 packetNumberLength: 0
             )
-            header.firstByte = protectedHeader.protectedFirstByte
             return ParsedPacketCore(
                 header: .long(header),
                 packetNumber: 0,
@@ -305,8 +301,8 @@ public enum PacketParsingCore {
         }
         // RFC 9001 §5.4.1: always read 4 PN bytes before removing header protection.
         let protectedPNBytesEnd = min(pnOffset + 4, bytes.count)
-        let protectedPNBytes = Array(bytes[pnOffset..<protectedPNBytesEnd])
-        let sample = Array(bytes[sampleOffset..<(sampleOffset + 16)])
+        let protectedPNBytes = materialize(bytes.extracting(pnOffset..<protectedPNBytesEnd))
+        let sample = bytes.extracting(sampleOffset..<(sampleOffset + 16))
 
         // Step 3: Remove header protection.
         let unprotectedFirstByte: UInt8
@@ -338,7 +334,7 @@ public enum PacketParsingCore {
         // Step 6: AAD + ciphertext boundary.
         var aad: [UInt8] = []
         aad.append(unprotectedFirstByte)
-        aad.append(contentsOf: bytes[1..<pnOffset])
+        append(bytes.extracting(1..<pnOffset), to: &aad)
         aad.append(contentsOf: unprotectedPNBytes.prefix(actualPNLength))
 
         let ciphertextStart = pnOffset + actualPNLength
@@ -370,12 +366,12 @@ public enum PacketParsingCore {
         guard ciphertextStart <= ciphertextEnd else {
             throw .invalidPacketFormat("Negative ciphertext length")
         }
-        let ciphertext = Array(bytes[ciphertextStart..<ciphertextEnd])
+        let ciphertext = bytes.extracting(ciphertextStart..<ciphertextEnd)
 
         // Decrypt payload.
         let plaintext: [UInt8]
         do {
-            plaintext = try protector.open(ciphertext, packetNumber: packetNumber, header: aad)
+            plaintext = try protector.open(ciphertext, packetNumber: packetNumber, header: aad.span)
         } catch {
             throw .protection(error)
         }
@@ -399,16 +395,19 @@ public enum PacketParsingCore {
     ///
     /// `headerProtectionProtector` removes header protection (its HP key is
     /// phase-independent, RFC 9001 §6.1) so the phase bit can be read; then
-    /// `openerSelector(keyPhase)` chooses the AEAD opener. The selector — not this
+    /// `openerSelector(keyPhase, packetNumber)` chooses the AEAD opener. The selector — not this
     /// core — decides whether next-phase keys are derived, and a key update is
     /// committed by the adapter only after a successful open, so a forged packet
     /// that fails AEAD here never changes committed key state (RFC 9001 §6.3).
-    public static func parseShortHeaderPacket<C: CryptoProvider>(
-        bytes: [UInt8],
+    public static func parseShortHeaderPacket(
+        bytes: Span<UInt8>,
         dcidLength: Int,
         largestPN: UInt64,
-        headerProtectionProtector: SuiteProtector<C>?,
-        openerSelector: (_ keyPhase: UInt8) throws(PacketParsingError) -> SuiteProtector<C>?
+        headerProtectionProtector: SuiteProtector?,
+        openerSelector: (
+            _ keyPhase: UInt8,
+            _ packetNumber: UInt64
+        ) throws(PacketParsingError) -> SuiteProtector?
     ) throws(PacketParsingError) -> ParsedPacketCore {
         // Step 1: Parse protected header.
         let protectedHeader: ProtectedShortHeader
@@ -433,8 +432,8 @@ public enum PacketParsingCore {
         }
 
         let protectedPNBytesEnd = min(pnOffset + 4, bytes.count)
-        let protectedPNBytes = Array(bytes[pnOffset..<protectedPNBytesEnd])
-        let sample = Array(bytes[sampleOffset..<(sampleOffset + 16)])
+        let protectedPNBytes = materialize(bytes.extracting(pnOffset..<protectedPNBytesEnd))
+        let sample = bytes.extracting(sampleOffset..<(sampleOffset + 16))
 
         // Step 3: Remove header protection (HP key is phase-independent).
         guard let hpProtector = headerProtectionProtector else {
@@ -470,8 +469,8 @@ public enum PacketParsingCore {
         }
 
         // Step 6: Select AEAD opener for this phase, then open.
-        let opener: SuiteProtector<C>?
-        do { opener = try openerSelector(keyPhase) } catch { throw error }
+        let opener: SuiteProtector?
+        do { opener = try openerSelector(keyPhase, packetNumber) } catch { throw error }
         guard let opener = opener else {
             throw .noProtector
         }
@@ -482,11 +481,11 @@ public enum PacketParsingCore {
         aad.append(contentsOf: unprotectedPNBytes.prefix(actualPNLength))
 
         let ciphertextStart = pnOffset + actualPNLength
-        let ciphertext = Array(bytes[ciphertextStart...])
+        let ciphertext = bytes.extracting(ciphertextStart..<bytes.count)
 
         let plaintext: [UInt8]
         do {
-            plaintext = try opener.open(ciphertext, packetNumber: packetNumber, header: aad)
+            plaintext = try opener.open(ciphertext, packetNumber: packetNumber, header: aad.span)
         } catch {
             throw .protection(error)
         }
@@ -504,6 +503,36 @@ public enum PacketParsingCore {
     }
 
     // MARK: - Private helpers
+
+    private static func protectHeader(
+        packet: borrowing [UInt8],
+        sampleOffset: Int,
+        firstByte: UInt8,
+        packetNumberBytes: [UInt8],
+        protector: SuiteProtector
+    ) throws(PacketProtectionError) -> (firstByte: UInt8, packetNumberBytes: [UInt8]) {
+        let sample = packet.span.extracting(sampleOffset..<(sampleOffset + 16))
+        return try protector.applyHeaderProtection(
+            sample: sample,
+            firstByte: firstByte,
+            packetNumberBytes: packetNumberBytes
+        )
+    }
+
+    private static func materialize(_ bytes: Span<UInt8>) -> [UInt8] {
+        var result: [UInt8] = []
+        result.reserveCapacity(bytes.count)
+        append(bytes, to: &result)
+        return result
+    }
+
+    private static func append(_ bytes: Span<UInt8>, to output: inout [UInt8]) {
+        var index = 0
+        while index < bytes.count {
+            output.append(bytes[index])
+            index += 1
+        }
+    }
 
     /// Decodes the packet number from its (unprotected) bytes, big-endian
     /// truncated, then RFC 9000 §A.3 reconstruction.
@@ -550,15 +579,19 @@ public enum PacketParsingCore {
     }
 
     /// Builds the long header (first byte, version, DCIDs, optional Initial token).
-    private static func buildLongHeader(_ header: LongHeader) -> [UInt8] {
-        var writer = ByteWriter()
+    private static func buildLongHeader(_ header: LongHeader) throws(PacketParsingError) -> [UInt8] {
+        var writer = QUICWireWriter()
         writer.writeByte(header.firstByte)
         header.version.encode(to: &writer)
         header.destinationConnectionID.encode(to: &writer)
         header.sourceConnectionID.encode(to: &writer)
         if header.packetType == .initial {
             let tokenLength = header.token?.count ?? 0
-            Varint(UInt64(tokenLength)).encodeToWriter(&writer)
+            do {
+                try writer.writeVarint(UInt64(tokenLength))
+            } catch {
+                throw .invalidPacketFormat("Initial token length exceeds the QUIC varint range")
+            }
             if let token = header.token {
                 writer.writeBytes(token)
             }
@@ -567,11 +600,18 @@ public enum PacketParsingCore {
     }
 
     /// Builds the long header followed by the Length field (Initial/Handshake/0-RTT).
-    private static func buildLongHeaderWithLength(_ header: LongHeader, length: UInt64) -> [UInt8] {
-        var bytes = buildLongHeader(header)
+    private static func buildLongHeaderWithLength(
+        _ header: LongHeader,
+        length: UInt64
+    ) throws(PacketParsingError) -> [UInt8] {
+        var bytes = try buildLongHeader(header)
         if header.hasPacketNumber {
-            var writer = ByteWriter()
-            Varint(length).encodeToWriter(&writer)
+            var writer = QUICWireWriter()
+            do {
+                try writer.writeVarint(length)
+            } catch {
+                throw .invalidPacketFormat("packet length exceeds the QUIC varint range")
+            }
             bytes.append(contentsOf: writer.finishArray())
         }
         return bytes
@@ -585,26 +625,10 @@ public enum PacketParsingCore {
         size += 1 + header.sourceConnectionID.length
         if header.packetType == .initial {
             let tokenLength = header.token?.count ?? 0
-            size += Varint(UInt64(tokenLength)).encodedLength
+            size += Varint.encodedLength(for: UInt64(tokenLength))
             size += tokenLength
         }
         size += 2  // Length field estimate (2 bytes for typical packet sizes)
         return size
-    }
-}
-
-// MARK: - Varint writer convenience
-
-extension Varint {
-    /// Appends this varint to a ``ByteWriter``. The value is constructed only
-    /// with values <= maxValue, so the write cannot overflow; the unreachable
-    /// overflow is a `fatalError`, never a silent fallback.
-    @inline(__always)
-    func encodeToWriter(_ writer: inout ByteWriter) {
-        do {
-            try writer.writeVarint(value)
-        } catch {
-            fatalError("Varint encode exceeded the QUIC varint range: \(value)")
-        }
     }
 }

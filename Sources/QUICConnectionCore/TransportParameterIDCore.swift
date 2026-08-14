@@ -2,9 +2,8 @@
 ///
 /// Identifiers for transport parameters exchanged during the TLS handshake.
 ///
-/// Embedded-clean: no Foundation, no `any`. The QUICCrypto adapter exposes this
-/// as `TransportParameterID` via a typealias so existing call sites and tests
-/// are unchanged.
+/// Embedded-clean: no Foundation and no existential dispatch. This core is the
+/// canonical owner of QUIC transport-parameter identifiers.
 
 /// QUIC Transport Parameter IDs (RFC 9000 Section 18.2)
 public enum TransportParameterIDCore: UInt64, Sendable, CaseIterable {

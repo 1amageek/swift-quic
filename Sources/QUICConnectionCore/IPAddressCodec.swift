@@ -2,18 +2,14 @@
 /// `preferred_address` transport parameter (RFC 9000 §18.2).
 ///
 /// `preferred_address` carries an IPv4 address (4 bytes) and an IPv6 address
-/// (16 bytes) on the wire, but the host adapter exposes them as textual
-/// strings. The historical adapter used `inet_pton`/`inet_ntop`, which pull in
-/// Darwin/Glibc and are unavailable under Embedded Swift. `IPAddressCodec`
-/// reimplements the strict parse/format in pure Swift over `[UInt8]`:
+/// (16 bytes) on the wire. `IPAddressCodec` implements strict textual
+/// parse/format in Pure Swift over `[UInt8]`:
 /// - IPv4 dotted-decimal <-> 4 bytes,
 /// - IPv6 textual (with `::` zero-compression and embedded-IPv4 tail) <-> 16
 ///   bytes, formatting back in RFC 5952 canonical form (longest zero-run
 ///   compressed, lowercase hex, leading zeros suppressed).
 ///
-/// The output of `formatIPv6` is byte-for-byte the canonical textual form that
-/// `inet_ntop(AF_INET6, …)` produces for the addresses this codec handles, so
-/// the adapter's `PreferredAddress.ipv6Address` String round-trips unchanged.
+/// The output of `formatIPv6` follows RFC 5952 canonical formatting.
 ///
 /// Embedded-clean: no Foundation, no `inet_pton`/`inet_ntop`, no `any`, no
 /// typed throws (every operation is total or returns `nil` on malformed input —

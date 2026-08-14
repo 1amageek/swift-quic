@@ -3,13 +3,8 @@
 /// Owns the send half of a QUIC stream: the send-side FSM
 /// (Ready → Send → DataSent → DataRecvd, plus ResetSent / ResetRecvd), the outgoing
 /// byte buffer with lazy compaction, the send offset / flow-control limit, and the
-/// STOP_SENDING / RESET_STREAM bookkeeping. This is the byte-identical send logic of
-/// the host `DataStream`, expressed as a `struct` with `mutating` methods over
-/// `[UInt8]` payloads.
-///
-/// The host `DataStream` holds this under a `Mutex` and bridges `Data` to/from
-/// `[UInt8]`, so observable behavior is unchanged. STREAM / RESET_STREAM frames are
-/// the `[UInt8]`-based types from `QUICWire`.
+/// STOP_SENDING / RESET_STREAM bookkeeping. STREAM / RESET_STREAM frames use the
+/// owned `[UInt8]` wire types from `QUICWire`; the caller owns synchronization and I/O.
 ///
 /// Embedded-clean: no Foundation, no `any`, no `Mutex`, no `ContinuousClock`.
 

@@ -3,11 +3,8 @@
 /// Owns the receive half of a QUIC stream: the receive-side FSM
 /// (Recv → SizeKnown → DataRecvd → DataRead, plus ResetRecvd), the in-order
 /// reassembly buffer, the receive offset / flow-control limit, and the final-size
-/// bookkeeping. This is the byte-identical receive logic of the host `DataStream`,
-/// expressed as a `struct` with `mutating` methods over `[UInt8]` payloads.
-///
-/// The host `DataStream` holds this under a `Mutex` and bridges `Data` to/from
-/// `[UInt8]`, so observable behavior is unchanged.
+/// bookkeeping. The caller-owned `struct` consumes `QUICWire` frames and leaves
+/// synchronization, scheduling, and I/O to the connection driver.
 ///
 /// The final-size (RFC 9000 §4.5) and flow-control (RFC 9000 §4.1) validations are
 /// protocol-security checks: they throw `StreamError.finalSizeMismatch` /
