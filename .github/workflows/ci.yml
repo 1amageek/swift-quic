@@ -43,6 +43,12 @@ jobs:
               -o "$package"
             installer -pkg "$package" -target CurrentUserHomeDirectory
           fi
+          # Development snapshot packages carry an absolute linker symlink whose
+          # Xcode application name differs across hosted runner images. Point the
+          # selected Swift toolchain at the linker from the active Xcode instead.
+          xcode_ld="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld"
+          test -x "$xcode_ld"
+          ln -sfn "$xcode_ld" "$toolchain/usr/bin/ld"
           xcrun swiftc --version | tee "$RUNNER_TEMP/swift-version.txt"
           grep -F "Swift ${SWIFT_COMPILER_COMMIT}" "$RUNNER_TEMP/swift-version.txt"
 
