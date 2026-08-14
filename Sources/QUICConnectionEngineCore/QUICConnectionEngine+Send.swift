@@ -34,6 +34,17 @@ extension QUICConnectionEngine {
         guard var send = streams.sendStreams[id] else {
             throw .invalidState("finish unknown or receive-only stream \(id)")
         }
+        // `finishStream` is the application-facing close operation. Once FIN or
+        // RESET has entered the send-side state machine, repeating close is a
+        // successful no-op. This includes the RFC 9000 section 3.5 path where a
+        // peer sends STOP_SENDING, we answer with RESET_STREAM, and its ACK moves
+        // the stream to `resetRecvd` before the application releases the stream.
+        switch send.sendState {
+        case .dataSent, .dataRecvd, .resetSent, .resetRecvd:
+            return
+        case .ready, .send:
+            break
+        }
         do { try send.finish() } catch { throw .stream(error) }
         streams.sendStreams[id] = send
     }

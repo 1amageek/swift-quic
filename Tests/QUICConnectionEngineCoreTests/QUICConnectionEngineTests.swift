@@ -616,6 +616,28 @@ struct QUICConnectionEngineTests {
         #expect(deadlines.lossDetectionNanos == nil)
     }
 
+    @Test("finishStream is idempotent after FIN and acknowledged reset")
+    func finishStreamIsIdempotentAfterTerminalSendStates() throws {
+        var (client, _, _, _, _) = try makePair()
+
+        let finishedStreamID = try client.openStream(bidirectional: true)
+        try client.writeStream(finishedStreamID, data: [0x01])
+        try client.finishStream(finishedStreamID)
+        _ = try client.flush(nowNanos: 1_000)
+        try client.finishStream(finishedStreamID)
+
+        let resetStreamID = try client.openStream(bidirectional: true)
+        var resetStream = try #require(client.streams.sendStreams[resetStreamID])
+        resetStream.handleStopSending(errorCode: 0)
+        let generatedReset = resetStream.generateResetStream(errorCode: 0)
+        _ = try #require(generatedReset)
+        resetStream.acknowledgeReset()
+        client.streams.sendStreams[resetStreamID] = resetStream
+
+        try client.finishStream(resetStreamID)
+        #expect(client.streams.sendStreams[resetStreamID]?.sendState == .resetRecvd)
+    }
+
     // MARK: - Connection close
 
     @Test("close produces a CONNECTION_CLOSE and marks the engine closed")
